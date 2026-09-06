@@ -1,0 +1,34 @@
+# ── trading-engines monorepo ─────────────────────────────────────────────
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+build/
+
+# Runtime / logs / data (regenerable or machine-local)
+*.log
+*.log.*
+*.db
+*.db-journal
+*.jsonl
+data/
+logs/
+screenshots/
+
+# Secrets — NEVER commit live .env files (ship .env.example instead)
+.env
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.tmp
+*.bak
