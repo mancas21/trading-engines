@@ -1,0 +1,210 @@
+================================================================================
+ATAS LIVE DATA BRIDGE & QUANTITATIVE ORDER FLOW ENGINE
+COMPREHENSIVE QUANTITATIVE RESEARCH & SOFTWARE ENGINEERING AUDIT REPORT
+================================================================================
+Auditor Perspective: Lead Quant Researcher, Algorithmic Trading & Systems Engineer
+Target System: ATAS X Live Exporter + FastAPI Bridge + CVD Tracker + Quant Signal Engine
+Workspace Directory: C:\atas-bridge
+Core Files Audited:
+  - atas-exporter/LiveExporter.cs
+  - bridge_server.py
+  - signal_engine.py
+  - decision_engine.py
+  - rules.json
+  - _integrated_analysis.py
+  - _calls_log.jsonl
+================================================================================
+
+1. EXECUTIVE SUMMARY & SYSTEM TOPOLOGY
+--------------------------------------------------------------------------------
+The target system is an event-driven order-flow and market-microstructure analytics 
+bridge connecting the ATAS X institutional trading platform (.NET) to a Python 
+FastAPI backend. The system fuses Footprint (cluster auction), Level 2 Smart DOM, 
+Smart Tape, Binance Futures WebSocket feeds (orderbook depth + trade flow), and 
+a stateful Cumulative Volume Delta (CVD) rollover engine to compute deterministic 
+trade bias scores (0-100) and track real-time trade call outcomes.
+
+TOPOLOGY DIAGRAM:
+  [ATAS X Desktop (C#)] 
+     │ (LiveExporter.cs OnCalculate / OnNewTrade)
+     ├─► Writes _live_indicators.json every 300ms (Atomic File Move)
+     └─► POST /alerta-atas (BigTrade / DOM Alerts)
+  [Binance Futures WebSockets]
+     ├─► wss://fstream.binance.com/ws/{symbol}@depth20@100ms
+     └─► wss://fstream.binance.com/ws/{symbol}@trade
+  [FastAPI Bridge (:8000)]
+     ├─► _cvd_tracker: Polls live JSON (0.5s), tracks bar rollover & CVD deltas
+     ├─► _dom_feeds: Ingests L2 depth snapshots & calculates 10s trade summaries
+     ├─► signal_engine.py: Deterministic 0-100 scorecard from rules.json
+     ├─► decision_engine.py: Dynamic Value Area (POC/VAH/VAL) & Volatility Regimes
+     └─► _calls_checker: Polls Binance prices (10s) & resolves open calls (MFE/MAE)
+
+
+2. RISK MATRIX & CORE FINDINGS
+--------------------------------------------------------------------------------
+[CRITICAL] Volume Climax Uses Hardcoded Absolute Thresholds (signal_engine.py:134-143)
+  - Impact: Hardcoded tiers (>500k, >200k, >50k) break across assets. 500k SUI ($1.5M) 
+    is standard, while 500k SOL ($50M) is extreme, and 500k BTC ($45B) is impossible.
+  - Severity: CRITICAL | Dimension: Quant Logic
+
+[CRITICAL] Tape Ratio Count-Based Whale Trap (signal_engine.py:118-121)
+  - Impact: Evaluates buy_count_pct instead of volume-weighted dollar volume. 50 retail 
+    buys of 0.1 SOL will register as 96% Bullish Tape even if 2 institutional market 
+    sells of 250 SOL dump 500 SOL net negative delta.
+  - Severity: CRITICAL | Dimension: Microstructure Integrity
+
+[HIGH] Polling Rate & Nyquist Aliasing (bridge_server.py:521 vs LiveExporter.cs:79)
+  - Impact: ATAS writes at 300ms, bridge polls at 500ms over local disk. Up to 300ms-500ms 
+    of final candle volume delta is truncated during bar rollover.
+  - Severity: HIGH | Dimension: Ingestion Synchronization
+
+[HIGH] Single File Multi-Symbol Collision (LiveExporter.cs:15)
+  - Impact: Hardcoded file path C:\atas-bridge\_live_indicators.json causes multiple open 
+    ATAS charts to overwrite each other, causing data cross-contamination.
+  - Severity: HIGH | Dimension: Multi-Asset Architecture
+
+[HIGH] Rules.json Scoring Weights Key Mismatch (signal_engine.py:240 vs rules.json:86)
+  - Impact: rules.json defines "multi_bar_confirmation": 15, but signal_engine uses 
+    "footprint_confirmation". The sub-score silently falls back to default weight 5.
+  - Severity: HIGH | Dimension: Signal Specification
+
+[MEDIUM] Trade Flow Summary Window Buffer Truncation (bridge_server.py:289-293)
+  - Impact: 10s trade summary is computed over recent_trades capped at 30 items. During 
+    high volatility, 30 trades occur in <300ms, corrupting the 10s volume metrics.
+  - Severity: MEDIUM | Dimension: Data Ingestion
+
+[MEDIUM] 10-Second REST Polling Wick Blind Spot (bridge_server.py:843)
+  - Impact: Resolution of trade calls polls Binance at 10s intervals. Fast wicks that 
+    hit SL/T1 and retrace within <10s are not resolved accurately.
+  - Severity: MEDIUM | Dimension: Outcome Verification
+
+
+3. SUBSYSTEM AUDIT BREAKDOWN
+--------------------------------------------------------------------------------
+
+3.1 ATAS C# EXPORTER (LiveExporter.cs)
+  - Current-Bar Isolation: Correctly enforces `if (bar != CurrentBar - 1) return;` 
+    to prevent historical chart replays from corrupting live tracker state.
+  - Atomic File Replacement: Uses temporary file write followed by `File.Move(..., overwrite: true)`. 
+    While thread-safe on NTFS, concurrent file open in Python without retry logic can 
+    occasionally raise WinError 32 (Sharing Violation).
+  - Footprint Cluster Truncation: `candle.GetAllPriceLevels().OrderByDescending(l => l.Volume).Take(10)` 
+    extracts only the top 10 volume nodes, discarding tail absorption levels and unfinished 
+    auctions at extreme high/low candle wicks.
+  - Tape Buffer Threading: Correctly locked with `lock (_tapeBuffer)`, and clears buffer 
+    when `_tapeBarIndex != bar` to ensure bar-scoped trade flow.
+
+3.2 CUMULATIVE VOLUME DELTA TRACKER (bridge_server.py)
+  - Rollover Mechanics: Bar close is recognized when `bar_index > prev_bar_index`. Closed-bar 
+    delta is assigned from `prev_live_delta`. Due to 500ms polling vs 300ms export, the last 
+    burst of orders before candle close is delayed or attributed to the new candle.
+  - Corruption Gates Assessment:
+      1. Race Gate (_CVD_RACE_SECONDS = 2.0s): Successfully filters historical backfill bursts.
+      2. Fast-Close Gate (_CVD_MIN_BAR_SECONDS = 20.0s): Skips fast timeframe flip-backs without 
+         wiping session cumulative delta.
+      3. Physical Gate (|delta| > volume * 1.1 + 1.0): Validates conservation of order volume.
+      4. Gap Gate & Reload Gate: Isolates session data from chart timeframe switches.
+  - Missing Normalization: Raw contract deltas are stored. SOL (+3,000), SUI (+250,000), and 
+    BTC (+50) cannot be compared directly without conversion to USD Notional Delta (Delta * Close) 
+    or Normalized Delta % (Delta / Total Bar Volume).
+
+3.3 DETERMINISTIC SIGNAL ENGINE (signal_engine.py)
+  - Architecture: Pure-functional, deterministic design (`compute_signal(Snapshot)`). 
+    Zero side-effects, fully testable.
+  - DOM Imbalance Scoring: Uses linear ramp `abs_imb * 0.5`, capping at +-20% imbalance. 
+    In crypto derivatives, orderbook imbalances frequently reach 40% to 75%.
+  - Rule 2 (Exhaustion): Flags `abs(last_delta) > 2.0 * prior_max`. Must verify that the spike 
+    is in the direction of the prevailing trend rather than a counter-trend absorption bar.
+  - Rule 6 (Distribution) & Rule 7 (Accumulation): Implements strict multi-condition logic 
+    (consecutive CVD bars + footprint bid/ask domination + DOM threshold).
+
+3.4 DECISION ENGINE & MACRO CONTEXT (decision_engine.py)
+  - Dynamic Profile Engine: Correctly slices 15m Binance klines over a 3-day window 
+    (`PROFILE_DAYS = 3`) to prevent multi-week distribution smearing.
+  - Value Area Math: Implements genuine 70% Value Area algorithm (`value_area`), finding 
+    POC, VAH, and VAL along with High/Low Volume Nodes (HVN/LVN).
+  - Volatility Regimes: Computes empirical ATR percentile rank, volatility expansion rate, 
+    and GARCH-like return autocorrelation clustering (`volatility_clustering`).
+
+3.5 TRADE CALL TRACKER & STATISTICAL POWER (_calls_log.jsonl)
+  - Track Record Sample Size: N = 10-11 calls (54.5% win rate).
+  - Wilson Score 95% Confidence Interval: [28.0%, 78.7%].
+  - Statistical Edge Conclusion: Current sample size is too small to distinguish from a 
+    random 50/50 coin flip. Minimum sample size for statistical significance (p < 0.05) 
+    at 60% win rate is N >= 185 resolved trades.
+
+
+4. REMEDIATION & PRODUCTION PATCHES
+--------------------------------------------------------------------------------
+
+PATCH 1: Volume-Weighted Tape & Asset-Agnostic Climax (signal_engine.py)
+--------------------------------------------------------------------------------
+def _score_tape_ratio(s: Snapshot) -> float:
+    """Volume-weighted tape ratio: 70% USD volume + 30% trade count."""
+    total_vol = s.tape_buy_vol + s.tape_sell_vol
+    total_cnt = s.tape_buy_count + s.tape_sell_count
+    vol_ratio = (s.tape_buy_vol / total_vol) if total_vol > 0 else 0.5
+    cnt_ratio = (s.tape_buy_count / total_cnt) if total_cnt > 0 else 0.5
+    combined = (0.70 * vol_ratio) + (0.30 * cnt_ratio)
+    return round(combined * 10.0, 2)
+
+def _score_volume_climax(s: Snapshot) -> float:
+    """Asset-agnostic climax score based on delta/volume absorption ratio."""
+    if s.volume_total <= 0:
+        return 5.0
+    delta_ratio = abs(s.delta) / s.volume_total
+    if delta_ratio < 0.05:
+        return 3.0  # High absorption / exhaustion risk
+    elif delta_ratio > 0.40:
+        return 8.5  # Strong clean flow, low exhaustion risk
+    return 6.0
+
+def _load_weights() -> dict:
+    """Synchronize weights with rules.json naming standard."""
+    return {
+        "footprint_depth": 25,
+        "dom_imbalance": 25,
+        "tape_ratio": 20,
+        "volume_climax": 15,
+        "footprint_confirmation": 15
+    }
+
+PATCH 2: Time-Based Eviction for Binance Trade Flow (bridge_server.py)
+--------------------------------------------------------------------------------
+# In _process_trades() loop:
+rt.append(trade)
+cutoff = now - TRADE_SUMMARY_WINDOW
+s["recent_trades"] = [t for t in rt if t["t"] >= cutoff]
+valid_trades = s["recent_trades"]
+buy_vol = sum(t["q"] for t in valid_trades if t["s"] == "buy")
+sell_vol = sum(t["q"] for t in valid_trades if t["s"] == "sell")
+buy_usd = sum(t["usd"] for t in valid_trades if t["s"] == "buy")
+sell_usd = sum(t["usd"] for t in valid_trades if t["s"] == "sell")
+buy_count = sum(1 for t in valid_trades if t["s"] == "buy")
+sell_count = sum(1 for t in valid_trades if t["s"] == "sell")
+
+PATCH 3: Dynamic Multi-Symbol Filenames (LiveExporter.cs)
+--------------------------------------------------------------------------------
+private string GetExportFilePath()
+{
+    var symbol = InstrumentInfo?.Instrument?.Replace("/", "").Replace(":", "").ToUpper() ?? "DEFAULT";
+    return $@"C:\atas-bridge\_live_indicators_{symbol}.json";
+}
+
+
+5. QUANT TRADER OPERATING CHECKLIST
+--------------------------------------------------------------------------------
+1. Continuity Verification: Query GET /cvd/{symbol} -> Ensure `continuity == "clean"` 
+   and `bars_since_gap >= 2`.
+2. Rule 2 Exhaustion: If bar delta > 2.0x prior peak delta -> Flag exhaustion; never 
+   enter momentum breakout.
+3. Rule 6 & 7 Regimes:
+   - Distribution: CVD falling 2+ bars + Footprint bid-selling >= 4 levels (>70%) + DOM < +5%.
+   - Accumulation: CVD rising 2+ bars + Footprint ask-buying >= 3 levels (>70%) + DOM > +10%.
+4. Rule 10 Neutral Filter: Bias score 40-59 -> Output "WAIT FOR CONFIRMATION"; suppress trade plans.
+5. Systematic Call Logging: Log all qualifying setups via POST /calls to build the N >= 185 
+   sample size required for verified statistical edge.
+
+================================================================================
+END OF AUDIT REPORT
+================================================================================

@@ -1,0 +1,142 @@
+﻿using OFT.Rendering.Context;
+using OFT.Rendering.Tools;
+using System.Drawing;
+
+namespace DomV10;
+
+using System;
+
+public partial class MainIndicator
+{
+    private const float MinFontSize = 0.5f;
+    private RenderFont _font = new RenderFont("Arial", 8);
+    private decimal _cacheMaxHeight;
+    private (float fontSize, float fontWidth) _cacheFontSize;
+
+    private RenderStringFormat _stringCenterFormat = new()
+    {
+        Alignment = StringAlignment.Center,
+        LineAlignment = StringAlignment.Center,
+        Trimming = StringTrimming.EllipsisCharacter,
+        FormatFlags = StringFormatFlags.NoWrap
+    };
+
+    private readonly RenderStringFormat _stringLeftFormat = new RenderStringFormat()
+    {
+        Alignment = StringAlignment.Near,
+        LineAlignment = StringAlignment.Center,
+        Trimming = StringTrimming.EllipsisCharacter,
+        FormatFlags = StringFormatFlags.NoWrap
+    };
+
+    private readonly RenderStringFormat _stringRightFormat = new RenderStringFormat()
+    {
+        Alignment = StringAlignment.Far,
+        LineAlignment = StringAlignment.Center,
+        Trimming = StringTrimming.EllipsisCharacter,
+        FormatFlags = StringFormatFlags.NoWrap
+    };
+
+    private int ItemWidthCalculation(decimal currentVol, decimal totalVolume, int maxScreenSize, int itemCount,
+        int space, decimal fontWidth)
+    {
+        var eachPic = ((decimal)maxScreenSize / totalVolume);
+        var w = (int)(eachPic * currentVol);
+        if (w < fontWidth) return (int)Math.Max(fontWidth, 1);
+        return w;
+    }
+
+    private int _lastHeight;
+
+    private (float fontSize, float fontWidth) SetFontSize(RenderContext context, decimal maxHeight)
+    {
+        var maxFontSize = (decimal)ChartInfo.PriceAxisFont.Size;
+
+        if (maxHeight < 2)
+            return (0, 0);
+
+        if (maxHeight == _cacheMaxHeight)
+            return _cacheFontSize;
+
+        var direction = 0;
+        var bestSize = (float)maxFontSize;
+        var bestW = 0;
+        var increment = 0.1m;
+
+        var x = 0;
+
+        var indicate = maxHeight - 2;
+
+        if (bestSize < MinFontSize)
+            bestSize = MinFontSize;
+
+        _font = new RenderFont("Arial", bestSize);
+
+        try
+        {
+            do
+            {
+                var size = context.MeasureString("#", _font);
+                var textSize = size.Height;
+
+                if (size.Height == indicate)
+                {
+                    bestSize = _font.Size;
+                    bestW = size.Width;
+                    break;
+                }
+
+                if (textSize < indicate)
+                {
+                    if (direction == 0) direction = 1;
+                    if (direction == -1) break;
+
+                    bestSize = _font.Size;
+                    bestW = size.Width;
+
+                    _font = new RenderFont(_font.FontFamily, (float)((decimal)_font.Size + increment));
+                    _lastHeight = size.Height;
+                    continue;
+                }
+
+                if (textSize > indicate)
+                {
+                    if (direction == 0) direction = -1;
+                    if (direction == 1) break;
+
+                    var nextSize = (float)((decimal)_font.Size - increment);
+
+                    if (nextSize < MinFontSize)
+                        break;
+
+                    _font = new RenderFont(_font.FontFamily, nextSize);
+                    _lastHeight = size.Height;
+                    bestSize = _font.Size;
+                    bestW = size.Width;
+
+                    continue;
+                }
+            }
+            while (x++ <= 100);
+        }
+        finally
+        {
+            _cacheFontSize = (bestSize, bestW);
+            _cacheMaxHeight = maxHeight;
+        }
+
+        return (bestSize, bestW);
+    }
+
+    private decimal GetFixPrice(decimal value, bool isTop, decimal step)
+    {
+        if (InstrumentInfo == null) return value;
+        var left = value % step;
+        value = value - left;
+        if (isTop) value += step;
+        else value -= step;
+        if (isTop) value += step;
+        else value -= step;
+        return value;
+    }
+}

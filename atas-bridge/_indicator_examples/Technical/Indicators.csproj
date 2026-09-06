@@ -1,0 +1,110 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>ATAS.Indicators.Technical</RootNamespace>
+    <AssemblyName>ATAS.Indicators.Technical</AssemblyName>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <LangVersion>latest</LangVersion>
+    <SignAssembly>true</SignAssembly>
+    <Configurations>Debug;Release;Publish</Configurations>
+    <Platforms>AnyCPU;Cross</Platforms>
+	<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+	<WarningsNotAsErrors>NU1903</WarningsNotAsErrors>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Platform)' == 'Cross' ">
+    <UseWPF>False</UseWPF>
+    <DefineConstants>$(DefineConstants);CROSS_PLATFORM</DefineConstants>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+
+	<PropertyGroup Condition=" '$(Platform)' != 'Cross' ">
+		<UseWPF>True</UseWPF>
+		<TargetFramework>net10.0-windows</TargetFramework>
+	</PropertyGroup>
+
+	<PropertyGroup>
+		<NoWarn>$(NoWarn);CA1416;CS8002</NoWarn>
+	</PropertyGroup>
+	
+  <PropertyGroup Condition=" '$(Configuration)' == 'Publish' ">
+    <Optimize Condition=" '$(Optimize)' == '' ">true</Optimize>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Platform)' == 'Cross' ">
+    <ATAS_BASE>C:\Program Files\ATAS X</ATAS_BASE>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Platform)' != 'Cross' ">
+    <ATAS_BASE>C:\Program Files (x86)\ATAS Platform</ATAS_BASE>
+  </PropertyGroup>
+
+	<ItemGroup>
+		<Reference Include="OFT.Attributes">
+			<HintPath>$(ATAS_BASE)\OFT.Attributes.dll</HintPath>
+		</Reference>
+		<Reference Include="OFT.Editors" Condition=" '$(Platform)' != 'Cross' ">
+			<HintPath>$(ATAS_BASE)\OFT.Editors.dll</HintPath>
+		</Reference>
+
+		<Reference Include="ATAS.DataFeedsCore">
+			<HintPath>$(ATAS_BASE)\ATAS.DataFeedsCore.dll</HintPath>
+		</Reference>
+		<Reference Include="ATAS.Indicators">
+			<HintPath>$(ATAS_BASE)\ATAS.Indicators.dll</HintPath>
+		</Reference>
+		<Reference Include="OFT.Rendering">
+			<HintPath>$(ATAS_BASE)\OFT.Rendering.dll</HintPath>
+		</Reference>
+		<Reference Include="Utils.Common">
+			<HintPath>$(ATAS_BASE)\Utils.Common.dll</HintPath>
+		</Reference>
+		<Reference Include="Utils.Windows" Condition=" '$(Platform)' != 'Cross' ">
+			<HintPath>$(ATAS_BASE)\Utils.Windows.dll</HintPath>
+		</Reference>
+		<Reference Include="OFT.Localization">
+			<HintPath>$(ATAS_BASE)\OFT.Localization.dll</HintPath>
+		</Reference>
+		<Reference Include="DevExpress.Data.v25.2" Condition=" '$(Platform)' != 'Cross' ">
+			<HintPath>$(ATAS_BASE)\DevExpress.Data.v25.2.dll</HintPath>
+		</Reference>
+		<Reference Include="Avalonia" Condition=" '$(Platform)' == 'Cross' ">
+			<HintPath>$(ATAS_BASE)\Avalonia.Base.dll</HintPath>
+		</Reference>
+	</ItemGroup>
+	<ItemGroup>
+		<PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+	</ItemGroup>
+	<ItemGroup Condition=" '$(Platform)' == 'Cross' ">
+		<PackageReference Include="System.Drawing.Common" Version="10.0.0" />
+	</ItemGroup>
+  <ItemGroup Condition=" '$(Platform)' != 'Cross' ">
+	  <Compile Remove="**\*.Common.cs" />
+	  <None Include="**\*.Common.cs" Exclude="$(DefaultItemExcludes);$(DefaultExcludesInProjectFolder)" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Update="Properties\Resources.Designer.cs">
+      <DesignTime>True</DesignTime>
+      <AutoGen>True</AutoGen>
+      <DependentUpon>Resources.resx</DependentUpon>
+    </Compile>
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Update="Properties\Resources.resx">
+      <Generator>PublicResXFileCodeGenerator</Generator>
+      <LastGenOutput>Resources.Designer.cs</LastGenOutput>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <!-- File exclusions -->
+  <ItemGroup Condition=" '$(Platform)' == 'Cross' ">
+    <Compile Remove="**\*.Windows.cs" />
+    <None Include="**\*.Windows.cs" Exclude="$(DefaultItemExcludes);$(DefaultExcludesInProjectFolder)" />
+
+    <Compile Remove="**\*.xaml.cs" />
+    <None Include="**\*.xaml.cs" Exclude="$(DefaultItemExcludes);$(DefaultExcludesInProjectFolder)" />
+
+    <Compile Remove="**\*.xaml" />
+    <None Include="**\*.xaml" Exclude="$(DefaultItemExcludes);$(DefaultExcludesInProjectFolder)" />
+  </ItemGroup>
+
+</Project>

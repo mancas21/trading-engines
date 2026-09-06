@@ -1,0 +1,18 @@
+{
+  "meta": {
+    "bars": 12,
+    "cost_bps": 8.0,
+    "min_score": 60.0,
+    "n_ticks": 200,
+    "n_signals": 0,
+    "skipped_low_coverage": 0,
+    "paths": [
+      "C:\\atas-bridge\\_tick_history.jsonl",
+      "C:\\atas-bridge\\_tick_history.jsonl.1"
+    ],
+    "generated_at": 1788374971.097157
+  },
+  "overall": {},
+  "per_symbol_direction": {},
+  "trades": []
+}

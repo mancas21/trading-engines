@@ -1,0 +1,259 @@
+# QUANT ALERT ENGINE v1.0 - QUICK REFERENCE
+
+## File Structure
+```
+quant-alert-engine/
+├── quant_alert_engine.py      # Main application (DO NOT EDIT unless advanced)
+├── config.json                # Configuration file (EDIT THIS!)
+├── setup_windows.bat          # Installation script (run once)
+├── run_engine.bat             # Run the engine (use daily)
+├── requirements.txt           # Python dependencies
+├── README.md                  # Full documentation
+├── QUICK_REFERENCE.txt        # This file
+├── quant_alert_engine.log     # Auto-generated log file
+└── logs/                      # Auto-created log directory
+```
+
+---
+
+## 5-Minute Setup
+
+1. **Double-click**: `setup_windows.bat`
+2. **Wait** for installation to complete (2-5 minutes)
+3. **Edit**: `config.json` with your symbols
+4. **Run**: `run_engine.bat`
+5. **Check**: `quant_alert_engine.log` for activity
+
+That's it! The engine is now monitoring your crypto pairs.
+
+---
+
+## Common Customizations
+
+### Change Symbols
+Open `config.json`, find this section:
+```json
+"symbols": [
+  "SOL/USDT",
+  "XRP/USDT",
+  "SUI/USDT"
+]
+```
+
+Replace with your pairs (examples):
+```json
+"symbols": [
+  "BTC/USDT",
+  "ETH/USDT",
+  "BNB/USDT"
+]
+```
+
+### Change Check Speed
+Default is 5 seconds. Edit in `config.json`:
+```json
+"general": {
+  "check_interval": 5    // Change this number
+}
+```
+
+Options:
+- `3`: Fast (every 3 seconds) - Good for scalping
+- `5`: Balanced (every 5 seconds) - Most common
+- `10`: Slow (every 10 seconds) - Less API strain
+- `30`: Very slow (every 30 seconds) - Lightweight
+
+### Disable/Enable Indicators
+In `config.json`, each indicator section has `"enabled": true/false`:
+
+```json
+"volume": {
+  "enabled": true      // Set to false to disable volume alerts
+},
+"rsi": {
+  "enabled": true      // Set to false to disable RSI alerts
+},
+```
+
+### Turn Off Notifications/Sounds
+```json
+"general": {
+  "enable_notifications": true,  // Set to false for quiet mode
+  "enable_sound": true           // Set to false to mute
+}
+```
+
+---
+
+## Running the Engine
+
+### Option 1: Easy (Recommended)
+```
+Double-click: run_engine.bat
+```
+
+### Option 2: Command Line
+```
+Open Command Prompt in the folder
+Type: run_engine.bat
+Press Enter
+```
+
+### Option 3: Advanced
+```
+venv\Scripts\activate.bat
+python quant_alert_engine.py
+```
+
+### Stopping the Engine
+```
+Press: CTRL + C
+```
+
+---
+
+## Understanding the Log
+
+When you see alerts in the log file:
+
+```
+[VOLUME] SOL/USDT - Volume Spike @ 141.2340
+```
+- **[VOLUME]** = Alert category
+- **SOL/USDT** = Trading pair
+- **Volume Spike** = Specific signal
+- **@ 141.2340** = Price at alert time
+
+---
+
+## Alert Categories
+
+| Symbol | Meaning |
+|--------|---------|
+| 🔴 [VOLUME] | Volume-based signals |
+| 🔵 [CVD] | Cumulative Volume Delta |
+| 🟣 [RSI] | RSI indicator |
+| 🟠 [MACD] | MACD indicator |
+| 🟡 [STOCH] | Stochastic indicator |
+| 🟢 [VOL] | Volatility/ATR/BB |
+
+---
+
+## Typical Settings for Different Strategies
+
+### Scalper (1-5 min)
+```json
+"check_interval": 3,
+"rsi": {
+  "length": 9,
+  "overbought": 75,
+  "oversold": 25
+},
+"volume": {
+  "spike_mult": 1.5,
+  "climax_mult": 2.5
+}
+```
+
+### Day Trader (5-30 min)
+```json
+"check_interval": 5,
+"rsi": {
+  "length": 14,
+  "overbought": 70,
+  "oversold": 30
+},
+"macd": {
+  "fast": 12,
+  "slow": 26,
+  "signal": 9
+}
+```
+
+### Swing Trader (30m+)
+```json
+"check_interval": 60,
+"rsi": {
+  "length": 21,
+  "overbought": 65,
+  "oversold": 35
+},
+"volatility": {
+  "bb_len": 30,
+  "atr_len": 21
+}
+```
+
+---
+
+## Troubleshooting - Quick Fixes
+
+| Problem | Solution |
+|---------|----------|
+| Python not found | Run setup_windows.bat again |
+| No alerts | Check config.json - enable indicators |
+| High CPU | Increase check_interval to 10-30 |
+| No notifications | Check Windows notification settings |
+| Can't connect to Binance | Check internet, wait 1 min, try again |
+
+---
+
+## Symbols Reference
+
+**Top Crypto Pairs**:
+```
+BTC/USDT  - Bitcoin
+ETH/USDT  - Ethereum
+SOL/USDT  - Solana
+XRP/USDT  - Ripple
+SUI/USDT  - Sui
+BNB/USDT  - Binance Coin
+ADA/USDT  - Cardano
+DOGE/USDT - Dogecoin
+```
+
+**Format**: `SYMBOL/USDT` (with the slash!)
+
+---
+
+## Performance Tips
+
+✅ Monitor 3-5 symbols (optimal)
+✅ Use 5-10 second intervals
+✅ Disable unused indicators
+✅ Run on a dedicated machine
+✅ Check logs daily for patterns
+
+❌ Don't monitor 50+ symbols
+❌ Don't use 1 second intervals (rate limits)
+❌ Don't enable all indicators if not needed
+❌ Don't run 24/7 without breaks
+
+---
+
+## Support Resources
+
+1. **Check logs**: `quant_alert_engine.log`
+2. **Read README.md**: Full documentation
+3. **Verify config.json**: Common issues are here
+4. **Test one symbol**: Start simple, add complexity
+5. **Review trades**: Track which alerts are profitable
+
+---
+
+## Next Steps
+
+1. ✅ Install with `setup_windows.bat`
+2. ✅ Customize `config.json`
+3. ✅ Run `run_engine.bat`
+4. ✅ Monitor `quant_alert_engine.log`
+5. ✅ Backtest signals in your trading strategy
+6. ✅ Adjust parameters for your style
+
+---
+
+**Version**: 1.0
+**Last Updated**: 2025
+**Status**: Production Ready
+
+Good luck with your trading! 🚀

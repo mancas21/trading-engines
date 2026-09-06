@@ -1,0 +1,28 @@
+# Quant Alert Engine - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Data processing & numerical computing
+pandas>=2.0.0,<=3.1.0
+numpy>=1.24.0,<=2.5.0
+
+# Crypto exchange API
+ccxt>=4.4.0,<=4.6.0
+
+# Desktop UI (required by quant_alert_ui.py)
+PyQt6>=6.6.0,<=6.12.0
+
+# HTTP (bridge agent + Telegram)
+requests>=2.31.0,<=2.35.0
+
+# Sound & Notifications (Windows)
+win10toast>=0.9
+
+# Config validation (Pydantic v2 + env var overrides)
+pydantic>=2.5.0,<3.0.0
+pydantic-settings>=2.1.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
+
+# Health server (FastAPI + metrics)
+fastapi>=0.104.0,<=0.142.0
+uvicorn>=0.24.0,<=0.53.0
+psutil>=5.9.0,<=7.3.0

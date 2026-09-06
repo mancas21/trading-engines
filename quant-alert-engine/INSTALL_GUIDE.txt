@@ -1,0 +1,315 @@
+# QUANT ALERT ENGINE v1.0 - INSTALLATION FLOWCHART
+
+```
+═══════════════════════════════════════════════════════════════════════════════
+                    WINDOWS 11 SETUP FLOWCHART
+═══════════════════════════════════════════════════════════════════════════════
+
+                           START HERE
+                               ↓
+                    ┌─────────────────────┐
+                    │ Install Python 3.10 │
+                    │  from python.org    │
+                    │  ✓ Add to PATH      │
+                    └─────────────────────┘
+                               ↓
+                    ┌─────────────────────┐
+                    │ Download all files  │
+                    │ from Claude         │
+                    │ (7 files total)     │
+                    └─────────────────────┘
+                               ↓
+                    ┌─────────────────────────────────┐
+                    │ Place in folder                 │
+                    │ C:\Users\YourName\quant-alert   │
+                    │ (or any Windows folder)         │
+                    └─────────────────────────────────┘
+                               ↓
+                    ┌──────────────────────────┐
+                    │ Double-click:            │
+                    │ setup_windows.bat        │
+                    │ (Wait 3-5 minutes)       │
+                    └──────────────────────────┘
+                               ↓
+                    ┌──────────────────────────┐
+                    │ Edit config.json         │
+                    │ - Change symbols         │
+                    │ - Adjust parameters      │
+                    └──────────────────────────┘
+                               ↓
+                    ┌──────────────────────────┐
+                    │ Double-click:            │
+                    │ run_engine.bat           │
+                    │ DONE! ✓                  │
+                    └──────────────────────────┘
+                               ↓
+                    ┌──────────────────────────┐
+                    │ Monitor alerts in        │
+                    │ console window           │
+                    │ & log file               │
+                    └──────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+
+FILE CHECKLIST - You should have these 7 files:
+
+✓ quant_alert_engine.py    (Main application - 550 lines)
+✓ config.json              (Configuration file - edit this!)
+✓ setup_windows.bat        (Installation script)
+✓ run_engine.bat           (Daily run script)
+✓ requirements.txt         (Python dependencies)
+✓ README.md                (Full documentation)
+✓ QUICK_REFERENCE.txt      (Quick tips)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+AFTER INSTALLATION - DAILY USE
+
+Morning:
+  1. Double-click: run_engine.bat
+  2. Minimize console (it keeps running in background)
+  3. Alerts appear as Windows notifications + sounds
+
+Evening:
+  1. Open quant_alert_engine.log
+  2. Review alerts that fired
+  3. Note profitable patterns
+
+Before Bed:
+  1. Press CTRL+C in console to stop
+  2. Close the window
+
+═══════════════════════════════════════════════════════════════════════════════
+
+DIRECTORY STRUCTURE (What gets created)
+
+After setup_windows.bat runs, your folder looks like:
+
+C:\Users\YourName\quant-alert-engine\
+│
+├─ quant_alert_engine.py          (Main app)
+├─ config.json                     (Settings - EDIT THIS)
+├─ setup_windows.bat               (Setup script)
+├─ run_engine.bat                  (Run script)
+├─ requirements.txt                (Dependencies)
+├─ README.md                       (Documentation)
+├─ QUICK_REFERENCE.txt             (Quick tips)
+│
+├─ venv\                          (Python virtual environment)
+│  └─ (auto-created, don't touch)
+│
+├─ logs\                          (Log files stored here)
+│  └─ (auto-created)
+│
+└─ quant_alert_engine.log         (Main log file - READ THIS!)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SYSTEM REQUIREMENTS
+
+✓ Windows 10 or 11 (64-bit recommended)
+✓ Python 3.8 or higher (3.10+ recommended)
+✓ 2GB RAM minimum (4GB+ recommended)
+✓ Internet connection (for live data)
+✓ 100MB disk space
+
+═══════════════════════════════════════════════════════════════════════════════
+
+IMPORTANT STEPS
+
+STEP 1: Install Python
+───────────────────────
+Go to: https://www.python.org/downloads/
+
+Download: Python 3.10+ for Windows (64-bit)
+
+Run installer:
+  1. Click "Add Python to PATH" ✓ (IMPORTANT!)
+  2. Click "Install Now"
+  3. Wait for completion
+  4. Close installer
+
+Verify:
+  1. Open Command Prompt
+  2. Type: python --version
+  3. Should show: Python 3.10.x or higher
+
+
+STEP 2: Extract Files
+──────────────────────
+Extract all 7 files to a single folder, e.g.:
+  C:\Users\YourName\quant-alert-engine\
+
+Files MUST be in same folder:
+  ✓ quant_alert_engine.py
+  ✓ config.json
+  ✓ setup_windows.bat
+  ✓ run_engine.bat
+  ✓ requirements.txt
+  ✓ README.md
+  ✓ QUICK_REFERENCE.txt
+
+
+STEP 3: Run Setup
+──────────────────
+1. Right-click in folder → "Open Command Prompt here"
+2. Or: Right-click → "Open PowerShell window here"
+3. Type: setup_windows.bat
+4. Press Enter
+5. Wait for completion (2-5 minutes)
+
+Output should show:
+  [OK] Python is installed
+  [OK] Virtual environment created
+  [OK] All packages installed successfully
+  [OK] Directory structure created
+  SETUP COMPLETED SUCCESSFULLY!
+
+
+STEP 4: Edit Configuration
+───────────────────────────
+1. Open config.json with Notepad (or VSCode)
+2. Find: "symbols": [...]
+3. Edit to your pairs:
+
+Example BEFORE:
+  "symbols": ["SOL/USDT", "XRP/USDT", "SUI/USDT"],
+
+Example AFTER (Bitcoin & Ethereum):
+  "symbols": ["BTC/USDT", "ETH/USDT"],
+
+Save file (Ctrl+S)
+
+
+STEP 5: Run the Engine
+─────────────────────
+1. Double-click: run_engine.bat
+2. Console opens
+3. See: "QUANT ALERT ENGINE v1.0 - Starting"
+4. Alerts appear here + Windows notifications
+
+STOP: Press CTRL+C in console
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+CONFIGURATION QUICK REFERENCE
+
+config.json - Main Settings File
+
+Change Symbols:
+────────────────
+"symbols": [
+  "SOL/USDT",      ← Change these
+  "XRP/USDT",      ← To your pairs
+  "SUI/USDT"       ← Format: SYMBOL/USDT
+]
+
+Change Check Speed (seconds):
+──────────────────────────────
+"general": {
+  "check_interval": 5    ← 3 (fast) to 60 (slow)
+}
+
+Enable/Disable Alerts:
+──────────────────────
+"volume": {"enabled": true},     ← Change to false to disable
+"rsi": {"enabled": true},        ← Change to false to disable
+"macd": {"enabled": true},       ← Change to false to disable
+"stochastic": {"enabled": true}, ← Change to false to disable
+"volatility": {"enabled": true}, ← Change to false to disable
+"cvd": {"enabled": true}         ← Change to false to disable
+
+Turn Off Sounds/Notifications:
+──────────────────────────────
+"general": {
+  "enable_sound": false,        ← Mute alert sounds
+  "enable_notifications": false ← Disable Windows popups
+}
+
+═══════════════════════════════════════════════════════════════════════════════
+
+COMMON ISSUES & FIXES
+
+Issue: "Python is not recognized"
+─────────────────────────────────
+Solution:
+  1. Reinstall Python from python.org
+  2. Check "Add Python to PATH"
+  3. Restart Command Prompt
+
+
+Issue: "ModuleNotFoundError"
+────────────────────────────
+Solution:
+  1. Open Command Prompt in folder
+  2. Type: venv\Scripts\activate.bat
+  3. Type: pip install -r requirements.txt
+
+
+Issue: No alerts appearing
+──────────────────────────
+Solution:
+  1. Check config.json - is symbol correct? (SOL/USDT not SOLUSDT)
+  2. Enable indicators: "enabled": true
+  3. Check quant_alert_engine.log for errors
+  4. Try a major pair first: BTC/USDT or ETH/USDT
+
+
+Issue: Windows notifications not showing
+────────────────────────────────────────
+Solution:
+  1. Settings → System → Notifications
+  2. Enable notifications
+  3. Or disable in config: "enable_notifications": false
+
+
+Issue: High CPU usage
+─────────────────────
+Solution:
+  1. Increase check_interval to 30 seconds
+  2. Reduce number of symbols
+  3. Disable unused indicators
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SUPPORT RESOURCES
+
+1. README.md ......... Full documentation (100+ sections)
+2. QUICK_REFERENCE.txt  Quick tips & tricks
+3. quant_alert_engine.log  Check logs for errors
+4. config.json ....... Adjust parameters here
+5. Original Pine Script  See the .pine file for indicator logic
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SUCCESS CHECKLIST
+
+✓ Python 3.10+ installed
+✓ All 7 files in same folder
+✓ setup_windows.bat ran successfully
+✓ config.json edited with your symbols
+✓ run_engine.bat runs without errors
+✓ Console shows "Analyzing SOL/USDT..." (or your symbols)
+✓ quant_alert_engine.log created
+✓ Alerts appear in console (wait 5+ minutes for first alert)
+✓ Windows notifications popup when alert fires
+✓ Alert sounds play (if enabled)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+YOU'RE READY! 🚀
+
+Your Quant Alert Engine is now running on Windows 11.
+
+Next steps:
+  1. Let it run for 1 hour to see real alerts
+  2. Review the alerts in quant_alert_engine.log
+  3. Adjust config.json parameters to your trading style
+  4. Add more symbols as needed
+  5. Use alerts to inform your trading decisions
+
+Good luck! 📈
+
+═══════════════════════════════════════════════════════════════════════════════

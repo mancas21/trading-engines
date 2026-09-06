@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Logs and runtime output
+logs/
+*.log
+
+# Secrets — never commit
+.env
+config.json
+!.env.example
+*.key
+*.secret
+
+# Runtime data (SQLite, lock files)
+data/
+*.db
+*.db-wal
+*.db-shm
+*.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Quant Alert Engine specific
+.quant_lock

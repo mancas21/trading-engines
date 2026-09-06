@@ -1,0 +1,12 @@
+C:\atas-bridge\atas-exporter\bin\Debug\net10.0\AtasExporter.deps.json
+C:\atas-bridge\atas-exporter\bin\Debug\net10.0\AtasExporter.dll
+C:\atas-bridge\atas-exporter\bin\Debug\net10.0\AtasExporter.pdb
+C:\atas-bridge\atas-exporter\obj\Debug\net10.0\AtasExporter.csproj.AssemblyReference.cache
+C:\atas-bridge\atas-exporter\obj\Debug\net10.0\AtasExporter.GeneratedMSBuildEditorConfig.editorconfig
+C:\atas-bridge\atas-exporter\obj\Debug\net10.0\AtasExporter.AssemblyInfoInputs.cache
+C:\atas-bridge\atas-exporter\obj\Debug\net10.0\AtasExporter.AssemblyInfo.cs
+C:\atas-bridge\atas-exporter\obj\Debug\net10.0\AtasExporter.csproj.CoreCompileInputs.cache
+C:\atas-bridge\atas-exporter\obj\Debug\net10.0\AtasExporter.dll
+C:\atas-bridge\atas-exporter\obj\Debug\net10.0\refint\AtasExporter.dll
+C:\atas-bridge\atas-exporter\obj\Debug\net10.0\AtasExporter.pdb
+C:\atas-bridge\atas-exporter\obj\Debug\net10.0\ref\AtasExporter.dll

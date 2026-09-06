@@ -1,0 +1,4 @@
+C:\atas-bridge\atas-exporter\obj\Debug\net10.0\InspectDll.GeneratedMSBuildEditorConfig.editorconfig
+C:\atas-bridge\atas-exporter\obj\Debug\net10.0\InspectDll.AssemblyInfoInputs.cache
+C:\atas-bridge\atas-exporter\obj\Debug\net10.0\InspectDll.AssemblyInfo.cs
+C:\atas-bridge\atas-exporter\obj\Debug\net10.0\InspectDll.csproj.CoreCompileInputs.cache

@@ -1,0 +1,714 @@
+====================================================================================================
+           QUANTITATIVE RESEARCH & SOFTWARE ENGINEERING AUDIT REPORT
+====================================================================================================
+PROJECT:       TradingView OpenCode Agent / MCP Bridge & Scalper Engine (claudeverstradingview)
+AUDIT TYPE:    Quantitative Research, Algorithmic Crypto Trading & Full-Stack System Architecture Audit
+AUTHOR:        Senior Quantitative Researcher & Lead High-Frequency / Algorithmic Systems Engineer
+DATE:          August 23, 2026
+CLASSIFICATION: TECHNICAL AUDIT / SECURITY & QUANTITATIVE RESILIENCE EVALUATION
+FILE TARGET:   TRADINGVIEW_OPENCODE_AGENT_QUANT_AUDIT.txt
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+TABLE OF CONTENTS
+----------------------------------------------------------------------------------------------------
+1. EXECUTIVE SUMMARY & SYSTEM CLASSIFICATION
+2. QUANTITATIVE SCORECARD & MATURITY MATRIX
+3. QUANTITATIVE RESEARCH & MATHEMATICAL MODELING AUDIT
+   3.1. Indicator Mathematical Divergences (RSI, EMA, VWAP)
+   3.2. Signal Logic Contradictions & Execution Asymmetry
+   3.3. Intraday Lookahead & Pine Script Repainting Bias
+   3.4. Backtester Overfitting & Microstructure Simulation Distortions
+4. ALGORITHMIC CRYPTO TRADING & EXECUTION ENGINE AUDIT (scalper-run.js)
+   4.1. Taker Fee Friction & Negative Expected Value (EV)
+   4.2. Precision, Lot Size Truncation & Step Sizing
+   4.3. Anti-Wash-Trading Lock & Fragile Error Parsing
+   4.4. Polling Cadence vs. Bar-Close Synchronization
+   4.5. Exchange Transport, Keep-Alive & Rate Limit Vulnerabilities
+5. SOFTWARE ARCHITECTURE & CDP BRIDGE AUDIT (src/core & src/connection.js)
+   5.1. Chrome DevTools Protocol (CDP) Concurrency & Renderer Blocking
+   5.2. React Fiber Traversal & Monaco Editor Discovery Vulnerability
+   5.3. DOM Scraping Fragility vs. Native API Hooks
+   5.4. Stream Polling vs. Event-Driven Model Subscription
+   5.5. Memory Leaks, Signal Handling & Stdio Cleanliness
+6. RISK MANAGEMENT, STATE SYNCHRONIZATION & OPERATIONAL RESILIENCE
+   6.1. Decoupling of rules.json from Active Execution Pipelines
+   6.2. In-Memory Delta & State Loss on Process Termination
+   6.3. Lack of Hard Circuit Breakers, Drawdown Caps & Bracket Orders
+7. SECURITY & THREAT MODELING
+   7.1. Unauthenticated CDP Port (9222) Exploitation Vector
+   7.2. Plaintext Credential Handling & Environment Hygiene
+   7.3. Unrestricted In-Process Remote Code Execution
+8. CODE-LEVEL FINDINGS MATRIX (CRITICAL TO INFORMATIONAL)
+9. QUANTITATIVE & ARCHITECTURAL REMEDIATION ROADMAP (PRODUCTION FIXES & CODE DIFFS)
+10. CONCLUSION & FORMAL AUDITOR SIGN-OFF
+
+====================================================================================================
+1. EXECUTIVE SUMMARY & SYSTEM CLASSIFICATION
+====================================================================================================
+
+The audited repository represents a hybrid system combining:
+1. An Model Context Protocol (MCP) server exposing 78 tools via Chrome DevTools Protocol (CDP) 
+   to inspect, control, and manipulate TradingView Desktop (Electron).
+2. A Pine Script static analysis, cloud compilation, and extraction toolchain.
+3. An algorithmic crypto scalping testbed (`scalper-run.js`) targeting BitGet Spot (XRP/USDT).
+4. A morning briefing and multi-asset scanner (`rules.json`, `morning.js`).
+
+EXECUTIVE VERDICT:
+The MCP/CDP bridge architecture is innovative and demonstrates impressive reverse-engineering of
+TradingView's internal React Fiber tree, Monaco editor, and internal data sources. However, from the
+perspective of Quantitative Research and Production Algorithmic Trading:
+
+- The crypto execution engine (`scalper-run.js`) contains fatal mathematical flaws in indicator
+  formulations (Wilder's smoothing missing from RSI, VWAP calculated on rolling 30 bars instead of
+  session anchor, EMA warmup truncated), market orders suffering severe fee drag, fragile regex
+  error-string parsing for locks, and lack of real-time state persistence.
+- The MCP Bridge (`src/`) relies on aggressive DOM scraping and synchronous CDP evaluations that
+  block the TradingView UI thread, poll rather than stream via internal event listeners, and suffer
+  from lookahead/repainting vulnerabilities when reading in-progress Pine indicator graphics.
+- The risk management defined in `rules.json` is purely informational prompt context and is completely
+  disconnected from the programmatic execution engine.
+
+====================================================================================================
+2. QUANTITATIVE SCORECARD & MATURITY MATRIX
+====================================================================================================
+
++------------------------------------------------------+--------+----------------------------------+
+| Dimension                                            | Score  | Status / Grade                   |
++------------------------------------------------------+--------+----------------------------------+
+| 1. Quantitative Rigor & Signal Math                 | 38/100 | CRITICAL DEFICIENCIES (F)        |
+| 2. Market Microstructure & Execution Engineering     | 42/100 | HIGH RISK (D-)                   |
+| 3. CDP Bridge Architecture & Tooling Robustness      | 78/100 | SOLID FOUNDATION (B-)            |
+| 4. Pine Script Parsing & Compiler Pipeline           | 84/100 | VERY GOOD (B+)                   |
+| 5. Risk Management & Capital Protection              | 25/100 | FAILING / NON-EXISTENT (F)       |
+| 6. Security, Authentication & Threat Surface         | 52/100 | MODERATE / ACTION NEEDED (C-)    |
++------------------------------------------------------+--------+----------------------------------+
+| OVERALL WEIGHTED SYSTEM SCORE                        | 53/100 | HIGH RISK FOR LIVE CAPITAL (D+)  |
++------------------------------------------------------+--------+----------------------------------+
+
+====================================================================================================
+3. QUANTITATIVE RESEARCH & MATHEMATICAL MODELING AUDIT
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+3.1. INDICATOR MATHEMATICAL DIVERGENCES (RSI, EMA, VWAP)
+----------------------------------------------------------------------------------------------------
+
+File: `scalper-run.js` (Lines 107-138)
+
+[DEFECT 3.1.1] Cutler's RSI vs. Wilder's Smoothed RSI (ta.rsi)
+----------------------------------------------------------------------------------------------------
+Code excerpt in `scalper-run.js` (Lines 114-126):
+```javascript
+function calcRSI(closes, period = 3) {
+  if (closes.length < period + 1) return 50;
+  let gains = 0, losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) gains += diff;
+    else losses -= diff;
+  }
+  if (losses === 0) return 100;
+  const rs = gains / losses;
+  return 100 - 100 / (1 + rs);
+}
+```
+Mathematical Analysis:
+1. The implementation calculates Cutler's RSI (Simple Moving Average of diffs over 3 bars).
+2. Standard TradingView Pine Script `ta.rsi(close, 3)` utilizes Wilder's Exponential Smoothing (RMA,
+   where alpha = 1/N).
+3. Wilder's smoothing carries an infinite impulse response (IIR) memory:
+      AvgGain_t = (AvgGain_{t-1} * (period - 1) + CurrentGain) / period
+4. Because `calcRSI` only sums the last 3 price differences:
+   - It experiences extreme discrete volatility.
+   - It ignores all price trends before `t-3`.
+   - The values generated in `scalper-run.js` WILL NOT MATCH the values seen on the TradingView chart,
+     leading Claude or the autonomous agent to make decisions on phantom indicator readings.
+
+[DEFECT 3.1.2] EMA Warmup & Burn-in Truncation
+----------------------------------------------------------------------------------------------------
+Code excerpt in `scalper-run.js` (Lines 107-112):
+```javascript
+function calcEMA(closes, period) {
+  const k = 2 / (period + 1);
+  let ema = closes[0];
+  for (let i = 1; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
+  return ema;
+}
+```
+Mathematical Analysis:
+1. `getCandles(SYMBOL, 30)` fetches only 30 1-minute bars.
+2. An EMA initialized at `closes[0]` requires at least 3.5 to 5 * period bars to decay the initialization
+   weight of `closes[0]` below 1%. For an 8-period EMA:
+      Weight of closes[0] after 30 bars = (1 - 2/9)^29 = (0.7778)^29 = 0.00067 (~0.07%).
+3. While 30 bars is marginally acceptable for EMA(8), if period is changed (e.g. EMA 20 or EMA 50),
+   the 30-bar dataset causes massive estimation error (>15% initialization bias).
+4. Best practice: Initialize `ema` with the Simple Moving Average (SMA) of the first `period` bars,
+   and fetch at least `200 + period` bars of historical data.
+
+[DEFECT 3.1.3] Rolling 30-Bar VWAP vs. Session Anchored VWAP
+----------------------------------------------------------------------------------------------------
+Code excerpt in `scalper-run.js` (Lines 128-138):
+```javascript
+function calcVWAP(candles) {
+  let cumTPV = 0, cumVol = 0;
+  for (const c of candles) {
+    const tp = (c.high + c.low + c.close) / 3;
+    cumTPV += tp * c.vol;
+    cumVol += c.vol;
+  }
+  return cumVol === 0 ? candles[candles.length - 1].close : cumTPV / cumVol;
+}
+```
+Mathematical Analysis:
+1. In institutional trading and TradingView's built-in VWAP, VWAP is **anchored to the session open**
+   (for 24/7 crypto, standard anchor is 00:00:00 UTC).
+2. The code computes a **30-minute Rolling Volume Weighted Moving Average (VWMA)**.
+3. This creates a severe divergence:
+   - At 23:00 UTC, true VWAP has 23 hours of volume accumulation.
+   - The script's `calcVWAP` only has 30 minutes of volume.
+   - Support/Resistance levels derived from this rolling VWAP will have zero correlation with institutional
+     or retail VWAP orders executing on BitGet/Binance.
+
+----------------------------------------------------------------------------------------------------
+3.2. SIGNAL LOGIC CONTRADICTIONS & EXECUTION ASYMMETRY
+----------------------------------------------------------------------------------------------------
+
+File: `scalper-run.js` (Lines 141-157)
+```javascript
+const bullBias = last > vwap && last > ema8;
+const bearBias = last < vwap && last < ema8;
+
+let signal = "flat";
+if (bullBias && rsi3 < 30) signal = "buy";
+else if (bearBias && rsi3 > 70) signal = "sell";
+```
+Quantitative Flaws:
+1. Mathematical Mutual Exclusivity on Short Timeframes:
+   - For `last > ema8` to be true on a 1-minute bar, the close must be trading above the fast 8-period EMA.
+   - For `rsi3 < 30` (calculated over only 3 bars), the last 3 bars must have experienced violent downward price drops.
+   - If price experienced 3 consecutive down bars, `last` is almost certainly below `ema8`.
+   - Result: The condition `last > ema8 && rsi3 < 30` represents a 3-standard-deviation tail event
+     (e.g., a massive green trend followed by a micro-flash crash that barely halts above EMA8). This signal
+     will almost never trigger during normal market regimes, leading to idle capital.
+2. Missing Symmetry & Short Capability:
+   - The strategy is executed on Spot XRP/USDT.
+   - `signal === "sell"` only exits an existing XRP position (`holding === "xrp"`).
+   - If market enters a strong bear trend, the agent is incapable of shorting (perpetual futures) and
+     will remain 100% idle in USDT.
+
+----------------------------------------------------------------------------------------------------
+3.3. INTRADAY LOOKAHEAD & PINE SCRIPT REPAINTING BIAS
+----------------------------------------------------------------------------------------------------
+
+File: `src/core/data.js` (Lines 410-504: `getPineLines`, `getPineLabels`, `getPineBoxes`)
+
+Quantitative Vulnerability:
+1. Direct extraction from TradingView's internal primitives:
+   `s._graphics._primitivesCollection.dwglines.get('lines').get(false)._primitivesDataById`
+2. Repainting Hazards:
+   - Many Pine indicators draw lines/labels on realtime bar updates (`barstate.isrealtime` or `barstate.isconfirmed`).
+   - If an indicator uses ZigZag, Pivot Points, Order Flow / Volume Profile, or Higher Timeframe `request.security()`
+     without `barmerge.lookahead_off`, the levels extracted by MCP are non-causal (they look ahead into the future).
+   - If Claude uses these levels to formulate trade entries, it suffers from severe historical confirmation bias.
+3. No Bar Confirmation Check:
+   - The bridge cannot distinguish between a confirmed bar graphic and an unconfirmed, fluctuating graphic.
+
+----------------------------------------------------------------------------------------------------
+3.4. BACKTESTER OVERFITTING & MICROSTRUCTURE SIMULATION DISTORTIONS
+----------------------------------------------------------------------------------------------------
+
+File: `src/core/data.js` (Lines 169-236: `getStrategyResults`, `getTrades`)
+
+Quantitative Risk:
+1. Strategy Tester Extraction:
+   - Extracts raw `strat.reportData()` and `strat.performance()`.
+2. Omission of Critical Execution Metrics:
+   - TradingView Pine strategies by default execute on bar close or intrabar without simulating real-world
+     order book depth, queue priority, taker fees, or slippage.
+   - The MCP tool does not inspect whether `slippage` and `commission_value` were parameterized in `strategy()`.
+   - Relying on `getStrategyResults` without auditing the underlying Pine configuration will lead the LLM
+     to approve overfitted, unviable trading strategies.
+
+====================================================================================================
+4. ALGORITHMIC CRYPTO TRADING & EXECUTION ENGINE AUDIT (scalper-run.js)
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+4.1. TAKER FEE FRICTION & NEGATIVE EXPECTED VALUE (EV)
+----------------------------------------------------------------------------------------------------
+
+File: `scalper-run.js` (Lines 160-169)
+```javascript
+async function placeOrder(side, size) {
+  const body = {
+    symbol: SYMBOL,
+    side,
+    orderType: "market",
+    force: "gtc",
+    size,
+  };
+  return request("POST", "/api/v2/spot/trade/place-order", body);
+}
+```
+Microstructure Failure:
+1. Every order is executed as a Spot **Market Order** (`orderType: "market"`).
+2. BitGet Spot standard taker fee is 0.10% (VIP 0: 0.1% maker / 0.1% taker; with BGB discount: 0.08%).
+3. Round-trip fee friction = 0.10% * 2 = 0.20% (20 basis points).
+4. On a 1-minute XRP/USDT chart, the average true range (ATR) of a 3-bar move is frequently 10-30 bps.
+5. Mathematical Expected Value:
+      EV = E[Return] - (2 * Fee_Taker) - (2 * HalfSpread) - Slippage
+      EV ≈ E[Return] - 0.0020 - 0.0004 - 0.0006 = E[Return] - 0.0030 (-30 bps)
+   To break even, the scalper must generate an unhedged gross return > 0.30% per trade.
+   Executing 10-second scalping with market orders is a guaranteed capital depletion mechanism.
+
+----------------------------------------------------------------------------------------------------
+4.2. PRECISION, LOT SIZE TRUNCATION & STEP SIZING
+----------------------------------------------------------------------------------------------------
+
+File: `scalper-run.js` (Lines 189, 256, 260)
+```javascript
+size = (bals.usdt * 0.9).toFixed(4); // Buy size (in USDT)
+size = (Math.floor(lastBuyXrpQty * 10000) / 10000).toFixed(4); // Sell size (in XRP)
+```
+Exchange Specification Errors:
+1. In BitGet Spot API v2:
+   - Market BUY orders with `orderType: "market"` require `size` denominated in **quote currency** (USDT).
+   - Market SELL orders with `orderType: "market"` require `size` denominated in **base currency** (XRP).
+   - Precision for XRP is typically 2 or 4 decimal places, but min notional is $5 USDT.
+2. Truncation Hazard:
+   - The script hardcodes `.toFixed(4)`. If trading BTC or ETH, 4 decimal places on market buy is invalid or
+     violates stepSize.
+   - If `bals.usdt * 0.9` is $4.50 USDT (less than exchange min-trade size of 5.00 USDT), BitGet rejects
+     the order with error `43012` (Order amount exceeds minimum limit).
+   - The code does not query `/api/v2/spot/public/symbols` to dynamically read `minTradeAmount`,
+     `quantityScale`, `priceScale`, or `minTradeUSDT`.
+
+----------------------------------------------------------------------------------------------------
+4.3. ANTI-WASH-TRADING LOCK & FRAGILE ERROR PARSING
+----------------------------------------------------------------------------------------------------
+
+File: `scalper-run.js` (Lines 187-214)
+```javascript
+async function placeSellWithRetry(qty, maxRetries = 12, retryDelayMs = 5000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const size = (Math.floor(qty * 10000) / 10000).toFixed(4);
+    const res = await placeOrder("sell", size);
+    if (res.code === "00000") return { ok: true, res, soldQty: parseFloat(size) };
+
+    const lockMatch = res.msg?.match(/([\d.]+)XRP can be used at most/i);
+    if (lockMatch) {
+      console.log(`  🔒 Lock active — only ${lockMatch[1]} XRP tradeable...`);
+      await new Promise((r) => setTimeout(r, retryDelayMs));
+      continue;
+    }
+    return { ok: false, res, soldQty: 0 };
+  }
+}
+```
+Systemic Risks:
+1. Fragile Regex Coupling:
+   - The anti-wash-trading lock regex `/([\d.]+)XRP can be used at most/i` is hardcoded to "XRP" and exact
+     English phrasing.
+   - If BitGet updates API response messages (e.g. "Available balance insufficient: 0.123 XRP"), the regex fails,
+     aborting retries immediately and leaving the trader holding unhedged inventory.
+2. Dangerous 60-Second Block:
+   - 12 retries * 5,000ms = 60 seconds blocking duration.
+   - In high-volatility crypto markets, holding an unmanaged position for 60 seconds without stop-loss
+     exposes the account to catastrophic adverse selection.
+
+----------------------------------------------------------------------------------------------------
+4.4. POLLING CADENCE VS. BAR-CLOSE SYNCHRONIZATION
+----------------------------------------------------------------------------------------------------
+
+File: `scalper-run.js` (Lines 29, 227-275)
+- `TOTAL_TRADES = 6`, `INTERVAL_MS = 10000` (10 seconds).
+- `getCandles(SYMBOL, 30)` fetches 1-minute candles (`granularity=1min`).
+Flaw:
+- 10-second polling evaluates the same 1-minute candle up to 6 times before it closes.
+- The indicator calculations (`last`, `ema8`, `rsi3`, `vwap`) are computed on in-progress, unclosed bar data.
+- Intra-bar noise generates false breakout signals that vanish before the candle closes.
+- Scalper trades on intermediate ticks without confirmation.
+
+----------------------------------------------------------------------------------------------------
+4.5. EXCHANGE TRANSPORT, HTTP STACK & RATE LIMITING
+----------------------------------------------------------------------------------------------------
+
+File: `scalper-run.js` (Lines 39-68)
+```javascript
+function request(method, path, body = null) {
+  return new Promise((resolve, reject) => {
+    ...
+    const req = https.request({ hostname: "api.bitget.com", path, method, headers }, (res) => {
+      let d = "";
+      res.on("data", (c) => (d += c));
+      res.on("end", () => resolve(JSON.parse(d)));
+    });
+    req.on("error", reject);
+  });
+}
+```
+Flaws:
+1. No HTTP status check (`res.statusCode`). If Cloudflare returns `502 Bad Gateway` (HTML body),
+   `JSON.parse(d)` throws an unhandled JSON parsing exception, crashing `main()`.
+2. No HTTP Keep-Alive Agent (`agent: new https.Agent({ keepAlive: true })`). Every request undergoes
+   full TCP handshake and TLS negotiation (adds 100-250ms of network latency per call).
+3. No Nonce / Rate Limit Backoff: Zero handling for HTTP 429 Too Many Requests.
+
+====================================================================================================
+5. SOFTWARE ARCHITECTURE & CDP BRIDGE AUDIT (src/)
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+5.1. CHROME DEVTOOLS PROTOCOL (CDP) CONCURRENCY & RENDERER BLOCKING
+----------------------------------------------------------------------------------------------------
+
+File: `src/connection.js` (Lines 1-69, 87-106)
+- Global singleton `client`.
+- `evaluate` executes JavaScript in the TradingView Electron UI process via `Runtime.evaluate`.
+Architectural Risks:
+1. UI Thread Contention:
+   - Large synchronous evaluations (e.g. scanning hundreds of lines/boxes in `getPineLines` or
+     `getStudyValues`) execute on the main thread of TradingView's WebContents.
+   - If the chart is rendering high-frequency ticks, heavy CDP scripts cause UI frame drops,
+     chart stuttering, and can trigger Electron renderer timeouts.
+2. Concurrent Evaluation Collisions:
+   - When multiple tools or streams run concurrently (e.g. streaming bars while calling `data_get_pine_lines`),
+     interleaved `Runtime.evaluate` calls with promises can result in race conditions.
+
+----------------------------------------------------------------------------------------------------
+5.2. REACT FIBER TRAVERSAL & MONACO EDITOR DISCOVERY VULNERABILITY
+----------------------------------------------------------------------------------------------------
+
+File: `src/core/pine.js` (Lines 8-36: `FIND_MONACO`)
+```javascript
+const FIND_MONACO = `
+  (function findMonacoEditor() {
+    var container = document.querySelector('.monaco-editor.pine-editor-monaco');
+    if (!container) return null;
+    var el = container;
+    var fiberKey;
+    for (var i = 0; i < 20; i++) {
+      if (!el) break;
+      fiberKey = Object.keys(el).find(function(k) { return k.startsWith('__reactFiber$'); });
+      if (fiberKey) break;
+      el = el.parentElement;
+    }
+    ...
+  })()
+`;
+```
+Engineering Evaluation:
+- Ingenious implementation to extract the internal Monaco instance from React 18+ Fiber internals.
+- High Brittleness: Any minor update to TradingView Desktop (e.g. changes in component hierarchy,
+  wrapping Monaco inside an iframe, React version bump, or obfuscation of `memoizedProps.value.monacoEnv`)
+  will cause `FIND_MONACO` to return `null`, breaking all Pine Script tools (`pine_set_source`, `pine_compile`, etc.).
+
+----------------------------------------------------------------------------------------------------
+5.3. DOM SCRAPING FRAGILITY VS. NATIVE API HOOKS
+----------------------------------------------------------------------------------------------------
+
+Files: `src/core/alerts.js`, `src/core/ui.js`, `src/core/data.js` (`getDepth`)
+- `getDepth`: Scrapes DOM classes (`document.querySelector('[class*="depth"]')`). If user does not
+  manually have the DOM panel open in the UI, `depth_get` fails completely.
+- `alert_create`: Simulates UI clicks, keyboard shortcuts (`KeyA`), and sets input values via
+  `HTMLInputElement.prototype.value`.
+- `morning.js`: Injects artificial delays (`setTimeout(r, 900)`) and changes active user chart
+  symbols during scan, disrupting active trading operations.
+
+----------------------------------------------------------------------------------------------------
+5.4. STREAM POLLING VS. EVENT-DRIVEN MODEL SUBSCRIPTION
+----------------------------------------------------------------------------------------------------
+
+File: `src/core/stream.js` (Lines 15-56)
+- Implements streaming via high-frequency `pollLoop` (`setInterval` / `sleep(300)`).
+Architectural Issue:
+- Continuous polling sends 3-5 CDP evaluate requests per second to Electron.
+- TradingView's internal `model().mainSeries().dataEvents()` already dispatches event callbacks
+  when bars update. Polling adds CPU overhead, latency jitter, and battery drain.
+
+----------------------------------------------------------------------------------------------------
+5.5. MEMORY LEAKS, SIGNAL HANDLING & STDIO CLEANLINESS
+----------------------------------------------------------------------------------------------------
+
+Files: `src/server.js`, `src/core/stream.js`
+- `src/server.js` (Lines 91-97): Writes banner to `process.stderr`. This correctly adheres to MCP
+  specification (preserving `process.stdout` exclusively for JSON-RPC 2.0 frames).
+- In `stream.js`, `SIGINT`/`SIGTERM` handlers are registered in `pollLoop`. If multiple streams are
+  spawned and killed, event listener memory leaks can accumulate on `process`.
+
+====================================================================================================
+6. RISK MANAGEMENT, STATE SYNCHRONIZATION & OPERATIONAL RESILIENCE
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+6.1. DECOUPLING OF rules.json FROM ACTIVE EXECUTION PIPELINES
+----------------------------------------------------------------------------------------------------
+
+File: `rules.json` vs. `scalper-run.js`
+- `rules.json` contains sound risk parameters:
+  - `max_risk_per_trade_pct: 1`
+  - `max_daily_loss_pct: 3`
+  - `position_size_formula: "risk_amount / (entry - stop)"`
+  - `stop_loss: "2x ATR or recent swing high/low"`
+  - `take_profit: "2R and 4R, move to breakeven at 1R"`
+- **CRITICAL GAP**: None of these rules are imported, enforced, or referenced in `scalper-run.js`.
+  `scalper-run.js` risks 90% of available USDT balance (`bals.usdt * 0.9`), places no stop loss,
+  places no take profit, and has zero daily drawdown monitoring.
+
+----------------------------------------------------------------------------------------------------
+6.2. IN-MEMORY DELTA & STATE LOSS ON PROCESS TERMINATION
+----------------------------------------------------------------------------------------------------
+
+File: `scalper-run.js` (Lines 224-225)
+- State is held in temporary variables: `let holding = "usdt"`, `let lastBuyXrpQty = 0`.
+- If the node process crashes (e.g. network disconnect, uncaught exception, OS reboot):
+  1. The agent loses knowledge that it bought XRP.
+  2. Upon restart, `holding` re-initializes to `"usdt"`.
+  3. The agent will attempt to buy again with whatever residual USDT remains, leaving the previously
+     purchased XRP orphaned and unprotected indefinitely.
+
+----------------------------------------------------------------------------------------------------
+6.3. LACK OF HARD CIRCUIT BREAKERS & BRACKET ORDERS
+----------------------------------------------------------------------------------------------------
+
+- No Exchange-Side Stop-Loss: Orders are sent without attached OCO (One-Cancels-the-Other) or
+  Stop-Market orders on BitGet.
+- If connectivity to BitGet drops or the script hangs, open positions have ZERO exchange-side protection.
+
+====================================================================================================
+7. SECURITY & THREAT MODELING
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+7.1. UNAUTHENTICATED CDP PORT (9222) EXPLOITATION VECTOR
+----------------------------------------------------------------------------------------------------
+
+- TradingView Desktop is launched with `--remote-debugging-port=9222`.
+- Chrome Remote Debugging Protocol has NO built-in authentication.
+- Any local application, unprivileged user script, or malicious webpage (via WebSocket SSRF to
+  `ws://localhost:9222`) can connect to port 9222, execute arbitrary JavaScript in TradingView,
+  access session cookies, read private Pine scripts, and execute unwanted UI actions.
+- Recommendation: Ensure firewall blocks all external access to port 9222 and avoid running untrusted
+  local scripts while debugging port is open.
+
+----------------------------------------------------------------------------------------------------
+7.2. PLAINTEXT CREDENTIAL HANDLING & ENVIRONMENT HYGIENE
+----------------------------------------------------------------------------------------------------
+
+File: `scalper-run.js` (Lines 6-19)
+- Custom `.env` parser reads plaintext API keys.
+- If repository is published to GitHub or shared with logs, `.env` and `safety-check-log.json`
+  can easily leak sensitive balance and trade history.
+- API Key Permissions: API keys must be strictly scoped to "Spot Trading" with IP whitelist enabled
+  and "Withdrawal" permissions PERMANENTLY DISABLED.
+
+====================================================================================================
+8. CODE-LEVEL FINDINGS MATRIX
+====================================================================================================
+
++----+------------------+-----------------+-----------+-----------------------------------------------+
+| ID | Component / File | Location        | Severity  | Description & Impact                          |
++----+------------------+-----------------+-----------+-----------------------------------------------+
+| 01 | scalper-run.js   | Lines 114-126   | CRITICAL  | Non-standard RSI calculation (Cutler's SMA vs |
+|    |                  |                 |           | Wilder's RMA) causing major signal divergence.|
++----+------------------+-----------------+-----------+-----------------------------------------------+
+| 02 | scalper-run.js   | Lines 128-138   | CRITICAL  | Rolling 30-bar VWAP instead of true session   |
+|    |                  |                 |           | anchored VWAP (00:00 UTC anchor).             |
++----+------------------+-----------------+-----------+-----------------------------------------------+
+| 03 | scalper-run.js   | Lines 253, 224  | CRITICAL  | In-memory state tracking loses open position  |
+|    |                  |                 |           | on crash; 90% capital risk violates rules.    |
++----+------------------+-----------------+-----------+-----------------------------------------------+
+| 04 | scalper-run.js   | Lines 160-168   | HIGH      | 100% Market orders generate ~20-30 bps fee/   |
+|    |                  |                 |           | slippage drag, wiping out 1m scalping edge.   |
++----+------------------+-----------------+-----------+-----------------------------------------------+
+| 05 | scalper-run.js   | Lines 187-214   | HIGH      | Fragile regex parsing of lock errors; 60s     |
+|    |                  |                 |           | blocking loop exposes unhedged delta.         |
++----+------------------+-----------------+-----------+-----------------------------------------------+
+| 06 | scalper-run.js   | Lines 39-68     | HIGH      | Missing HTTP status verification & keep-alive;|
+|    |                  |                 |           | unhandled JSON parse crash on 502/HTML.       |
++----+------------------+-----------------+-----------+-----------------------------------------------+
+| 07 | src/core/data.js | Lines 410-504   | MEDIUM    | Extraction of unconfirmed Pine drawings with  |
+|    |                  |                 |           | potential lookahead / repainting bias.        |
++----+------------------+-----------------+-----------+-----------------------------------------------+
+| 08 | src/core/pine.js | Lines 8-36      | MEDIUM    | Fragile React Fiber traversal (__reactFiber$) |
+|    |                  |                 |           | vulnerable to TradingView Electron updates.   |
++----+------------------+-----------------+-----------+-----------------------------------------------+
+| 09 | src/core/stream  | Lines 15-56     | MEDIUM    | High-frequency polling loop over CDP creates  |
+|    |                  |                 |           | unnecessary CPU overhead on renderer thread.  |
++----+------------------+-----------------+-----------+-----------------------------------------------+
+| 10 | src/core/morning | Lines 64-87     | LOW       | Morning brief forces active chart switching,  |
+|    |                  |                 |           | interrupting trader UI workflow.              |
++----+------------------+-----------------+-----------+-----------------------------------------------+
+
+====================================================================================================
+9. QUANTITATIVE & ARCHITECTURAL REMEDIATION ROADMAP
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+REMEDIATION 1: QUANTITATIVELY CORRECT INDICATOR CALCULATIONS (scalper-run.js)
+----------------------------------------------------------------------------------------------------
+
+Replace the flawed indicator functions in `scalper-run.js` with mathematically rigorous versions:
+
+```javascript
+// ── Mathematically Rigorous Wilder's RSI (ta.rsi equivalent) ──
+function calcWilderRSI(closes, period = 14) {
+  if (closes.length < period * 2) return 50; // Require sufficient warmup
+
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) gains += diff;
+    else losses -= diff;
+  }
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+  }
+
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
+}
+
+// ── True Session-Anchored VWAP (00:00 UTC Anchor) ──
+function calcSessionVWAP(candles) {
+  if (!candles || candles.length === 0) return 0;
+  
+  // Find index of the first candle of the current UTC day
+  const latestTs = candles[candles.length - 1].ts;
+  const startOfDay = new Date(latestTs).setUTCHours(0, 0, 0, 0);
+
+  let cumTPV = 0, cumVol = 0;
+  for (const c of candles) {
+    if (c.ts >= startOfDay) {
+      const tp = (c.high + c.low + c.close) / 3;
+      cumTPV += tp * c.vol;
+      cumVol += c.vol;
+    }
+  }
+  return cumVol === 0 ? candles[candles.length - 1].close : cumTPV / cumVol;
+}
+
+// ── Warmup-Stabilized EMA ──
+function calcStableEMA(closes, period) {
+  if (closes.length < period) return closes[closes.length - 1];
+  const k = 2 / (period + 1);
+  // Seed with SMA
+  let sum = 0;
+  for (let i = 0; i < period; i++) sum += closes[i];
+  let ema = sum / period;
+
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
+```
+
+----------------------------------------------------------------------------------------------------
+REMEDIATION 2: PERSISTENT STATE & HARD RISK MANAGEMENT ENGINE
+----------------------------------------------------------------------------------------------------
+
+Create a dedicated state and risk manager:
+
+```javascript
+import { readFileSync, writeFileSync, existsSync } from "fs";
+
+const STATE_FILE = "position-state.json";
+
+function loadState() {
+  if (existsSync(STATE_FILE)) {
+    return JSON.parse(readFileSync(STATE_FILE, "utf8"));
+  }
+  return { position: "NONE", entryPrice: 0, qty: 0, highestPrice: 0, dailyLossUSDT: 0 };
+}
+
+function saveState(state) {
+  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+function validateRisk(balanceUSDT, riskRules) {
+  if (balanceUSDT <= 0) return { allowed: false, reason: "Insufficient balance" };
+  const maxRiskAmount = balanceUSDT * (riskRules.max_risk_per_trade_pct / 100);
+  return { allowed: true, maxRiskAmount };
+}
+```
+
+----------------------------------------------------------------------------------------------------
+REMEDIATION 3: ROBUST HTTP TRANSPORT & KEEP-ALIVE
+----------------------------------------------------------------------------------------------------
+
+Update `request()` with Keep-Alive agent and status handling:
+
+```javascript
+const agent = new https.Agent({ keepAlive: true, maxSockets: 50 });
+
+function request(method, path, body = null) {
+  return new Promise((resolve, reject) => {
+    const ts = Date.now().toString();
+    const bodyStr = body ? JSON.stringify(body) : "";
+    const sig = sign(ts, method.toUpperCase(), path, bodyStr);
+    
+    const req = https.request({
+      hostname: "api.bitget.com",
+      path,
+      method: method.toUpperCase(),
+      agent,
+      headers: {
+        "Content-Type": "application/json",
+        "ACCESS-KEY": API_KEY,
+        "ACCESS-SIGN": sig,
+        "ACCESS-TIMESTAMP": ts,
+        "ACCESS-PASSPHRASE": PASSPHRASE,
+        "locale": "en-US"
+      }
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => data += chunk);
+      res.on("end", () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          return reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+        }
+        try {
+          resolve(JSON.parse(data));
+        } catch (err) {
+          reject(new Error(`JSON Parse Error: ${err.message} — Body: ${data.substring(0, 100)}`));
+        }
+      });
+    });
+    req.on("error", reject);
+    if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
+}
+```
+
+====================================================================================================
+10. CONCLUSION & FORMAL AUDITOR SIGN-OFF
+====================================================================================================
+
+SUMMARY VERDICT:
+The TradingView OpenCode Agent project is an impressive technical bridge between Anthropic's Model
+Context Protocol and the TradingView Desktop interface. Its ability to extract custom Pine drawings,
+interact with Monaco, and manipulate multi-pane charts provides immense utility for AI-assisted
+technical analysis and Pine Script programming.
+
+However, the algorithmic execution layer (`scalper-run.js`) is NOT PRODUCTION-READY and MUST NOT be
+deployed with live capital until:
+1. Indicator mathematical formulas (Wilder's RSI, Anchored VWAP, Seeded EMA) are corrected.
+2. Market orders are replaced with Maker Limit / Post-Only or Smart Routing to avoid fee decay.
+3. Strict, programmatic risk guardrails (Stop-Loss, Position Sizing, Daily Loss Limit) from `rules.json`
+   are implemented directly into the execution engine.
+4. Position state is persistently serialized to disk or database to survive crashes.
+
+AUDIT STATUS: REVISION REQUIRED PRIOR TO LIVE DEPLOYMENT
+AUDITOR: Senior Quantitative Trading Systems Specialist & Software Engineer
+====================================================================================================

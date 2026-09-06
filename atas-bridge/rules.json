@@ -1,0 +1,94 @@
+{
+  "rules": [
+    {
+      "id": 1,
+      "title": "No Single Bar Prediction",
+      "description": "NEVER call a directional reversal from a single bar. Wait minimum 2 consecutive bars confirming the new direction.",
+      "enforcement": "hard"
+    },
+    {
+      "id": 2,
+      "title": "CVD Extremes = Exhaustion",
+      "description": "A CVD spike >2x prior ATH in one bar is EXHAUSTION, not continuation. Same for crashes >2x max 1-bar decline. Flag as exhaustion; do NOT call continuation.",
+      "enforcement": "hard",
+      "conditions": {
+        "spike_multiple": 2.0,
+        "min_prior_bars": 3
+      }
+    },
+    {
+      "id": 3,
+      "title": "No Invented Probabilities",
+      "description": "Probabilities must come from validated hit-rate. No backtest = output 'probability: unvalidated'. Every probability claim must cite a rule from rules.json.",
+      "enforcement": "hard"
+    },
+    {
+      "id": 4,
+      "title": "Score, Don't Predict",
+      "description": "Output a structured signal scorecard (0-100). Bias >= 60 bullish, <= 40 bearish, 40-59 neutral. Bias is the weighted sum of all signals, not a gut call.",
+      "enforcement": "hard",
+      "thresholds": {
+        "bullish_min": 60,
+        "bearish_max": 40,
+        "neutral_min": 40,
+        "neutral_max": 59
+      }
+    },
+    {
+      "id": 5,
+      "title": "No Pattern Anchoring",
+      "description": "Past shakeouts do not predict future shakeouts. Each bar is judged on its own data. Do not reference prior bar patterns as evidence. Only use current bar data + structural levels.",
+      "enforcement": "hard"
+    },
+    {
+      "id": 6,
+      "title": "Distribution Threshold",
+      "description": "ALL required: (a) CVD drops 2+ consecutive bars AND (b) footprint shows 4+ levels with >70% bid-side selling AND (c) DOM imbalance below +5%. Only then output bearish bias.",
+      "enforcement": "hard",
+      "conditions": {
+        "cvd_consecutive_down_min": 2,
+        "footprint_levels_min": 4,
+        "footprint_sell_pct_min": 70,
+        "dom_imbalance_max": 5
+      }
+    },
+    {
+      "id": 7,
+      "title": "Accumulation Threshold",
+      "description": "ALL required: (a) CVD rises 2+ consecutive bars AND (b) footprint shows 3+ levels with >70% ask-side buying AND (c) DOM imbalance > +10%. Only then output bullish bias.",
+      "enforcement": "hard",
+      "conditions": {
+        "cvd_consecutive_up_min": 2,
+        "footprint_levels_min": 3,
+        "footprint_buy_pct_min": 70,
+        "dom_imbalance_min": 10
+      }
+    },
+    {
+      "id": 8,
+      "title": "Audit On Loss",
+      "description": "After a call that fails (price moves >1% against within 2 bars), record loss with root cause in audit.log.json at START of next analysis.",
+      "enforcement": "hard"
+    },
+    {
+      "id": 9,
+      "title": "Asset Independence",
+      "description": "SUI and SOL analyzed independently. Decoupling means correlation = 0. Do not cross-use weakness/strength as evidence for the other.",
+      "enforcement": "hard"
+    },
+    {
+      "id": 10,
+      "title": "No Trade Plan In Neutral Zone",
+      "description": "No trade plan if bias score is 40-59. Output 'WAIT FOR CONFIRMATION' instead of Setup A/B. Trade plan only when bias >= 60 (long) or <= 40 (short).",
+      "enforcement": "hard"
+    }
+  ],
+  "scoring_weights": {
+    "footprint_depth": 25,
+    "dom_imbalance": 25,
+    "tape_ratio": 20,
+    "volume_climax": 15,
+    "footprint_confirmation": 15
+  },
+  "version": "3.2"
+}

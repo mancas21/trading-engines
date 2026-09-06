@@ -1,0 +1,5 @@
+C:\atas-bridge\atas-exporter\obj\Release\net8.0\AtasExporter.csproj.AssemblyReference.cache
+C:\atas-bridge\atas-exporter\obj\Release\net8.0\AtasExporter.GeneratedMSBuildEditorConfig.editorconfig
+C:\atas-bridge\atas-exporter\obj\Release\net8.0\AtasExporter.AssemblyInfoInputs.cache
+C:\atas-bridge\atas-exporter\obj\Release\net8.0\AtasExporter.AssemblyInfo.cs
+C:\atas-bridge\atas-exporter\obj\Release\net8.0\AtasExporter.csproj.CoreCompileInputs.cache
