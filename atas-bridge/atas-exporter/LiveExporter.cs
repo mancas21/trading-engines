@@ -19,10 +19,16 @@ public class LiveExporter : Indicator
     private string GetExportFilePath()
     {
         var symbol = InstrumentInfo?.Instrument?.Replace("/", "").Replace(":", "").ToUpper() ?? "DEFAULT";
-        return $@"C:\atas-bridge\_live_indicators_{symbol}.json";
+        // Output dir: env override first, else the bridge's current dir.
+        // (was hardcoded C:\atas-bridge, which no longer exists after the
+        // repo moved to trading-engines\atas-bridge).
+        var dir = Environment.GetEnvironmentVariable("ATAS_BRIDGE_DIR");
+        if (string.IsNullOrWhiteSpace(dir))
+            dir = @"C:\Users\Lenovo\trading-engines\atas-bridge";
+        return $@"{dir}\_live_indicators_{symbol}.json";
     }
     private string _filePath => GetExportFilePath();
-    private readonly string _logPath = @"C:\atas-bridge\_exporter_debug.log";
+    private readonly string _logPath = @"C:\Users\Lenovo\trading-engines\atas-bridge\_exporter_debug.log";
     private readonly object _lock = new();
     private DateTime _lastWrite = DateTime.MinValue;
 

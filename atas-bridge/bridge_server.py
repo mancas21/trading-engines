@@ -512,7 +512,26 @@ async def telegram_polling():
 # ---------------------------------------------------------------------------
 # Live indicators from ATAS exporter
 # ---------------------------------------------------------------------------
-_LIVE_INDICATORS_FILE = r"C:\atas-bridge\_live_indicators.json"
+# LiveExporter output path. Resolved relative to THIS bridge's directory so the
+# bridge never depends on a hardcoded absolute path (was C:\atas-bridge, which
+# got deleted when the repo moved to trading-engines\atas-bridge — the source
+# of "frozen /indicators" data). Overridable via ATAS_BRIDGE_DIR env.
+_BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
+_LIVE_INDICATORS_FILE = os.environ.get(
+    "ATAS_BRIDGE_DIR",
+    os.path.join(_BRIDGE_DIR, "_live_indicators.json"),
+)
+# Where the compiled LiveExporter.dll actually writes its per-symbol files.
+# Defaults to the legacy C:\atas-bridge dir until ATAS is rebuilt to the new
+# path — the bridge must read from HERE, not from its own directory.
+_LIVEEXPORTER_OUTPUT_DIR = os.environ.get(
+    "ATAS_BRIDGE_DIR",
+    r"C:\atas-bridge",
+)
+# Max age (s) for a LiveExporter snapshot to be considered "live" — older than
+# this is frozen and must NOT be served as current data (kills the "same stale
+# alert every 15 min" behaviour at the source).
+_LIVE_STALE_LIMIT_SECONDS = 300
 
 # P2: Feature/tick history — append-only JSONL per poll
 _TICK_HISTORY_PATH = os.path.join(os.path.dirname(__file__), "_tick_history.jsonl")
@@ -1665,24 +1684,58 @@ async def _require_auth(request: Request):
         raise HTTPException(status_code=403, detail="Invalid or missing X-Bridge-Token")
 
 def _read_live_data() -> dict | None:
-    """Read latest LiveExporter indicator data. Supports per-symbol files."""
+    """Read latest LiveExporter indicator data. Supports per-symbol files.
+
+    Resolution order (newest file wins, stale files rejected):
+      1. ATAS_BRIDGE_DIR (env) — or the directory of _LIVE_INDICATORS_FILE.
+      2. This bridge's own directory.
+    The compiled LiveExporter.dll writes per-symbol files
+    (_live_indicators_<SYMBOL>.json) into its configured dir (historically
+    C:\\atas-bridge); the legacy single _live_indicators.json is frozen and
+    must never shadow a fresher per-symbol file nor be served when stale.
+    """
+    import glob as _glob
     try:
-        # Prefer legacy single file; fallback to newest per-symbol file
+        # LiveExporter's real output directory (env override or the legacy
+        # C:\atas-bridge dir). This is where ATAS actually writes.
+        live_dir = _LIVEEXPORTER_OUTPUT_DIR
+        search_dirs = []
+        for d in (live_dir, os.path.dirname(os.path.abspath(__file__))):
+            if d and d not in search_dirs and os.path.isdir(d):
+                search_dirs.append(d)
+
         candidates = []
-        if os.path.exists(_LIVE_INDICATORS_FILE):
-            candidates.append(_LIVE_INDICATORS_FILE)
-        import glob as _glob
-        for p in _glob.glob(os.path.join(os.path.dirname(__file__), "_live_indicators_*.json")):
-            if p != _LIVE_INDICATORS_FILE:
-                candidates.append(p)
-        # Pick most recently modified
-        candidates.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+        for d in search_dirs:
+            for p in _glob.glob(os.path.join(d, "_live_indicators_*.json")):
+                if p not in candidates:
+                    candidates.append(p)
+
+        if not candidates:
+            return None
+
+        # Newest mtime first, but drop files older than STALE_LIMIT so a frozen
+        # legacy file can never shadow live data or be served as a snapshot.
+        now = time.time()
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         for path in candidates:
             try:
+                age = now - os.path.getmtime(path)
+                if age > _LIVE_STALE_LIMIT_SECONDS:
+                    continue
                 with open(path, "r") as f:
                     content = f.read()
                 if content.strip():
-                    return _json.loads(content)
+                    data = _json.loads(content)
+                    # Legacy frozen files carry an old internal timestamp too —
+                    # double-guard on the payload's timestamp when present.
+                    ts = data.get("timestamp")
+                    if ts is not None:
+                        try:
+                            if (now * 1000 - float(ts)) > _LIVE_STALE_LIMIT_SECONDS * 1000:
+                                continue
+                        except (TypeError, ValueError):
+                            pass
+                    return data
             except Exception:
                 continue
         return None

@@ -29,5 +29,5 @@ foreach ($p in @($procs)) {
 Start-Sleep -Seconds 1
 
 # Launch detached supervisor (survives our shell exit, auto-restarts on crash)
-wscript "C:\atas-bridge\launch_bridge.vbs"
+wscript "C:\Users\Lenovo\trading-engines\atas-bridge\launch_bridge.vbs"
 Write-Host "Bridge supervisor launched (detached, auto-restart)." -ForegroundColor Green

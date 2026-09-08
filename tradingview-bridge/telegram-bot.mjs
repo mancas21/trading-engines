@@ -141,6 +141,10 @@ async function getChartQuote() {
 async function runAnalysis() {
   log('[BOT] Running analysis...');
   const ind = await lxRequest('/indicators');
+  if (!indicatorsFresh(ind)) {
+    log('[BOT] Analysis skipped — /indicators stale or no_data (ATAS/LiveExporter closed)');
+    return null;
+  }
 
   const ticker = (ind.ticker || '').toUpperCase() || 'SUIUSDT';
   const shortSym = ticker.endsWith('USDT') ? ticker.slice(0, -4) : ticker;
@@ -440,6 +444,10 @@ async function handleCommand(text, chatId, reply) {
     const dir = isLongCmd(text) ? 'LONG' : 'SHORT';
     await reply(`⏳ Calculando plan ${dir}...`);
     const report = await runAnalysis();
+    if (report == null) {
+      await reply('⚠️ No puedo generar el plan: LiveExporter/ATAS sin datos frescos. Abre ATAS con el indicador LiveExporter.');
+      return;
+    }
     await tgSendLong(`🎯 *SEÑAL SOLICITADA: ${dir}*\n\n${report}`);
     log(`[BOT] ${dir} report sent.`);
     return;
@@ -447,6 +455,10 @@ async function handleCommand(text, chatId, reply) {
   if (isAnalysisCmd(text)) {
     await reply('⏳ Ejecutando análisis...');
     const report = await runAnalysis();
+    if (report == null) {
+      await reply('⚠️ No puedo generar el análisis: LiveExporter/ATAS sin datos frescos. Abre ATAS con el indicador LiveExporter.');
+      return;
+    }
     await tgSendLong(report);
     log('[BOT] Report sent.');
     return;
@@ -507,6 +519,23 @@ async function startTwoWay() {
 }
 
 // ─── Periodic analysis + heartbeat ──────────────────────────────
+// Freshness guard: /indicators carries a `timestamp` (ms). If it is older
+// than STALE_MS (ATAS/LiveExporter closed or frozen), treat the data as
+// stale and DO NOT emit a report — otherwise the bot re-sends the same
+// frozen analysis every 15 min.
+const STALE_MS = 5 * 60 * 1000; // 5 min max age for a live snapshot
+const INDICATOR_OK_KEYS = ['price', 'volume', 'delta', 'dom', 'tape', 'footprint'];
+let lastStaleWarned = 0;
+
+function indicatorsFresh(ind) {
+  if (!ind || typeof ind !== 'object') return false;
+  if (ind.status === 'no_data' || ind.status === 'error') return false;
+  const ts = Number(ind.timestamp);
+  if (!Number.isFinite(ts) || ts <= 0) return false;
+  // Guard against a frozen LiveExporter file re-read with an old timestamp.
+  return (Date.now() - ts) < STALE_MS;
+}
+
 // Dedup: the 15-min tick only sends a new report when the underlying
 // data actually changed (bar/price/delta/CVD/DOM/footprint/alerts).
 // While LiveExporter is frozen (ATAS closed) or nothing moves, the
@@ -557,6 +586,17 @@ function startScheduler() {
   let lastDigest = null;
   const tick = async () => {
     try {
+      const ind = await lxRequest('/indicators').catch(() => null);
+      if (!indicatorsFresh(ind)) {
+        log('[BOT] Periodic analysis skipped (stale/no_data indicators)');
+        // Warn at most once every 30 min instead of spamming every 15.
+        const now = Date.now();
+        if (now - lastStaleWarned > 30 * 60 * 1000) {
+          lastStaleWarned = now;
+          try { await tgSend('⚠️ Bot: LiveExporter/ATAS sin datos frescos — análisis periódico en pausa hasta que ATAS esté abierto.'); } catch (_) {}
+        }
+        return;
+      }
       const digest = await periodicStateDigest();
       if (digest === lastDigest) {
         log('[BOT] Periodic analysis skipped (state unchanged)');
@@ -564,6 +604,10 @@ function startScheduler() {
       }
       lastDigest = digest;
       const report = await runAnalysis();
+      if (report == null) {
+        log('[BOT] Periodic analysis skipped (runAnalysis stale)');
+        return;
+      }
       await tgSendLong(report);
       log('[BOT] Periodic analysis sent');
     } catch (e) {

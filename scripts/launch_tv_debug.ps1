@@ -10,8 +10,14 @@ if (-not $tvPath) {
 }
 Write-Host "Found TradingView at: $tvPath" -ForegroundColor Green
 
+# Kill existing instances and WAIT until every process is gone. Zombie Electron
+# children from a previous launch keep the CDP port/user-data-dir locked, so a
+# fresh start binds --remote-debugging-port only after a full process teardown.
 Get-Process -Name "TradingView" -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Seconds 3
+for ($i = 0; $i -lt 20; $i++) {
+    if (-not (Get-Process -Name "TradingView" -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Seconds 1
+}
 
 Write-Host "Starting TradingView with CDP on port $Port..." -ForegroundColor Yellow
 Start-Process -FilePath $tvPath -ArgumentList "--remote-debugging-port=$Port"

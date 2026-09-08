@@ -17,6 +17,7 @@ build/
 *.db
 *.db-journal
 *.jsonl
+atas-bridge/_*.json
 data/
 logs/
 screenshots/

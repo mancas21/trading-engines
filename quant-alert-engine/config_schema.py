@@ -33,6 +33,7 @@ _ENV_FILE = str((Path(__file__).parent / ".env").resolve())
 # Before pydantic_settings validates, map those to nested TELEGRAM__TOKEN / TELEGRAM__CHAT_ID.
 _LEGACY_ENV_MIGRATIONS = {
     "TELEGRAM_BOT_TOKEN": "TELEGRAM__TOKEN",
+    "TELEGRAM_TOKEN": "TELEGRAM__TOKEN",
     "TELEGRAM_CHAT_ID": "TELEGRAM__CHAT_ID",
     "TELEGRAM_ENABLED": "TELEGRAM__ENABLED",
     "EXCHANGE_ID": "EXCHANGE__ID",
@@ -210,6 +211,21 @@ class Level2Config(BaseModel):
     cache_ttl_seconds: float = Field(4.0, ge=1.0, le=60.0, description="Cache bridge reads per symbol to avoid hammering")
 
 
+class MacroConfig(BaseModel):
+    """External macro/market-context pipeline (CoinGecko + DefiLlama +
+    Polymarket + Binance funding). Complements the engine's technical and
+    order-flow analysis with spot pricing, fundamentals, and prediction-
+    market sentiment. Fail-open: missing/stale macro data never blocks
+    signal emission."""
+    enabled: bool = Field(False, description="Enable the macro context background pipeline")
+    coingecko_key: str = Field("", description="CoinGecko API key (free tier works empty)")
+    cache_ttl_seconds: float = Field(60.0, ge=10.0, le=900.0, description="Seconds between macro refreshes per symbol")
+    predictive_weight: float = Field(0.3, ge=0.0, le=1.0, description="How much Polymarket sentiment influences macro score (0=info only, 1=full gate)")
+    max_concurrent_requests: int = Field(3, ge=1, le=10, description="Max concurrent HTTP requests to external APIs")
+    max_retries: int = Field(3, ge=1, le=10, description="Max retries per request")
+    gate_signals: bool = Field(False, description="If true, suppress counter-macro directional signals; if false, macro is info-only overlay")
+
+
 class Settings(BaseSettings):
     """Root settings with env var support. Env vars take precedence over config.json."""
 
@@ -233,6 +249,7 @@ class Settings(BaseSettings):
     telegram: TelegramConfig = TelegramConfig()
     bridge: BridgeConfig = BridgeConfig()
     level2: Level2Config = Level2Config()
+    macro: MacroConfig = MacroConfig()
     database: str = "data/alerts.db"
 
     @field_validator("timeframes")
@@ -291,7 +308,7 @@ class Config:
             json_data = _normalize_legacy_config(json_data)
             # Strip empty secrets from json so .env / env vars can populate them
             # (otherwise Settings(**json_data) would pass "" and override env)
-            for section, keys in [("telegram", ["token", "chat_id"]), ("exchange", ["api_key", "secret"])]:
+            for section, keys in [("telegram", ["token", "chat_id"]), ("exchange", ["api_key", "secret"]), ("macro", ["coingecko_key"])]:
                 sec = json_data.get(section)
                 if isinstance(sec, dict):
                     for k in keys:
@@ -374,6 +391,7 @@ class Config:
                 ("telegram", "chat_id"): "",
                 ("exchange", "api_key"): "",
                 ("exchange", "secret"): "",
+                ("macro", "coingecko_key"): "",
             }
             if os.path.exists(self.config_file):
                 try:

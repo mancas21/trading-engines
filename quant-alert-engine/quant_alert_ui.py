@@ -6,7 +6,7 @@ Fixes: Pydantic config, SQLite dedup unification, configurable bridge, debug-lev
 
 import os, sys, json, queue, threading, time as _time, logging
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple, Callable
+from typing import Optional, Dict, List, Tuple, Callable, Any
 from pathlib import Path
 
 import requests
@@ -177,7 +177,8 @@ class TelegramNotifier:
         return True
 
     def send_alert(self, signal_name: str, symbol: str, price: float,
-                   signal_type: str, timeframe: str = "", color: str = "info"):
+                   signal_type: str, timeframe: str = "", color: str = "info",
+                   market_data: Optional[Dict[str, Any]] = None):
         if not self.enabled:
             logger.debug("TG skipped: not enabled (%s %s)", symbol, timeframe)
             return
@@ -200,6 +201,50 @@ class TelegramNotifier:
                     f"`{signal_type}` {signal_name}\n"
                     f"Price: `{price:.4f}`"
                 )
+                # Enrich with fresh market data so every alert is unique & informative
+                md_parts = []
+                if market_data:
+                    if market_data.get("rsi") is not None:
+                        md_parts.append(f"*RSI:* `{market_data['rsi']:.1f}`")
+                    if market_data.get("cvd") is not None:
+                        md_parts.append(f"*CVD:* `{market_data['cvd']:+,.0f}`")
+                    if market_data.get("delta") is not None:
+                        md_parts.append(f"*Delta:* `{market_data['delta']:+,.0f}`")
+                    if market_data.get("volume") is not None and market_data.get("vol_avg"):
+                        ratio = market_data['volume'] / market_data['vol_avg']
+                        md_parts.append(f"*Vol:* `{ratio:.1f}x`")
+                    if market_data.get("macd_line") is not None:
+                        md_parts.append(f"*MACD:* `{market_data['macd_line']:.3f}`/`{market_data['macd_signal']:.3f}`")
+                    if market_data.get("stoch_k") is not None:
+                        md_parts.append(f"*Stoch:* `{market_data['stoch_k']:.1f}`/`{market_data['stoch_d']:.1f}`")
+                    if market_data.get("bb_upper") is not None and market_data.get("bb_lower"):
+                        md_parts.append(f"*BB:* `{market_data['bb_lower']:.4f}`–`{market_data['bb_upper']:.4f}`")
+                    if market_data.get("atr") is not None:
+                        md_parts.append(f"*ATR:* `{market_data['atr']:.4f}`")
+                    if market_data.get("bull_conf") is not None and market_data.get("bear_conf") is not None:
+                        md_parts.append(f"*Confluence:* B={market_data['bull_conf']} S={market_data['bear_conf']}")
+                    if market_data.get("regime") is not None:
+                        reg = market_data['regime']
+                        reg_str = "UP" if reg > 0 else ("DOWN" if reg < 0 else "NEU")
+                        md_parts.append(f"*Regime:* `{reg_str}`")
+                    # External macro overlay (v2.7): one compact summary line
+                    macro = market_data.get("macro")
+                    if isinstance(macro, dict) and not macro.get("stale", True):
+                        mparts = []
+                        if macro.get("price_usd") is not None:
+                            mparts.append(f"${macro['price_usd']:,.2f}")
+                        if macro.get("chg_24h") is not None:
+                            mparts.append(f"{macro['chg_24h']:+.2f}% 24h")
+                        if macro.get("funding_rate") is not None:
+                            mparts.append(f"fund {macro['funding_rate']:+.4%}")
+                        if macro.get("poly_yes") is not None:
+                            mparts.append(f"Poly YES {macro['poly_yes']:.0%}")
+                        if macro.get("regime_hint") and macro["regime_hint"] != "neutral":
+                            mparts.append(f"macro {macro['regime_hint'].upper()}")
+                        if mparts:
+                            md_parts.append("*Macro:* " + " · ".join(mparts))
+                    if md_parts:
+                        msg += "\n" + "\n".join(md_parts)
                 resp = requests.post(
                     f"{self._base}/sendMessage",
                     json={"chat_id": self.chat_id, "text": msg, "parse_mode": "Markdown"},
@@ -231,7 +276,8 @@ class QueueAlertManager(AlertManager):
 
     def emit_alert(self, signal_name: str, symbol: str, price: float,
                    signal_type: str = "SIGNAL", color: str = "info",
-                   bar_key: str = "", timeframe: str = ""):
+                   bar_key: str = "", timeframe: str = "",
+                   market_data: Optional[Dict[str, Any]] = None):
         signal_id = f"{symbol}_{signal_name}_{timeframe}_{bar_key}"
         # Fast in-memory check
         if signal_id in self._mem_cache:
@@ -252,7 +298,7 @@ class QueueAlertManager(AlertManager):
                         self.config.get('general.outcome_forward_bars', 12))
 
         msg = f"[{signal_type}] {symbol} - {signal_name} @ {price:.4f}"
-        logger.info(msg, extra={"event_type": "alert_fired", "symbol": symbol, "timeframe": timeframe, "signal_name": signal_name, "signal_type": signal_type, "price": price, "color": color, "signal_id": signal_id})
+        logger.info(msg, extra={"event_type": "alert_fired", "symbol": symbol, "timeframe": timeframe, "signal_name": signal_name, "signal_type": signal_type, "price": price, "color": color, "signal_id": signal_id, "market_data": market_data or {}})
         if self.config.get('general.enable_sound', True) and winsound:
             try:
                 winsound.PlaySound('SystemExclamation', winsound.SND_ASYNC)
@@ -273,10 +319,11 @@ class QueueAlertManager(AlertManager):
             "price": price,
             "color": color,
             "timeframe": timeframe,
+            "market_data": market_data or {},
         })
 
         if self.telegram_bot:
-            self.telegram_bot.send_alert(signal_name, symbol, price, signal_type, timeframe, color)
+            self.telegram_bot.send_alert(signal_name, symbol, price, signal_type, timeframe, color, market_data=market_data)
 
         # Forward to bridge agent — configurable via config.json/.env (Fix M8: async dispatch)
         if self.config.get('bridge.enabled', True):
@@ -296,6 +343,7 @@ class QueueAlertManager(AlertManager):
                             "price": price,
                             "timeframe": timeframe,
                             "color": color,
+                            "market_data": market_data or {},
                         },
                         headers=_headers,
                         timeout=bridge_timeout,
@@ -430,6 +478,7 @@ class EngineThread(QThread):
                 register_check("time_gating", lambda: analyzer.time_health() if hasattr(analyzer, 'time_health') else {"status": "healthy", "metrics": {}})
                 register_check("blackout", lambda: analyzer.blackout_health() if hasattr(analyzer, 'blackout_health') else {"status": "healthy", "metrics": {"enabled": False}})
                 register_check("level2", lambda: analyzer.level2_health() if hasattr(analyzer, 'level2_health') else {"status": "healthy", "metrics": {"enabled": False}})
+                register_check("macro_context", lambda: analyzer.macro_context_health() if hasattr(analyzer, 'macro_context_health') else {"status": "healthy", "metrics": {"enabled": 0}})
                 _hport = self.config_obj.get('general.health_port', 8080)
                 _hhost = self.config_obj.get('general.health_host', '127.0.0.1')
                 self._health_thread = start_health_server(host=_hhost, port=_hport)

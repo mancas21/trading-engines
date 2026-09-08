@@ -74,6 +74,19 @@ FAIL_RETRY_SECONDS = 30
 # suppresses the duplicate on lower timeframes within the same candle window.
 TF_RANK = {tf: i for i, tf in enumerate(sorted(TF_SECONDS, key=lambda t: TF_SECONDS[t]))}
 
+# Exchange base symbol -> CoinGecko coin id, for the external macro pipeline.
+# Unknown bases fall back to the lowercased base itself.
+_COIN_ID_MAP = {
+    "btc": "bitcoin", "eth": "ethereum", "sol": "solana", "sui": "sui",
+    "xrp": "ripple", "hype": "hype", "doge": "dogecoin", "ada": "cardano",
+    "avax": "avalanche-2", "link": "chainlink", "ton": "the-open-network",
+    "trx": "tron", "dot": "polkadot", "matic": "matic-network",
+    "arb": "arbitrum", "op": "optimism", "inj": "injective-protocol",
+    "sei": "sei-network", "apt": "aptos", "near": "near",
+    "atom": "cosmos", "ltc": "litecoin", "bch": "bitcoin-cash",
+    "fil": "filecoin", "etc": "ethereum-classic",
+}
+
 
 class TimeframeCadence:
     """Polls each (symbol, timeframe) pair at most once per candle duration.
@@ -139,31 +152,48 @@ class SingleInstanceLock:
         except Exception:
             return False
 
-    def acquire(self) -> bool:
+    def acquire(self, retries: int = 5) -> bool:
+        """Atomic single-instance acquisition (v2.7.1).
+
+        Uses O_CREAT|O_EXCL so two simultaneous starters cannot BOTH pass:
+        exactly one wins; the loser checks the winner's liveness and either
+        refuses (alive) or clears the stale file and retries. This closes the
+        TOCTOU race in the old exists-check-then-write sequence, which let
+        duplicate UIs scan and send duplicate Telegram alerts.
+        """
         if self._held:
             return True
-        if os.path.exists(self.lock_path):
+        for _ in range(max(1, retries)):
+            try:
+                fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                try:
+                    os.write(fd, str(os.getpid()).encode())
+                finally:
+                    os.close(fd)
+                self._held = True
+                return True
+            except FileExistsError:
+                pass
+            except OSError as e:
+                logger.error("Could not create lock file %s: %s", self.lock_path, e)
+                return False
+            # Lock exists: refuse if the owner is alive, else clear + retry.
             try:
                 with open(self.lock_path, 'r') as f:
                     pid = int(f.read().strip() or 0)
-                if pid > 0 and self._pid_alive(pid):
-                    logger.warning("Another instance is already running (PID %s). Refusing to start.", pid)
-                    return False
-                logger.warning("Removing stale lock file from dead PID %s.", pid)
-            except (ValueError, OSError) as e:
-                logger.warning("Stale lock file: %s. Removing.", e)
+            except (ValueError, OSError):
+                pid = 0
+            if pid > 0 and self._pid_alive(pid):
+                logger.warning("Another instance is already running (PID %s). Refusing to start.", pid)
+                return False
+            logger.warning("Removing stale lock file from dead PID %s.", pid)
             try:
                 os.remove(self.lock_path)
             except OSError:
                 pass
-        try:
-            with open(self.lock_path, 'w') as f:
-                f.write(str(os.getpid()))
-            self._held = True
-            return True
-        except OSError as e:
-            logger.error("Could not create lock file %s: %s", self.lock_path, e)
-            return False
+            time.sleep(0.05)
+        logger.warning("Could not acquire instance lock after %d retries.", retries)
+        return False
 
     def release(self):
         if self._held:
@@ -674,14 +704,50 @@ class AlertManager:
 
     def emit_alert(self, signal_name: str, symbol: str, price: float,
                    signal_type: str = "SIGNAL", color: str = "info",
-                   bar_key: str = "", timeframe: str = ""):
+                   bar_key: str = "", timeframe: str = "",
+                   market_data: Optional[Dict[str, Any]] = None):
         signal_id = f"{symbol}_{signal_name}_{timeframe}_{bar_key}"
         if self._is_fired(signal_id):
             return
         
         self._mark_fired(signal_id)
         msg = f"[{signal_type}] {symbol} {timeframe} - {signal_name} @ {price:.4f}"
-        logger.info(msg, extra={"event_type": "alert_fired", "symbol": symbol, "timeframe": timeframe, "signal_name": signal_name, "signal_type": signal_type, "price": price, "color": color, "signal_id": signal_id})
+        if market_data:
+            md_parts = []
+            if market_data.get("rsi") is not None:
+                md_parts.append(f"RSI={market_data['rsi']:.1f}")
+            if market_data.get("cvd") is not None:
+                md_parts.append(f"CVD={market_data['cvd']:+,.0f}")
+            if market_data.get("delta") is not None:
+                md_parts.append(f"Δ={market_data['delta']:+,.0f}")
+            if market_data.get("volume") is not None and market_data.get("vol_avg"):
+                ratio = market_data['volume'] / market_data['vol_avg']
+                md_parts.append(f"VOL={ratio:.1f}x")
+            if market_data.get("bull_conf") is not None:
+                md_parts.append(f"bull_conf={market_data['bull_conf']}")
+            if market_data.get("bear_conf") is not None:
+                md_parts.append(f"bear_conf={market_data['bear_conf']}")
+            if market_data.get("regime") is not None:
+                reg = market_data['regime']
+                reg_str = "UP" if reg > 0 else ("DOWN" if reg < 0 else "NEU")
+                md_parts.append(f"regime={reg_str}")
+            _mm = market_data.get("macro")
+            if isinstance(_mm, dict) and not _mm.get("stale", True):
+                _mp = []
+                if _mm.get("chg_24h") is not None:
+                    _mp.append(f"24h={_mm['chg_24h']:+.2f}%")
+                if _mm.get("funding_rate") is not None:
+                    _mp.append(f"fund={_mm['funding_rate']:+.4%}")
+                if _mm.get("poly_yes") is not None:
+                    _mp.append(f"poly={_mm['poly_yes']:.0%}")
+                _rh = _mm.get("regime_hint", "neutral")
+                if _rh and _rh != "neutral":
+                    _mp.append(f"macro={_rh}")
+                if _mp:
+                    md_parts.append("macro[" + " ".join(_mp) + "]")
+            if md_parts:
+                msg += f" | {' '.join(md_parts)}"
+        logger.info(msg, extra={"event_type": "alert_fired", "symbol": symbol, "timeframe": timeframe, "signal_name": signal_name, "signal_type": signal_type, "price": price, "color": color, "signal_id": signal_id, "market_data": market_data or {}})
 
         # Outcome tagging: store this signal for forward-return resolution
         self.tag_signal(signal_name, symbol, price, timeframe, bar_key, signal_type,
@@ -712,6 +778,7 @@ class AlertManager:
                         "price": price,
                         "timeframe": timeframe,
                         "color": color,
+                        "market_data": market_data or {},
                     }).encode()
                     req = _urllib.Request(
                         bridge_url,
@@ -801,6 +868,50 @@ class SignalAnalyzer:
         self._l2_cache: Dict[str, Tuple[float, dict]] = {}
         self._l2_blocked_count: int = 0
         self._l2_failopen_count: int = 0
+        # External macro context pipeline (v2.7): CoinGecko + DefiLlama +
+        # Polymarket + funding. Info overlay by default; directional gate only
+        # when macro.gate_signals is true. Fail-open: init/refresh failures
+        # never block signal emission.
+        self._extmacro_enabled = bool(self.config.get('macro.enabled', False))
+        self._extmacro_gate = bool(self.config.get('macro.gate_signals', False))
+        try:
+            self._extmacro_weight = float(self.config.get('macro.predictive_weight', 0.3) or 0.3)
+        except (TypeError, ValueError):
+            self._extmacro_weight = 0.3
+        self._extmacro_pipeline = None
+        self._extmacro_thread = None
+        self._extmacro_loop_ref = None
+        self._extmacro_gated_count: int = 0
+        if self._extmacro_enabled:
+            try:
+                from macro_context_pipeline import MacroContextPipeline, MacroConfig
+                _symbols_cfg = list(self.config.get('symbols', []) or [])
+                _tracked = {}
+                for _s in _symbols_cfg:
+                    _base = str(_s).split('/')[0].split(':')[0].lower()
+                    _tracked[_s] = _COIN_ID_MAP.get(_base, _base)
+                _mcfg = MacroConfig(
+                    enabled=True,
+                    coingecko_key=str(self.config.get('macro.coingecko_key', '') or ''),
+                    cache_ttl_seconds=float(self.config.get('macro.cache_ttl_seconds', 60.0) or 60.0),
+                    predictive_weight=self._extmacro_weight,
+                    max_concurrent_requests=int(self.config.get('macro.max_concurrent_requests', 3) or 3),
+                    max_retries=int(self.config.get('macro.max_retries', 3) or 3),
+                    tracked_coins=_tracked,
+                )
+                self._extmacro_pipeline = MacroContextPipeline(_mcfg)
+                _t = threading.Thread(
+                    target=self._run_macro_loop, args=(_symbols_cfg,),
+                    daemon=True, name="macro-context",
+                )
+                _t.start()
+                self._extmacro_thread = _t
+                logger.info("External macro pipeline enabled for %d symbols (gate=%s)",
+                            len(_symbols_cfg), self._extmacro_gate)
+            except Exception as e:
+                logger.warning("Macro pipeline disabled (init failed, fail-open): %s", str(e)[:150])
+                self._extmacro_enabled = False
+                self._extmacro_pipeline = None
         self._macro_enabled = bool(self.config.get('general.macro_regime_enabled', False))
         self._macro_symbols: List[str] = list(self.config.get('general.macro_regime_symbols', ["BTC/USDT:USDT", "ETH/USDT:USDT"]) or ["BTC/USDT:USDT", "ETH/USDT:USDT"])
         self._outcome_enabled = bool(self.config.get('general.outcome_gating_enabled', False))
@@ -839,6 +950,87 @@ class SignalAnalyzer:
         except (TypeError, ValueError):
             return None
         return float(v)
+
+    # ── External macro context (v2.7) ──
+    def _run_macro_loop(self, symbols: List[str]):
+        """Background thread entry: own asyncio loop driving the pipeline's
+        refresh loop directly. NOTE: we must run _background_loop itself —
+        awaiting start() alone would return after scheduling the task and
+        leave the loop with nothing to run (silent stall)."""
+        import asyncio
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._extmacro_loop_ref = loop
+            self._extmacro_pipeline._running = True
+            loop.run_until_complete(self._extmacro_pipeline._background_loop(symbols, []))
+        except Exception as e:
+            logger.warning("Macro background loop exited: %s", str(e)[:150])
+
+    @staticmethod
+    def _flatten_macro(mctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Flatten the pipeline's nested context into Telegram-ready fields."""
+        flat: Dict[str, Any] = {"stale": bool(mctx.get("_stale", False))}
+        pricing = mctx.get("market_pricing", {}) if isinstance(mctx.get("market_pricing"), dict) else {}
+        if "error" not in pricing:
+            if pricing.get("price_usd") is not None:
+                flat["price_usd"] = float(pricing["price_usd"])
+            if pricing.get("change_24h_percent") is not None:
+                flat["chg_24h"] = float(pricing["change_24h_percent"])
+            if pricing.get("volume_24h_usd") is not None:
+                flat["vol_24h_usd"] = float(pricing["volume_24h_usd"])
+        fr = mctx.get("funding_rate")
+        if fr is not None:
+            try:
+                flat["funding_rate"] = float(fr)
+            except (TypeError, ValueError):
+                pass
+        ath = mctx.get("ath_dwd", {}) if isinstance(mctx.get("ath_dwd"), dict) else {}
+        flat["regime_hint"] = str(ath.get("regime_hint", "neutral"))
+        # First Polymarket market's YES probability, if parseable
+        sent = mctx.get("macro_prediction_sentiment", [])
+        if isinstance(sent, list) and sent and isinstance(sent[0], dict) and "error" not in sent[0]:
+            probs = sent[0].get("outcome_probabilities")
+            if isinstance(probs, list) and probs:
+                try:
+                    flat["poly_yes"] = float(probs[0])
+                    flat["poly_question"] = str(sent[0].get("question", ""))[:80]
+                except (TypeError, ValueError):
+                    pass
+        return flat
+
+    def macro_context_health(self) -> Dict[str, Any]:
+        """Health check payload for the /health endpoint.
+
+        Counts only FRESH entries (age < TTL) — a live refresh loop with
+        failing fetches must show fresh_cached=0 (degraded), never hide
+        behind stale entries the way a raw len(_cache) does."""
+        if not self._extmacro_enabled or self._extmacro_pipeline is None:
+            return {"status": "healthy", "metrics": {"enabled": 0}}
+        try:
+            import time as _t
+            cache = getattr(self._extmacro_pipeline, "_cache", {}) or {}
+            ttl = float(getattr(getattr(self._extmacro_pipeline, "cfg", None),
+                                "cache_ttl_seconds", 60.0) or 60.0)
+            now = _t.time()
+            ages = [now - ts for ts, _ in cache.values()]
+            fresh = sum(1 for a in ages if a < ttl)
+            oldest = round(max(ages), 1) if ages else None
+        except Exception:
+            fresh, oldest = 0, None
+        alive = bool(self._extmacro_thread and self._extmacro_thread.is_alive())
+        ok = bool(alive and fresh)
+        return {
+            "status": "healthy" if ok else "degraded",
+            "metrics": {
+                "enabled": 1,
+                "thread_alive": 1 if alive else 0,
+                "symbols_cached": fresh,
+                "oldest_cache_age_s": oldest,
+                "gated_total": self._extmacro_gated_count,
+                "gate_signals": 1 if self._extmacro_gate else 0,
+            },
+        }
 
     def _init_exchange(self, max_retries: int = 3):
         """Use ResilientExchange wrapper for retry/backoff/circuit breaker."""
@@ -1018,18 +1210,63 @@ class SignalAnalyzer:
         regime = self._trend_regime(c, atr_arr)
         conf = (bull_conf, bear_conf, regime, self._conf_req, self._regime_enabled)
 
+        # Build market_data dict for enriched Telegram alerts
+        market_data: Dict[str, Any] = {
+            "price": price,
+            "bar_key": bar_key,
+            "timeframe": timeframe,
+            "symbol": symbol,
+        }
+        if rsi_arr is not None and not np.isnan(rsi_arr[-1]):
+            market_data["rsi"] = float(rsi_arr[-1])
+        if ml is not None and not np.isnan(ml[-1]):
+            market_data["macd_line"] = float(ml[-1])
+            market_data["macd_signal"] = float(sl[-1])
+            market_data["macd_hist"] = float(hist[-1]) if not np.isnan(hist[-1]) else None
+        if k is not None and not np.isnan(k[-1]):
+            market_data["stoch_k"] = float(k[-1])
+            market_data["stoch_d"] = float(d[-1])
+        if upper is not None and not np.isnan(upper[-1]):
+            market_data["bb_upper"] = float(upper[-1])
+            market_data["bb_mid"] = float(mid[-1])
+            market_data["bb_lower"] = float(lower[-1])
+        if atr_arr is not None and not np.isnan(atr_arr[-1]):
+            market_data["atr"] = float(atr_arr[-1])
+        if cvd_cum is not None and len(cvd_cum) > 0 and not np.isnan(cvd_cum[-1]):
+            market_data["cvd"] = float(cvd_cum[-1])
+        if cvd_cum_smooth is not None and not np.isnan(cvd_cum_smooth[-1]):
+            market_data["cvd_smooth"] = float(cvd_cum_smooth[-1])
+        # Latest bar delta from bar-signed volume
+        if len(v) > 0 and len(c) > 1:
+            delta = float(v[-1]) if c[-1] >= c[-2] else float(-v[-1])
+            market_data["delta"] = delta
+        if vol_avg is not None:
+            market_data["vol_avg"] = float(vol_avg)
+            market_data["volume"] = float(v[-1]) if not np.isnan(v[-1]) else None
+        market_data["bull_conf"] = int(bull_conf)
+        market_data["bear_conf"] = int(bear_conf)
+        market_data["regime"] = int(regime)
+        # External macro overlay (v2.7): cached CoinGecko/Polymarket/funding
+        # context. Fail-open: missing/stale data leaves market_data unchanged.
+        if self._extmacro_enabled and self._extmacro_pipeline is not None:
+            try:
+                _mctx = self._extmacro_pipeline.get_context(symbol)
+                market_data["macro"] = self._flatten_macro(_mctx)
+            except Exception:
+                pass
+
         if self.config.get('volume.enabled'):
-            self._check_volume(symbol, price, c, v, bar_key, timeframe, vol_avg, conf)
+            self._check_volume(symbol, price, c, v, bar_key, timeframe, vol_avg, conf, market_data=market_data)
         if self.config.get('cvd.enabled'):
-            self._check_cvd(symbol, price, c, bar_key, timeframe, cvd_cum, cvd_cum_smooth, conf)
+            self._check_cvd(symbol, price, c, bar_key, timeframe, cvd_cum, cvd_cum_smooth, conf, market_data=market_data)
         if self.config.get('rsi.enabled'):
-            self._check_rsi(symbol, price, c, bar_key, timeframe, rsi_arr, conf)
+            self._check_rsi(symbol, price, c, bar_key, timeframe, rsi_arr, conf, market_data=market_data)
         if self.config.get('macd.enabled'):
-            self._check_macd(symbol, price, c, bar_key, timeframe, ml, sl, hist, conf)
+            self._check_macd(symbol, price, c, bar_key, timeframe, ml, sl, hist, conf, market_data=market_data)
         if self.config.get('stochastic.enabled'):
-            self._check_stoch(symbol, price, h, l, c, bar_key, timeframe, k, d, conf)
+            self._check_stoch(symbol, price, h, l, c, bar_key, timeframe, k, d, conf, market_data=market_data)
         if self.config.get('volatility.enabled'):
-            self._check_vol(symbol, price, h, l, c, bar_key, timeframe, upper, mid, lower, atr_arr, conf)
+            self._check_vol(symbol, price, h, l, c, bar_key, timeframe, upper, mid, lower, atr_arr, conf, market_data=market_data)
 
         # Outcome tagging (fix #3): resolve forward returns for signals that have
         # reached their forward horizon in this window.
@@ -1335,18 +1572,19 @@ class SignalAnalyzer:
             logger.debug("L2 fetch failed %s: %s", endpoint, e)
             return None
 
-    def _l2_dom_score(self, pair: str, direction: str) -> float:
-        """+1 strong agree, +0.5 weak agree, -1 strong disagree, -0.5 weak disagree, 0 none."""
+    def _l2_dom_score(self, pair: str, direction: str) -> Optional[float]:
+        """+1 strong agree, +0.5 weak agree, -1 strong disagree, -0.5 weak disagree.
+        None when the bridge has no DOM data (missing, not neutral)."""
         d = self._l2_fetch("/dom/" + pair.lower(), cache_key=("dom", pair.lower()))
         if not d:
-            return 0.0
+            return None
         imb = d.get("imbalance_pct")
         if imb is None:
-            return 0.0
+            return None
         try:
             imb = float(imb)
         except (TypeError, ValueError):
-            return 0.0
+            return None
         wants_positive = (direction == "bull")
         agrees = (imb > 0) == wants_positive
         strong = abs(imb) >= self._l2_dom_min
@@ -1354,33 +1592,37 @@ class SignalAnalyzer:
             return 1.0 if strong else 0.5
         return -1.0 if strong else -0.5
 
-    def _l2_cvd_score(self, pair: str, direction: str) -> float:
-        """+1 rising/positive CVD agrees, -1 disagrees, 0 none."""
+    def _l2_cvd_score(self, pair: str, direction: str) -> Optional[float]:
+        """+1 rising/positive CVD agrees, -1 disagrees.
+        None when the bridge has no CVD data (missing, not neutral)."""
         d = self._l2_fetch("/cvd/" + pair, cache_key=("cvd", pair))
         if not d:
-            return 0.0
+            return None
         # /cvd/{symbol} returns the symbol's fields at top level; /cvd nests them.
         entry = d if ("current_bar_delta" in d or "last_delta" in d) else d.get(pair)
         if not isinstance(entry, dict):
-            return 0.0
+            return None
         delta = entry.get("current_bar_delta")
         if delta is None:
             delta = entry.get("last_delta")
         if delta is None:
-            return 0.0
+            return None
         try:
             delta = float(delta)
         except (TypeError, ValueError):
-            return 0.0
+            return None
         if direction == "bull":
             return 1.0 if delta > 0 else -1.0
         return 1.0 if delta < 0 else -1.0
 
-    def _l2_quant_score(self, base: str, direction: str) -> float:
-        """+1 multi-TF consensus agrees, -1 disagrees, 0 neutral/none."""
+    def _l2_quant_score(self, base: str, direction: str) -> Optional[float]:
+        """+1 multi-TF consensus agrees, -1 disagrees, 0.0 neutral (balanced).
+        None when the bridge has no quant alerts buffered (missing, not neutral)."""
         d = self._l2_fetch("/quant/" + base, cache_key=("quant", base))
         if not d or not isinstance(d.get("alerts"), list):
-            return 0.0
+            return None
+        if not d["alerts"]:
+            return None
         bull = bear = 0
         tfs: Dict[str, int] = {}
         for a in d["alerts"]:
@@ -1401,23 +1643,52 @@ class SignalAnalyzer:
 
     def _l2_validate(self, symbol: str, direction: str) -> Tuple[bool, float, str]:
         """Run Level-2 validation. Returns (pass, score, detail).
-        Fail-open: on bridge failure we ALLOW the alert."""
+
+        Fail-open: on bridge failure we ALLOW the alert. Missing components
+        (bridge down / symbol untracked / buffer empty) contribute nothing;
+        when ALL components are missing the bridge is treated as down and
+        the fail_open setting decides (previously this silently rejected
+        with a misleading 'score 0.00')."""
         base, pair = self._l2_symbols(symbol)
         score = 0.0
         parts = []
+        missing = 0
         try:
             if self._l2_require_dom:
                 s = self._l2_dom_score(pair, direction)
-                score += s
-                parts.append(f"dom={s:+.1f}")
+                if s is None:
+                    missing += 1
+                    parts.append("dom=--")
+                else:
+                    score += s
+                    parts.append(f"dom={s:+.1f}")
             if self._l2_require_cvd:
                 s = self._l2_cvd_score(pair, direction)
-                score += s
-                parts.append(f"cvd={s:+.1f}")
+                if s is None:
+                    missing += 1
+                    parts.append("cvd=--")
+                else:
+                    score += s
+                    parts.append(f"cvd={s:+.1f}")
             if self._l2_require_quant:
                 s = self._l2_quant_score(base, direction)
-                score += s
-                parts.append(f"quant={s:+.1f}")
+                if s is None:
+                    missing += 1
+                    parts.append("quant=--")
+                else:
+                    score += s
+                    parts.append(f"quant={s:+.1f}")
+            required = sum((self._l2_require_dom, self._l2_require_cvd,
+                            self._l2_require_quant))
+            if required and missing >= required:
+                # Bridge has no data at all for this symbol: honor fail_open.
+                with self._state_lock:
+                    self._l2_failopen_count += 1
+                detail = " ".join(parts) + " l2-bridge-no-data"
+                if self._l2_fail_open:
+                    logger.debug("L2 bridge no-data for %s, fail-open ALLOW", symbol)
+                    return True, 0.0, detail + "(fail-open)"
+                return False, 0.0, detail
             ok = score >= self._l2_min_score
             return ok, round(score, 2), " ".join(parts)
         except Exception as e:
@@ -1480,7 +1751,8 @@ class SignalAnalyzer:
 
     def _emit(self, name: str, sym: str, p: float, stype: str, color: str,
               bk: str, tf: str, conf: Tuple[int, int, int, int, bool],
-              direction: Optional[str] = None) -> bool:
+              direction: Optional[str] = None,
+              market_data: Optional[Dict[str, Any]] = None) -> bool:
         """Central emit gate: regime filter + confluence + multi-TF consolidation + macro + outcome gating.
         Returns True if the alert was actually emitted."""
         bull_conf, bear_conf, regime, conf_req, reg_enabled = conf
@@ -1545,7 +1817,20 @@ class SignalAnalyzer:
                     self._l2_blocked_count += 1
                 logger.info("L2-rejected %s %s %s (%s, score %.2f)", sym, tf, name, l2_detail, l2_score)
                 return False
-        self.alert_mgr.emit_alert(name, sym, p, stype, color, bk, tf)
+        # External macro gate (v2.7, opt-in via macro.gate_signals): suppress
+        # directional signals that fight a strong external macro regime hint.
+        if self._extmacro_enabled and self._extmacro_gate and direction in ("bull", "bear"):
+            _mhint = "neutral"
+            try:
+                _mhint = str((market_data or {}).get("macro", {}).get("regime_hint", "neutral"))
+            except Exception:
+                _mhint = "neutral"
+            if (_mhint == "bear" and direction == "bull") or (_mhint == "bull" and direction == "bear"):
+                with self._state_lock:
+                    self._extmacro_gated_count += 1
+                logger.info("ExtMacro-gated %s %s %s (macro %s vs %s)", sym, tf, name, _mhint, direction)
+                return False
+        self.alert_mgr.emit_alert(name, sym, p, stype, color, bk, tf, market_data=market_data)
         try:
             t0 = datetime.fromisoformat(bk).timestamp() if bk else 0.0
         except (ValueError, TypeError):
@@ -1560,7 +1845,8 @@ class SignalAnalyzer:
 
     def _div_alert(self, name: str, sym: str, p: float, bk: str, tf: str,
                    stype: str, color: str, conf: Tuple[int, int, int, int, bool],
-                   direction: str, detected: bool):
+                   direction: str, detected: bool,
+                   market_data: Optional[Dict[str, Any]] = None):
         """Divergence episode gating (fix #1): fire ONCE per divergence episode,
         reset when the condition clears, instead of alerting every bar."""
         key = (sym, tf, name)
@@ -1570,7 +1856,8 @@ class SignalAnalyzer:
                 return
             if key in self._div_episodes:
                 return
-        if self._emit(name, sym, p, stype, color, bk, tf, conf, direction):
+        if self._emit(name, sym, p, stype, color, bk, tf, conf, direction,
+                      market_data=market_data):
             with self._state_lock:
                 self._div_episodes[key] = True
 
@@ -1613,7 +1900,8 @@ class SignalAnalyzer:
         except Exception as e:
             logger.debug("Outcome resolution failed: %s", e)
 
-    def _check_volume(self, sym, p, c, v, bk, tf, vol_avg, conf):
+    def _check_volume(self, sym, p, c, v, bk, tf, vol_avg, conf,
+                       market_data: Optional[Dict[str, Any]] = None):
         cur_vol = v[-1]
         state_key = f"{sym}_{tf}_vol_state"
 
@@ -1627,7 +1915,7 @@ class SignalAnalyzer:
 
         prev_state = self._STATE_CODE_TO_NAME.get(self.alert_mgr.get_state_val(state_key), "normal")
         if cur_state != "normal" and cur_state != prev_state:
-            self._emit(f"Volume {cur_state.capitalize()}", sym, p, "VOL", "red", bk, tf, conf)
+            self._emit(f"Volume {cur_state.capitalize()}", sym, p, "VOL", "red", bk, tf, conf, market_data=market_data)
         self.alert_mgr.set_state_val(state_key, self._STATE_NAME_TO_CODE[cur_state])
 
         # OBV Cross
@@ -1635,96 +1923,101 @@ class SignalAnalyzer:
         obv_sma = self.ind.sma(obv, self.config.get('volume.obv_len', 20))
         if not np.isnan(obv_sma[-1]) and not np.isnan(obv_sma[-2]):
             if obv[-1] > obv_sma[-1] and obv[-2] <= obv_sma[-2]:
-                self._emit("OBV Bullish Break", sym, p, "VOL", "green", bk, tf, conf, "bull")
+                self._emit("OBV Bullish Break", sym, p, "VOL", "green", bk, tf, conf, "bull", market_data=market_data)
             elif obv[-1] < obv_sma[-1] and obv[-2] >= obv_sma[-2]:
-                self._emit("OBV Bearish Break", sym, p, "VOL", "red", bk, tf, conf, "bear")
+                self._emit("OBV Bearish Break", sym, p, "VOL", "red", bk, tf, conf, "bear", market_data=market_data)
 
-    def _check_cvd(self, sym, p, c, bk, tf, cvd_cum, cvd_smooth, conf):
+    def _check_cvd(self, sym, p, c, bk, tf, cvd_cum, cvd_smooth, conf,
+                   market_data: Optional[Dict[str, Any]] = None):
         # Bar-signed volume index (tick-rule proxy) vs its EMA: order-flow trend flip
         if len(cvd_cum) < 2 or np.isnan(cvd_cum[-1]) or np.isnan(cvd_cum[-2]):
             return
 
         if cvd_cum[-1] > cvd_smooth[-1] and cvd_cum[-2] <= cvd_smooth[-2]:
-            self._emit("CVD Bullish Flip", sym, p, "CVD", "green", bk, tf, conf, "bull")
+            self._emit("CVD Bullish Flip", sym, p, "CVD", "green", bk, tf, conf, "bull", market_data=market_data)
         elif cvd_cum[-1] < cvd_smooth[-1] and cvd_cum[-2] >= cvd_smooth[-2]:
-            self._emit("CVD Bearish Flip", sym, p, "CVD", "red", bk, tf, conf, "bear")
+            self._emit("CVD Bearish Flip", sym, p, "CVD", "red", bk, tf, conf, "bear", market_data=market_data)
 
         rb, ru, hb, hu = self.div.detect_divergence(
             c, cvd_cum, self.config.get('cvd.pivot_len', 5),
             self.config.get('cvd.div_lookback', 20), self.config.get('cvd.min_gap', 3))
-        self._div_alert("CVD Reg Bear Div", sym, p, bk, tf, "CVD_DIV", "red", conf, "bear", rb)
-        self._div_alert("CVD Reg Bull Div", sym, p, bk, tf, "CVD_DIV", "green", conf, "bull", ru)
-        self._div_alert("CVD Hidden Bear Div", sym, p, bk, tf, "CVD_DIV", "red", conf, "bear", hb)
-        self._div_alert("CVD Hidden Bull Div", sym, p, bk, tf, "CVD_DIV", "green", conf, "bull", hu)
+        self._div_alert("CVD Reg Bear Div", sym, p, bk, tf, "CVD_DIV", "red", conf, "bear", rb, market_data=market_data)
+        self._div_alert("CVD Reg Bull Div", sym, p, bk, tf, "CVD_DIV", "green", conf, "bull", ru, market_data=market_data)
+        self._div_alert("CVD Hidden Bear Div", sym, p, bk, tf, "CVD_DIV", "red", conf, "bear", hb, market_data=market_data)
+        self._div_alert("CVD Hidden Bull Div", sym, p, bk, tf, "CVD_DIV", "green", conf, "bull", hu, market_data=market_data)
 
-    def _check_rsi(self, sym, p, c, bk, tf, rsi, conf):
+    def _check_rsi(self, sym, p, c, bk, tf, rsi, conf,
+                   market_data: Optional[Dict[str, Any]] = None):
         ob, ovs = self.config.get('rsi.overbought', 70), self.config.get('rsi.oversold', 30)
 
         if rsi[-1] > ob and rsi[-2] <= ob:
-            self._emit("RSI Overbought", sym, p, "RSI", "red", bk, tf, conf, "bear")
+            self._emit("RSI Overbought", sym, p, "RSI", "red", bk, tf, conf, "bear", market_data=market_data)
         elif rsi[-1] < ovs and rsi[-2] >= ovs:
-            self._emit("RSI Oversold", sym, p, "RSI", "green", bk, tf, conf, "bull")
+            self._emit("RSI Oversold", sym, p, "RSI", "green", bk, tf, conf, "bull", market_data=market_data)
 
         if rsi[-1] > 50 and rsi[-2] <= 50:
-            self._emit("RSI Crossed Above 50", sym, p, "RSI", "green", bk, tf, conf, "bull")
+            self._emit("RSI Crossed Above 50", sym, p, "RSI", "green", bk, tf, conf, "bull", market_data=market_data)
         elif rsi[-1] < 50 and rsi[-2] >= 50:
-            self._emit("RSI Crossed Below 50", sym, p, "RSI", "red", bk, tf, conf, "bear")
+            self._emit("RSI Crossed Below 50", sym, p, "RSI", "red", bk, tf, conf, "bear", market_data=market_data)
 
         rb, ru, hb, hu = self.div.detect_divergence(
             c, rsi, self.config.get('rsi.pivot_len', 5),
             self.config.get('rsi.div_lookback', 20), self.config.get('rsi.min_gap', 3))
-        self._div_alert("RSI Reg Bear Div", sym, p, bk, tf, "RSI_DIV", "red", conf, "bear", rb)
-        self._div_alert("RSI Reg Bull Div", sym, p, bk, tf, "RSI_DIV", "green", conf, "bull", ru)
-        self._div_alert("RSI Hidden Bear Div", sym, p, bk, tf, "RSI_DIV", "red", conf, "bear", hb)
-        self._div_alert("RSI Hidden Bull Div", sym, p, bk, tf, "RSI_DIV", "green", conf, "bull", hu)
+        self._div_alert("RSI Reg Bear Div", sym, p, bk, tf, "RSI_DIV", "red", conf, "bear", rb, market_data=market_data)
+        self._div_alert("RSI Reg Bull Div", sym, p, bk, tf, "RSI_DIV", "green", conf, "bull", ru, market_data=market_data)
+        self._div_alert("RSI Hidden Bear Div", sym, p, bk, tf, "RSI_DIV", "red", conf, "bear", hb, market_data=market_data)
+        self._div_alert("RSI Hidden Bull Div", sym, p, bk, tf, "RSI_DIV", "green", conf, "bull", hu, market_data=market_data)
 
-    def _check_macd(self, sym, p, c, bk, tf, ml, sl, hist, conf):
+    def _check_macd(self, sym, p, c, bk, tf, ml, sl, hist, conf,
+                      market_data: Optional[Dict[str, Any]] = None):
         if not np.isnan(ml[-1]):
             if ml[-1] > sl[-1] and ml[-2] <= sl[-2]:
-                self._emit("MACD Bullish Cross", sym, p, "MACD", "green", bk, tf, conf, "bull")
+                self._emit("MACD Bullish Cross", sym, p, "MACD", "green", bk, tf, conf, "bull", market_data=market_data)
             elif ml[-1] < sl[-1] and ml[-2] >= sl[-2]:
-                self._emit("MACD Bearish Cross", sym, p, "MACD", "red", bk, tf, conf, "bear")
+                self._emit("MACD Bearish Cross", sym, p, "MACD", "red", bk, tf, conf, "bear", market_data=market_data)
 
             if not np.isnan(ml[-2]):
                 if ml[-1] > 0 and ml[-2] <= 0:
-                    self._emit("MACD Crossed Above Zero", sym, p, "MACD", "green", bk, tf, conf, "bull")
+                    self._emit("MACD Crossed Above Zero", sym, p, "MACD", "green", bk, tf, conf, "bull", market_data=market_data)
                 elif ml[-1] < 0 and ml[-2] >= 0:
-                    self._emit("MACD Crossed Below Zero", sym, p, "MACD", "red", bk, tf, conf, "bear")
+                    self._emit("MACD Crossed Below Zero", sym, p, "MACD", "red", bk, tf, conf, "bear", market_data=market_data)
 
             if self.config.get('macd.histogram_flip', True) and not np.isnan(hist[-2]):
                 if hist[-1] > 0 and hist[-2] <= 0:
-                    self._emit("MACD Hist Flip Up", sym, p, "MACD", "green", bk, tf, conf, "bull")
+                    self._emit("MACD Hist Flip Up", sym, p, "MACD", "green", bk, tf, conf, "bull", market_data=market_data)
                 elif hist[-1] < 0 and hist[-2] >= 0:
-                    self._emit("MACD Hist Flip Down", sym, p, "MACD", "red", bk, tf, conf, "bear")
+                    self._emit("MACD Hist Flip Down", sym, p, "MACD", "red", bk, tf, conf, "bear", market_data=market_data)
 
             rb, ru, hb, hu = self.div.detect_divergence(
                 c, ml, self.config.get('macd.pivot_len', 5),
                 self.config.get('macd.div_lookback', 20), self.config.get('macd.min_gap', 3))
-            self._div_alert("MACD Reg Bear Div", sym, p, bk, tf, "MACD_DIV", "red", conf, "bear", rb)
-            self._div_alert("MACD Reg Bull Div", sym, p, bk, tf, "MACD_DIV", "green", conf, "bull", ru)
-            self._div_alert("MACD Hidden Bear Div", sym, p, bk, tf, "MACD_DIV", "red", conf, "bear", hb)
-            self._div_alert("MACD Hidden Bull Div", sym, p, bk, tf, "MACD_DIV", "green", conf, "bull", hu)
+            self._div_alert("MACD Reg Bear Div", sym, p, bk, tf, "MACD_DIV", "red", conf, "bear", rb, market_data=market_data)
+            self._div_alert("MACD Reg Bull Div", sym, p, bk, tf, "MACD_DIV", "green", conf, "bull", ru, market_data=market_data)
+            self._div_alert("MACD Hidden Bear Div", sym, p, bk, tf, "MACD_DIV", "red", conf, "bear", hb, market_data=market_data)
+            self._div_alert("MACD Hidden Bull Div", sym, p, bk, tf, "MACD_DIV", "green", conf, "bull", hu, market_data=market_data)
 
-    def _check_stoch(self, sym, p, h, l, c, bk, tf, k, d, conf):
+    def _check_stoch(self, sym, p, h, l, c, bk, tf, k, d, conf,
+                       market_data: Optional[Dict[str, Any]] = None):
         ob, ovs = self.config.get('stochastic.overbought', 80), self.config.get('stochastic.oversold', 20)
 
         if not np.isnan(k[-1]) and not np.isnan(k[-2]):
             if k[-1] > d[-1] and k[-2] <= d[-2]:
-                self._emit("Stoch Bullish Cross", sym, p, "STOCH", "green", bk, tf, conf, "bull")
+                self._emit("Stoch Bullish Cross", sym, p, "STOCH", "green", bk, tf, conf, "bull", market_data=market_data)
             elif k[-1] < d[-1] and k[-2] >= d[-2]:
-                self._emit("Stoch Bearish Cross", sym, p, "STOCH", "red", bk, tf, conf, "bear")
+                self._emit("Stoch Bearish Cross", sym, p, "STOCH", "red", bk, tf, conf, "bear", market_data=market_data)
 
             if k[-1] > ob and k[-2] <= ob:
-                self._emit("Stoch Entered Overbought", sym, p, "STOCH", "red", bk, tf, conf, "bear")
+                self._emit("Stoch Entered Overbought", sym, p, "STOCH", "red", bk, tf, conf, "bear", market_data=market_data)
             elif k[-1] < ovs and k[-2] >= ovs:
-                self._emit("Stoch Entered Oversold", sym, p, "STOCH", "green", bk, tf, conf, "bull")
+                self._emit("Stoch Entered Oversold", sym, p, "STOCH", "green", bk, tf, conf, "bull", market_data=market_data)
 
-    def _check_vol(self, sym, p, h, l, c, bk, tf, upper, mid, lower, atr, conf):
+    def _check_vol(self, sym, p, h, l, c, bk, tf, upper, mid, lower, atr, conf,
+                     market_data: Optional[Dict[str, Any]] = None):
         if not np.isnan(upper[-1]):
             if c[-1] > upper[-1] and c[-2] <= upper[-2]:
-                self._emit("BB Breakout Up", sym, p, "VOL", "green", bk, tf, conf, "bull")
+                self._emit("BB Breakout Up", sym, p, "VOL", "green", bk, tf, conf, "bull", market_data=market_data)
             elif c[-1] < lower[-1] and c[-2] >= lower[-2]:
-                self._emit("BB Breakout Down", sym, p, "VOL", "red", bk, tf, conf, "bear")
+                self._emit("BB Breakout Down", sym, p, "VOL", "red", bk, tf, conf, "bear", market_data=market_data)
 
             # BB Squeeze Transition
             bb_width = (upper - lower) / mid
@@ -1734,7 +2027,7 @@ class SignalAnalyzer:
             state_key = f"{sym}_{tf}_bb_squeeze"
             in_squeeze = bb_width[-1] < threshold
             if in_squeeze and not self.alert_mgr.get_state(state_key):
-                self._emit("BB Squeeze (Entry)", sym, p, "VOL", "yellow", bk, tf, conf)
+                self._emit("BB Squeeze (Entry)", sym, p, "VOL", "yellow", bk, tf, conf, market_data=market_data)
             self.alert_mgr.set_state(state_key, in_squeeze)
 
         # ATR Expansion Transition
@@ -1745,7 +2038,7 @@ class SignalAnalyzer:
             if atr[-1] > atr_avg * self.config.get('volatility.atr_expansion_mult', 1.8):
                 state_key = f"{sym}_{tf}_atr_exp"
                 if not self.alert_mgr.get_state(state_key):
-                    self._emit("ATR Expansion (Vol Surge)", sym, p, "VOL", "yellow", bk, tf, conf)
+                    self._emit("ATR Expansion (Vol Surge)", sym, p, "VOL", "yellow", bk, tf, conf, market_data=market_data)
                     self.alert_mgr.set_state(state_key, True)
             else:
                 self.alert_mgr.set_state(state_key, False)
@@ -2071,6 +2364,7 @@ class QuantAlertEngine:
                 register_check("macro_regime", lambda: self.analyzer.macro_health())
                 register_check("outcome_gating", lambda: self.analyzer.gating_health())
                 register_check("time_gating", lambda: self.analyzer.time_health())
+                register_check("macro_context", lambda: self.analyzer.macro_context_health() if hasattr(self.analyzer, 'macro_context_health') else {"status": "healthy", "metrics": {"enabled": 0}})
                 port = self.config.get('general.health_port', 8080)
                 host = self.config.get('general.health_host', '127.0.0.1')
                 self._health_thread = start_health_server(host=host, port=port)

@@ -103,13 +103,17 @@ def send_telegram(text, parse_mode="Markdown"):
 
 
 def _alert_text(sym, sig, price, raw):
-    """Build a compact order-flow alert message for Telegram."""
+    """Build a compact order-flow alert message for Telegram with fresh market data."""
     cvd = raw.get("cvd", {})
     dom = raw.get("dom", {})
     va = raw.get("context", {}).get("value_area", {})
+    live = raw.get("live", {})
     direction = "LONG" if sig.bias_label == "bullish" else "SHORT"
     icon = "🟢" if direction == "LONG" else "🔴"
     cvd_v = cvd.get("cvd")
+    delta = live.get("delta", 0.0)
+    vol = live.get("volume", {})
+    footprint = live.get("footprint", {})
     lines = [
         f"{icon} *{direction} TRIGGER — {sym}*",
         f"Bias {sig.bias_score:.0f}/100 ({sig.bias_label}) · Rule 10 plan allowed",
@@ -121,6 +125,16 @@ def _alert_text(sym, sig, price, raw):
         lines.append(f"DOM imbalance: `{dom['imbalance_pct']:+.1f}%`")
     if va.get("poc"):
         lines.append(f"Value area: POC `{va['poc']:.2f}` VAH `{va['vah']:.2f}` VAL `{va['val']:.2f}` ({va.get('location','?')})")
+    if delta != 0.0:
+        lines.append(f"Delta: `{delta:+,.0f}`")
+    if vol.get("total"):
+        lines.append(f"Volume: {vol['total']:,.0f} (bid {vol.get('bid',0):,.0f} / ask {vol.get('ask',0):,.0f})")
+    if footprint:
+        bid_vol = footprint.get("bid_vol_total", 0)
+        ask_vol = footprint.get("ask_vol_total", 0)
+        if bid_vol or ask_vol:
+            imb = ((bid_vol - ask_vol) / (bid_vol + ask_vol) * 100) if (bid_vol + ask_vol) > 0 else 0
+            lines.append(f"Footprint imbalance: `{imb:+.1f}%`")
     lines.append(f"_Order-flow snapshot logged via /calls (validated)_")
     return "\n".join(lines)
 

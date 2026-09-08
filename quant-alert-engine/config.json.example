@@ -113,5 +113,14 @@
     "fail_open": true,
     "cache_ttl_seconds": 4.0
   },
+  "macro": {
+    "enabled": false,
+    "coingecko_key": "",
+    "cache_ttl_seconds": 60.0,
+    "predictive_weight": 0.3,
+    "max_concurrent_requests": 3,
+    "max_retries": 3,
+    "gate_signals": false
+  },
   "database": "data/alerts.db"
 }
