@@ -58,6 +58,15 @@ except Exception:
         def show_toast(self, *args, **kwargs):
             return False
 
+
+def _bridge_headers():
+    """JSON headers + X-Bridge-Token when BRIDGE_TOKEN env is set (same .env as the bridge)."""
+    h = {"Content-Type": "application/json"}
+    _bt = os.environ.get("BRIDGE_TOKEN", "").strip()
+    if _bt:
+        h["X-Bridge-Token"] = _bt
+    return h
+
 # ============================================================================
 # TIMEFRAME CADENCE & SINGLE-INSTANCE GUARD
 # ============================================================================
@@ -783,7 +792,7 @@ class AlertManager:
                     req = _urllib.Request(
                         bridge_url,
                         data=bridge_payload,
-                        headers={"Content-Type": "application/json"},
+                        headers=_bridge_headers(),
                         method="POST",
                     )
                     _urllib.urlopen(req, timeout=bridge_timeout)
