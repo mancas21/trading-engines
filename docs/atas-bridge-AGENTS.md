@@ -59,13 +59,13 @@ Bridge (FastAPI on :8000)
 
 ## Quant Analysis Rules (audited after 10-call track record — 50% raw, NOT signal-validated; pre-fix entries lack snapshots)
 
-ALL quant analyses MUST follow the 10 hard rules in `rules.json`. Key rules:
+ALL quant analyses MUST follow the 9 hard rules in `rules.json`. Key rules:
 - **Rule 1:** No directional call from a single bar — wait 2+ bars of confirmation
 - **Rule 2:** CVD spike >2x prior ATH in one bar = exhaustion — flag, never call continuation
 - **Rule 4:** Must output signal scorecard (0-100). Bias >= 60 bullish, <= 40 bearish, else neutral
 - **Rule 6:** Distribution requires ALL: CVD drops 2+ consecutive bars + 4 levels 70%+ selling + DOM < +5%
 - **Rule 7:** Accumulation requires ALL: CVD rises 2+ consecutive bars + 3 levels 70%+ buying + DOM > +10%
-- **Rule 10:** NO trade plan in neutral zone (bias 40-59)
+- **Rule 10:** DELETED 2026-09-17 (audit C-1 action 1) — score ranks only, never gates plans.
 
 Every trade plan delivered in analysis MUST be logged via `POST /calls` (outcome tracking). This builds the validated track record.
 
@@ -87,5 +87,5 @@ Every trade plan delivered in analysis MUST be logged via `POST /calls` (outcome
 - `quant_engine/` — Vendored engine subpackage (volume + volatility + core modules)
 - `atas-exporter/LiveExporter.cs` — C# indicator source
 - `atas-exporter/AtasExporter.csproj` — .NET project file
-- `rules.json` — 10 hard rules for quant analysis (must-follow)
+- `rules.json` — 9 hard rules for quant analysis (must-follow)
 - `audit.log.json` — Track record of every call with outcome

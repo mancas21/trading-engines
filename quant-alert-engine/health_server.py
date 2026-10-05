@@ -119,12 +119,36 @@ def start_health_server(host: str = "127.0.0.1", port: int = 8080):
         logger.warning(f"Health server host '{host}' is non-standard; prefer 127.0.0.1 or 0.0.0.0")
     try:
         import uvicorn
-        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
-        server = uvicorn.Server(config)
-        _server_thread = threading.Thread(target=server.run, daemon=True, name="health-server")
-        _server_thread.start()
-        logger.info("Health server started on http://%s:%s/health", host, port)
-        return _server_thread
+        # log_config=None: uvicorn otherwise runs logging.config.dictConfig on its own
+        # default LOGGING_CONFIG, which uses disable_existing_loggers and rewrites the
+        # root logger. quant_alert_engine calls logging_setup.setup_logging() more than
+        # once per process, and the two dictConfig passes interleave in different
+        # threads — the second one tears down the formatters dict while the first is
+        # still reading it, so uvicorn raises KeyError("Unable to configure formatter
+        # 'default'") and the health server never binds. The health endpoint is a
+        # diagnostic, not an app feature: it must not own the app's logging.
+        last = None
+        for attempt in range(3):
+            try:
+                config = uvicorn.Config(app, host=host, port=port, log_level="warning",
+                                        log_config=None)
+                server = uvicorn.Server(config)
+                _server_thread = threading.Thread(target=server.run, daemon=True,
+                                                  name="health-server")
+                _server_thread.start()
+                # confirm it actually bound — a thread can start and die immediately
+                for _ in range(20):
+                    if getattr(server, "started", False):
+                        break
+                    time.sleep(0.1)
+                if getattr(server, "started", False):
+                    logger.info("Health server started on http://%s:%s/health", host, port)
+                    return _server_thread
+                last = RuntimeError("server thread did not report started")
+            except Exception as e:  # noqa: BLE001
+                last = e
+            time.sleep(1.0)
+        raise last
     except Exception as e:
         logger.error("Failed to start health server: %s", e, exc_info=True)
         return None

@@ -1,13 +1,16 @@
 import asyncio
 import json
+import logging
 import os
 import time
 import sys
 from threading import Lock
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 # vendor the engine subpackage (engine.volume / engine.volatility / engine.core)
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,17 +41,27 @@ _context_lock = Lock()
 
 # --- data fetch -----------------------------------------------------------
 def _fetch_klines(symbol: str, interval: str, limit: int):
-    """Raw Binance Futures klines (blocking — run in executor)."""
+    """Raw Binance Futures klines (blocking — run in executor).
+
+    Failures used to be swallowed silently, so the endpoint answered 503 no_klines with
+    nothing in the log to say why. Log the reason on every attempt.
+    """
     url = KLINES_URL.format(symbol=symbol, interval=interval, limit=limit)
+    req = Request(url, headers={"User-Agent": "atas-bridge/1.0", "Accept": "application/json"})
     data = None
     for attempt in range(2):
         try:
-            data = json.loads(urlopen(url, timeout=10).read())
+            data = json.loads(urlopen(req, timeout=10).read())
             break
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            log.warning("klines fetch failed (%s %s, attempt %d/2): %s: %s",
+                        symbol, interval, attempt + 1, type(e).__name__, str(e)[:160])
             if attempt == 0:
                 time.sleep(0.5)
     if data is None:
+        return None
+    if not isinstance(data, list) or not data:
+        log.warning("klines fetch returned no rows for %s %s: %s", symbol, interval, str(data)[:160])
         return None
     rows = []
     for k in data:

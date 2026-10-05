@@ -8,7 +8,7 @@ register("brief", {
     rules: {
       type: "string",
       short: "r",
-      description: "Path to rules.json (default: ./rules.json)",
+      description: "Path to morning-rules.json (default: ./morning-rules.json)",
     },
   },
   handler: async ({ rules }) => core.runBrief({ rules_path: rules }),

@@ -2053,3 +2053,72 @@ If issues arise:
 ---
 
 *End of Priority 1 Fixes Document*
+---
+
+# Priority 2 Fixes — config changes justified by the Step 1 expectancy report
+
+Source: `expectancy_report.py` (views `outcomes` / `gates` / `simulate`) run over
+1,676 resolved outcomes. Reproduce with:
+`python expectancy_report.py all --json data/expectancy_report.json`
+
+## Verdict of the measurement
+
+No edge, before or after costs. Two independent methods agree:
+
+| method | expectancy |
+|---|---|
+| recorded outcomes, R-normalised, net of costs | **-4.61R** per signal (IC90 [-5.77,-3.52], n=868) |
+| full-path fill simulation (stop/target on real high/low, repo `CostModel`) | **-4.41% of equity** per trade, PF 0.029, maxDD 100% |
+
+Gross hit rate is 45.7% -> the edge BEFORE any cost is `2p-1 = -0.085R`. The
+signals do not predict direction, and then costs make it far worse.
+
+## Fix 1 — removed `1m` from `timeframes` (config.json, config.json.example)
+
+1m carried 690 of 868 directional signals (79%) and is structurally untradeable:
+
+| tf | n | median stop | median cost | trades whose cost ALONE > 1R |
+|---|---|---|---|---|
+| **1m** | 690 | 0.128% | **0.784R** | **41.6%** |
+| 5m | 126 | 0.388% | 0.258R | 19.8% |
+| 15m | 31 | 0.622% | 0.161R | 29.0% |
+| 30m | 13 | 1.003R | 0.100R | 23.1% |
+| 1h | 8 | 2.660% | 0.041R | 0.0% |
+
+Roundtrip cost is 0.100% of price. On 1m the ATR is 0.08%, so a 2xATR stop is
+0.128% wide — **narrower than the fee**. Sizing 1% risk over that stop levers the
+notional ~8x and the fee is paid on the notional: 41.6% of 1m trades cannot win
+even when the target is hit. Confirmed in the simulation: of 241 target hits,
+several were net-negative (8 of 25 on the SOL-only run).
+
+Widening the stop does NOT fix it (2x -> 4x -> 8xATR drops 1m median cost
+0.784R -> 0.196R but median net only -1.187R -> -0.297R): the binding constraint
+is the absent gross edge, not just cost.
+
+## Fix 2 — `general.outcome_gating_enabled: true -> false`
+
+Measured with train-only discipline (mute set built from the first half, applied
+to the held-out half):
+
+- sample size per (symbol, signal) pair: max 33, median 6, p90 19; **1 of 113
+  pairs reaches n>=30**, so at the configured `outcome_gating_min_n: 30` the gate
+  is effectively a no-op.
+- at every REACHABLE threshold it makes expectancy worse:
+  min_n 3 -> delta -1.86R, 5 -> -1.66R, 8 -> -1.19R, 10 -> -0.77R, 15 -> -0.32R.
+
+Muting on a raw mean over 5-15 samples is noise-chasing: it discards pairs whose
+true expectancy is positive. Either useless or harmful, so it is off. Revisit
+once 4-8 weeks exist and n>=30 per pair is genuinely reached (>=5m only).
+
+## NOT changed, and why — `time_gating_protected_hours_local: [8..15]`
+
+The gate mutes hours on GROSS expectancy (ignores costs), and the protected list
+overrides it for 8 of the 10 observed hours — which measured as the WORST of the
+10 (UTC 18h/19h = -11.95R/-13.73R mean, while the unprotected UTC 22h/23h were
+the least bad at -0.61R/-0.54R). So the override looks backwards.
+
+It was deliberately left alone: 72% of ALL signals sit inside those hours, so
+clearing the list would let the gate mute ~72% of volume — and every hour of the
+current sample is negative, i.e. the engine would go silent. That is a product
+decision, and the hour statistics are contaminated by 1m (which is now disabled).
+Re-measure the per-hour table on the >=5m stream before touching this list.

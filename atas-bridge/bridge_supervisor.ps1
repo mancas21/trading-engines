@@ -12,7 +12,7 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
 $python = "C:\Users\Lenovo\AppData\Local\Programs\Python\Python312\python.exe"
-$bridge = "C:\atas-bridge\bridge_server.py"
+$bridge = "C:\Users\Lenovo\trading-engines\atas-bridge\bridge_server.py"
 
 function Write-Log($msg) {
   $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $msg"

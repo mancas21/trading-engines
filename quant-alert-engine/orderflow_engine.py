@@ -25,6 +25,7 @@ import time
 import argparse
 import datetime as _dt
 import urllib.request
+from collections import deque
 from urllib.error import URLError
 
 # Reuse the bridge's deterministic scorer + rules (single source of truth)
@@ -34,9 +35,11 @@ if os.path.exists(_BRIDGE_DIR) and _BRIDGE_DIR not in sys.path:
 
 try:
     from signal_engine import build_snapshot_from_live, compute_signal  # noqa: E402
+    from orderflow_calls import build_plan as _canonical_build_plan  # noqa: E402
 except ImportError:
     build_snapshot_from_live = None
     compute_signal = None
+    _canonical_build_plan = None
 
 BASE = os.getenv("BRIDGE_URL", "http://127.0.0.1:8000").rstrip("/quant-alert").rstrip("/quant/filter").rstrip("/")
 
@@ -116,7 +119,7 @@ def _alert_text(sym, sig, price, raw):
     footprint = live.get("footprint", {})
     lines = [
         f"{icon} *{direction} TRIGGER — {sym}*",
-        f"Bias {sig.bias_score:.0f}/100 ({sig.bias_label}) · Rule 10 plan allowed",
+        f"Bias {sig.bias_score:.0f}/100 ({sig.bias_label}) · plan allowed (no veto)",
         f"Price: `{price:.2f}`",
     ]
     if cvd_v is not None:
@@ -169,6 +172,9 @@ def live_snapshot(symbol):
         live = dict(live)
         live["dom"] = {
             "imbalance_pct": dom.get("imbalance_pct", live.get("dom", {}).get("imbalance_pct", 0)),
+            # Audit C-3 action 3: keep the 45s EMA — signal_engine scores and
+            # rules 6/7 leg (c) on it, and the monitor persistence gate reads it.
+            "imbalance_pct_ema": dom.get("imbalance_pct_ema", 0),
             "cumulative_bid_vol": dom.get("total_bid_vol", 0),
             "cumulative_ask_vol": dom.get("total_ask_vol", 0),
         }
@@ -189,35 +195,27 @@ def live_snapshot(symbol):
 
 
 def build_trade_plan(live_price, direction, ctx, bias_score):
-    """Replicate the live-anchored trade plan sizing from _integrated_analysis.py
-    (entry ±0.15%, SL 0.85x med, T1 1.0x med, T2 1.8x p90) using context expected move."""
-    exp_med = ctx.get("expected_move", {}).get("value", 0.44) if isinstance(ctx, dict) else 0.44
-    # p90 now rides on its own field (audit M4); fall back to legacy CI[1] if present
+    """Single source of truth (audit H-4 action 5, 2026-09-17): delegates to
+    atas-bridge/orderflow_calls.build_plan. Entry ±0.05%, cost-suppressed
+    (cost_r<=0.15R), T1>=1.5xSL, 8-decimal schema. Returns None when the
+    geometry cannot carry costs (caller must handle). exp_med/exp_p90 are
+    attached for display compatibility."""
     em = ctx.get("expected_move", {}) if isinstance(ctx, dict) else {}
-    exp_p90 = em.get("p90")
+    exp_med = em.get("value", 0.44) if isinstance(em, dict) else 0.44
+    exp_p90 = em.get("p90") if isinstance(em, dict) else None
     if exp_p90 is None:
-        ci = em.get("confidence_interval")
+        ci = em.get("confidence_interval") if isinstance(em, dict) else None
         exp_p90 = ci[1] if isinstance(ci, (list, tuple)) and len(ci) > 1 else None
-    if exp_p90 is None:
-        exp_p90 = exp_med * 4.6
-    if isinstance(exp_med, dict):
-        exp_med = exp_med.get("value", 0.44)
-    if exp_med < 0.05:
-        exp_med *= 100
-    if exp_p90 < 0.05:
-        exp_p90 *= 100
-    half = live_price * 0.0015
-    sl_d = live_price * (exp_med / 100) * 0.85
-    t1_d = live_price * (exp_med / 100)
-    t2_d = live_price * (exp_med / 100) * 1.8
-    entry_low, entry_high = live_price - half, live_price + half
-    if direction == "long":
-        return dict(entry_low=round(entry_low, 4), entry_high=round(entry_high, 4),
-                    sl=round(entry_low - sl_d, 4), t1=round(entry_high + t1_d, 4),
-                    t2=round(entry_high + t2_d, 4), exp_med=exp_med, exp_p90=exp_p90)
-    return dict(entry_low=round(entry_low, 4), entry_high=round(entry_high, 4),
-                sl=round(entry_high + sl_d, 4), t1=round(entry_low - t1_d, 4),
-                t2=round(entry_low - t2_d, 4), exp_med=exp_med, exp_p90=exp_p90)
+    if _canonical_build_plan is None:
+        raise ImportError("orderflow_calls.build_plan unavailable — check ATAS_BRIDGE_DIR")
+    plan = _canonical_build_plan(
+        {"mid": live_price, "exp_move_med": exp_med, "exp_move_p90": exp_p90},
+        direction)
+    if plan is None:
+        return None
+    plan["exp_med"] = exp_med
+    plan["exp_p90"] = exp_p90 if exp_p90 else exp_med * 4.6
+    return plan
 
 
 def compact_snapshot(raw):
@@ -280,6 +278,8 @@ def monitor(symbols, cooldown_s=600, history=None, snapdir=None, poll=2.0):
     hist = snapdir or os.path.join(os.path.dirname(__file__), "data", "orderflow_history")
     os.makedirs(hist, exist_ok=True)
     last_call = {s: 0.0 for s in symbols}
+    # Audit C-3 action 3: DOM leg-(c) persistence — EMA side must hold 3 polls.
+    legc = {s: deque(maxlen=3) for s in symbols}
 
     print(f"[orderflow] monitoring {symbols} (cooldown {cooldown_s}s, both dirs, history -> {hist})")
     while True:
@@ -293,39 +293,54 @@ def monitor(symbols, cooldown_s=600, history=None, snapdir=None, poll=2.0):
                 snap = build_snapshot_from_live(live, raw.get("cvd"))
                 sig = compute_signal(snap) if snap else None
                 now = time.time()
+                # Persistence history builds on every pass.
+                _ema = (raw.get("dom", {}) or {}).get("imbalance_pct_ema")
+                legc[sym].append(1 if _ema is not None and _ema > 10
+                                 else (-1 if _ema is not None and _ema < 5 else 0))
 
                 if sig and sig.trade_plan_allowed and (now - last_call[sym]) >= cooldown_s:
                     direction = "long" if sig.bias_label == "bullish" else "short"
-                    plan = build_trade_plan(price, direction, raw.get("context", {}), sig.bias_score)
-                    snap_compact = compact_snapshot(raw)
-                    note = (f"phase2 live-anchored {price:.2f} (bias {sig.bias_score:.0f}, "
-                            f"cov={getattr(sig, 'data_coverage', 1.0):.2f}, "
-                            f"sub={json.dumps(sig.sub_scores)})")
-                    payload = {
-                        "symbol": sym, "direction": direction,
-                        "entry_low": plan["entry_low"], "entry_high": plan["entry_high"],
-                        "sl": plan["sl"], "t1": plan["t1"], "t2": plan["t2"],
-                        "bias_score": sig.bias_score,
-                        "note": note,
-                        "snapshot": snap_compact,
-                    }
-                    try:
-                        res = _post("/calls", payload)
-                        last_call[sym] = now
-                        print(f"[{_dt.datetime.now().strftime('%H:%M:%S')}] CALL {res.get('call_id')} "
-                              f"{sym} {direction.upper()} bias {sig.bias_score:.0f} cov={getattr(sig, 'data_coverage', 1.0):.2f} @ {price:.2f}")
-                        with open(call_file, "a") as f:
-                            f.write(json.dumps({"ts": now, "call_id": res.get("call_id"),
-                                                "symbol": sym, **payload}) + "\n")
-                        # Telegram alert on trigger
-                        sent = send_telegram(_alert_text(sym, sig, price, raw))
-                        print(f"  telegram_sent={sent}")
-                    except Exception as e:  # noqa: BLE001
-                        print(f"  ! {sym} call log failed: {e}")
+                    _streak = list(legc[sym])
+                    _want = 1 if direction == "long" else -1
+                    _persist_ok = len(_streak) == 3 and all(x == _want for x in _streak)
+                    if not _persist_ok:
+                        print(f"[{_dt.datetime.now().strftime('%H:%M:%S')}] {sym} bias "
+                              f"{sig.bias_score:.0f} @ {price:.2f} (no plan: dom leg-(c) "
+                              f"persistence {_streak})")
+                    else:
+                        plan = build_trade_plan(price, direction, raw.get("context", {}), sig.bias_score)
+                        if plan is None:
+                            print(f"[{_dt.datetime.now().strftime('%H:%M:%S')}] {sym} "
+                                  f"persistence ok but geometry suppressed (cost_r>max) @ {price:.2f}")
+                        else:
+                            snap_compact = compact_snapshot(raw)
+                            note = (f"phase2 live-anchored {price:.2f} (bias {sig.bias_score:.0f}, "
+                                    f"cov={getattr(sig, 'data_coverage', 1.0):.2f}, "
+                                    f"sub={json.dumps(sig.sub_scores)})")
+                            payload = {
+                                "symbol": sym, "direction": direction,
+                                "entry_low": plan["entry_low"], "entry_high": plan["entry_high"],
+                                "sl": plan["sl"], "t1": plan["t1"], "t2": plan["t2"],
+                                "note": note,
+                                "snapshot": snap_compact,
+                            }
+                            try:
+                                res = _post("/calls", payload)
+                                last_call[sym] = now
+                                print(f"[{_dt.datetime.now().strftime('%H:%M:%S')}] CALL {res.get('call_id')} "
+                                      f"{sym} {direction.upper()} bias {sig.bias_score:.0f} cov={getattr(sig, 'data_coverage', 1.0):.2f} @ {price:.2f}")
+                                with open(call_file, "a") as f:
+                                    f.write(json.dumps({"ts": now, "call_id": res.get("call_id"),
+                                                        "symbol": sym, **payload}) + "\n")
+                                # Telegram alert on trigger
+                                sent = send_telegram(_alert_text(sym, sig, price, raw))
+                                print(f"  telegram_sent={sent}")
+                            except Exception as e:  # noqa: BLE001
+                                print(f"  ! {sym} call log failed: {e}")
                 elif sig and not sig.trade_plan_allowed:
                     reasons = getattr(sig, "plan_blocked_reasons", [])
                     cov = getattr(sig, "data_coverage", 1.0)
-                    rs = ",".join(reasons) if reasons else f"rule10 neutral (cov {cov:.2f})"
+                    rs = ",".join(reasons) if reasons else f"hard veto (cov {cov:.2f})"
                     print(f"[{_dt.datetime.now().strftime('%H:%M:%S')}] {sym} bias "
                           f"{sig.bias_score:.0f} @ {price:.2f} (no plan: {rs})")
 

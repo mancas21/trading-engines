@@ -1,6 +1,6 @@
 /**
  * Morning brief core logic.
- * Reads rules.json, scans watchlist symbols, returns structured data
+ * Reads morning-rules.json, scans watchlist symbols, returns structured data
  * for Claude to apply bias criteria and generate a session brief.
  */
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
@@ -17,8 +17,8 @@ const SESSIONS_DIR = join(homedir(), ".kasper", "sessions");
 function loadRules(rulesPath) {
   const candidates = [
     rulesPath,
-    join(PROJECT_ROOT, "rules.json"),
-    join(homedir(), ".kasper", "rules.json"),
+    join(PROJECT_ROOT, "morning-rules.json"),
+    join(homedir(), ".kasper", "morning-rules.json"),
   ].filter(Boolean);
 
   for (const p of candidates) {
@@ -26,13 +26,13 @@ function loadRules(rulesPath) {
       try {
         return { rules: JSON.parse(readFileSync(p, "utf8")), path: p };
       } catch (e) {
-        throw new Error(`Failed to parse rules.json at ${p}: ${e.message}`);
+        throw new Error(`Failed to parse morning-rules.json at ${p}: ${e.message}`);
       }
     }
   }
 
   throw new Error(
-    "No rules.json found. Copy rules.example.json to rules.json and fill in your trading rules.\n" +
+    "No morning-rules.json found. Copy morning-rules.example.json to morning-rules.json and fill in your trading rules.\n" +
       "Looked in:\n" +
       candidates
         .filter(Boolean)
@@ -47,7 +47,7 @@ export async function runBrief({ rules_path } = {}) {
 
   if (!watchlist.length) {
     throw new Error(
-      "rules.json watchlist is empty. Add at least one symbol to your watchlist array.",
+      "morning-rules.json watchlist is empty. Add at least one symbol to your watchlist array.",
     );
   }
 

@@ -32,6 +32,7 @@ from urllib.request import urlopen, Request as URLRequest
 
 import uvicorn
 import decision_engine as _de
+import _shared_read
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
@@ -252,6 +253,24 @@ async def _dom_feeds():
 
                                 # P6: DOM persistence filter — require wall to persist across reads
                                 dp = dom_persist[sym]
+
+                                # P7: time-averaged book imbalance. One top-15 snapshot is
+                                # dominated by sampling noise (mean |Δ| between 15s polls measured
+                                # at 1.44x the whole cross-symbol spread), so publish an
+                                # exponentially-weighted average next to the raw value. Consumers
+                                # that score on imbalance should use imbalance_pct_ema.
+                                import math as _math
+                                _now_ema = time.time()
+                                _prev_ema = dp.get("imb_ema")
+                                if _prev_ema is None:
+                                    imb_ema = imb
+                                else:
+                                    _dt = max(_now_ema - dp.get("imb_ema_ts", _now_ema), 0.0)
+                                    _alpha = 1.0 - _math.exp(-_dt / _DOM_IMB_EMA_TAU_S)
+                                    imb_ema = _prev_ema + _alpha * (imb - _prev_ema)
+                                dp["imb_ema"] = imb_ema
+                                dp["imb_ema_ts"] = _now_ema
+                                dp["imb_ema_n"] = int(dp.get("imb_ema_n", 0)) + 1
                                 if dp["bid_wall_price"] == bid_wall_price:
                                     dp["bid_wall_hits"] = min(dp["bid_wall_hits"] + 1, DOM_PERSIST_REQUIRED)
                                 else:
@@ -276,6 +295,8 @@ async def _dom_feeds():
                                     s["total_bid_vol"] = round(total_bid, 2)
                                     s["total_ask_vol"] = round(total_ask, 2)
                                     s["imbalance_pct"] = round(imb, 1)
+                                    s["imbalance_pct_ema"] = round(imb_ema, 1)
+                                    s["imbalance_ema_samples"] = dp["imb_ema_n"]
                                     s["bids"] = [[p, v] for p, v in bids[:15]]
                                     s["asks"] = [[p, v] for p, v in asks[:15]]
                                     s["bid_wall_persistent"] = dp["bid_wall_hits"] >= DOM_PERSIST_REQUIRED
@@ -522,16 +543,91 @@ _LIVE_INDICATORS_FILE = os.environ.get(
     os.path.join(_BRIDGE_DIR, "_live_indicators.json"),
 )
 # Where the compiled LiveExporter.dll actually writes its per-symbol files.
-# Defaults to the legacy C:\atas-bridge dir until ATAS is rebuilt to the new
-# path — the bridge must read from HERE, not from its own directory.
+# The DLL (LiveExporter.cs) writes to THIS directory by default (matching
+# the bridge's own dir). Overridable via ATAS_BRIDGE_DIR env.
 _LIVEEXPORTER_OUTPUT_DIR = os.environ.get(
     "ATAS_BRIDGE_DIR",
-    r"C:\atas-bridge",
+    _BRIDGE_DIR,
 )
 # Max age (s) for a LiveExporter snapshot to be considered "live" — older than
 # this is frozen and must NOT be served as current data (kills the "same stale
 # alert every 15 min" behaviour at the source).
 _LIVE_STALE_LIMIT_SECONDS = 300
+
+# ── LIVE-ONLY GATE ────────────────────────────────────────────────────────
+# Standing rule: analysis may ONLY use data that is live at the moment of the
+# ask. Nothing frozen, restored-from-disk, or carried over from a previous run
+# may be served as if it were current. Two mechanisms:
+#
+#   1. Per-symbol freshness. The exporter writes one file PER SYMBOL, so a
+#      single frozen symbol must never be answered with a sibling's data or
+#      with its own stale snapshot. Every read surface filters on payload age.
+#   2. Derived-state freshness. CVD / taker-CVD / alert buffers are accumulated
+#      state; a symbol whose source stopped is DROPPED rather than served at a
+#      frozen value, because a stale CVD reads as a live one on a chart.
+#
+# Default 300s was chosen because the exporter publishes every ~300ms while a
+# chart is calculating, and a stopped chart is what we want to surface. Override
+# with ATAS_LIVE_MAX_AGE_SECONDS when a symbol legitimately updates slower.
+_LIVE_MAX_AGE_SECONDS = float(os.environ.get("ATAS_LIVE_MAX_AGE_SECONDS", "300"))
+
+
+def _payload_age_seconds(payload: dict):
+    """Age (s) of a LiveExporter payload from its own `timestamp`, else None."""
+    if not isinstance(payload, dict):
+        return None
+    ts = payload.get("timestamp")
+    if ts is None:
+        return None
+    try:
+        return max(0.0, time.time() - (float(ts) / 1000.0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_live_payload(payload: dict) -> bool:
+    """True only if the payload was written within the live window."""
+    age = _payload_age_seconds(payload)
+    return age is not None and age <= _LIVE_MAX_AGE_SECONDS
+
+
+def _live_indicator_symbols():
+    """Map symbol -> age_seconds for EVERY currently-live exporter file.
+
+    A file that exists but is frozen (chart stopped calculating) is simply
+    absent from the result — callers use this to exclude it rather than to
+    discover it late.
+    """
+    import glob as _glob
+    now = time.time()
+    out = {}
+    dirs = []
+    for d in (_LIVEEXPORTER_OUTPUT_DIR, _BRIDGE_DIR):
+        if d and d not in dirs and os.path.isdir(d):
+            dirs.append(d)
+    for d in dirs:
+        for path in _glob.glob(os.path.join(d, "_live_indicators_*.json")):
+            try:
+                # mtime alone is not enough: a direct-overwrite fallback write
+                # can bump mtime, so trust the payload's own timestamp.
+                content = _shared_read.read_text(path)
+                if not content.strip():
+                    continue
+                payload = _json.loads(content)
+            except Exception:
+                continue
+            age = _payload_age_seconds(payload)
+            if age is None or age > _LIVE_MAX_AGE_SECONDS:
+                continue
+            if now - os.path.getmtime(path) > _LIVE_MAX_AGE_SECONDS:
+                continue
+            sym = str(payload.get("ticker") or "").upper().strip()
+            if not sym:
+                base = os.path.basename(path)
+                sym = base[len("_live_indicators_"):-len(".json")].upper()
+            if sym:
+                out[sym] = age
+    return out
 
 # P2: Feature/tick history — append-only JSONL per poll
 _TICK_HISTORY_PATH = os.path.join(os.path.dirname(__file__), "_tick_history.jsonl")
@@ -908,6 +1004,8 @@ _TAKER_CVD_STATE_PATH = os.path.join(os.path.dirname(__file__), "_taker_cvd_stat
 _taker_cvd_state: dict[str, dict] = {}
 _TAKER_CVD_LOCK = threading.Lock()
 _taker_cvd_dirty = False
+# Rolling-window length for the restart-proof flow metric published as cvd_usd_1m/5m.
+_TAKER_FLOW_WINDOW_S = float(os.getenv("TAKER_FLOW_WINDOW_S", "300.0"))
 
 def _taker_cvd_new_state() -> dict:
     return {
@@ -918,6 +1016,8 @@ def _taker_cvd_new_state() -> dict:
         "high_cvd_usd": 0.0,
         "low_cvd_usd": 0.0,
         "bars": 0,              # trade count
+        "started_ts": 0.0,      # first-trade ts of THIS accumulator run
+        "flow_win": [],         # [[ts, delta_usd], ...] trailing window for cvd_usd_1m/5m
         "updated_ts": 0.0,
     }
 
@@ -932,6 +1032,11 @@ def _taker_cvd_load() -> None:
                 continue
             merged = _taker_cvd_new_state()
             merged.update(st)
+            if not merged.get("started_ts"):
+                # Legacy/older state file: cvd_usd carries over from a previous run but the
+                # accumulator's true start is unknown, so its age (and any per-minute rate
+                # derived from it) would be wrong. Flag it instead of publishing a fake rate.
+                merged["started_ts_unknown"] = True
             _taker_cvd_state[sym.upper()] = merged
         log.info("Taker CVD state loaded: %s", ", ".join(_taker_cvd_state) or "empty")
     except Exception as e:
@@ -956,17 +1061,45 @@ def _taker_cvd_get(symbol: str) -> dict | None:
         return dict(st) if st else None
 
 def _taker_cvd_public(sym: str, st: dict) -> dict:
-    return {
+    """Public view. `cvd_usd` is a running sum whose value depends on how long the
+    symbol's WS stream has been alive (measured spread across symbols: 18.6x in tick
+    count), so it is NOT comparable across symbols. The scale-free fields below are:
+    `cvd_usd_per_min` (flow rate since start), `range_pos_usd` (position inside the
+    session high/low range) and `age_s`."""
+    now = time.time()
+    started = st.get("started_ts") or 0.0
+    legacy = bool(st.get("started_ts_unknown"))
+    # age_s is only meaningful when this run started the accumulator from zero
+    age_s = max(now - started, 0.0) if (started and not legacy) else None
+    cvd_usd = st.get("cvd_usd", 0.0)
+    hi = st.get("high_cvd_usd", 0.0)
+    lo = st.get("low_cvd_usd", 0.0)
+    win = st.get("flow_win") or []
+    flow_1m = sum(e[1] for e in win if e[0] >= now - 60.0)
+    flow_5m = sum(e[1] for e in win if e[0] >= now - 300.0)
+    out = {
         "symbol": sym,
         "cvd": round(st.get("cvd", 0.0), 4),
-        "cvd_usd": round(st.get("cvd_usd", 0.0), 2),
+        "cvd_usd": round(cvd_usd, 2),
         "high_cvd": round(st.get("high_cvd", 0.0), 4),
         "low_cvd": round(st.get("low_cvd", 0.0), 4),
-        "high_cvd_usd": round(st.get("high_cvd_usd", 0.0), 2),
-        "low_cvd_usd": round(st.get("low_cvd_usd", 0.0), 2),
+        "high_cvd_usd": round(hi, 2),
+        "low_cvd_usd": round(lo, 2),
         "bars": int(st.get("bars", 0)),
+        "started_ts": started or None,
+        "age_s": None if age_s is None else round(age_s, 1),
+        "cvd_usd_1m": round(flow_1m, 2),
+        "cvd_usd_5m": round(flow_5m, 2),
+        "range_pos_usd": (None if (hi - lo) <= 0 else round((cvd_usd - lo) / (hi - lo), 4)),
         "updated_ts": st.get("updated_ts", 0.0),
+        "_note": ("cvd_usd is a cumulative sum whose size depends on how long the stream has "
+                  "been alive (ages differ ~19x across symbols): compare cvd_usd_1m, "
+                  "cvd_usd_5m or range_pos_usd across symbols, never cvd_usd"),
     }
+    if legacy:
+        out["_note"] += (" | accumulator carried over from a previous run: cvd_usd includes "
+                         "earlier flow, the rolling windows do not")
+    return out
 
 def _taker_cvd_update(symbol: str, delta_qty: float, delta_usd: float) -> None:
     global _taker_cvd_dirty
@@ -974,6 +1107,8 @@ def _taker_cvd_update(symbol: str, delta_qty: float, delta_usd: float) -> None:
     now = time.time()
     with _TAKER_CVD_LOCK:
         st = _taker_cvd_state.setdefault(sym, _taker_cvd_new_state())
+        if not st.get("started_ts"):
+            st["started_ts"] = now
         st["cvd"] += delta_qty
         st["cvd_usd"] += delta_usd
         st["bars"] += 1
@@ -981,6 +1116,13 @@ def _taker_cvd_update(symbol: str, delta_qty: float, delta_usd: float) -> None:
         st["low_cvd"] = min(st["low_cvd"], st["cvd"])
         st["high_cvd_usd"] = max(st["high_cvd_usd"], st["cvd_usd"])
         st["low_cvd_usd"] = min(st["low_cvd_usd"], st["cvd_usd"])
+        # Rolling window: a cumulative sum is not comparable across symbols (stream ages
+        # differ by ~19x), so also keep the trailing net flow per symbol.
+        win = st.setdefault("flow_win", [])
+        win.append([now, delta_usd])
+        cutoff = now - _TAKER_FLOW_WINDOW_S
+        if len(win) > 4096 or (win and win[0][0] < cutoff):
+            st["flow_win"] = [e for e in win if e[0] >= cutoff]
         st["updated_ts"] = now
         _taker_cvd_dirty = True
 
@@ -1197,6 +1339,10 @@ async def context_symbol(symbol: str):
 # replaying the log on startup. All mutations happen on the event-loop
 # thread; RLock is defensive only.
 _CALLS_LOG_PATH = os.path.join(os.path.dirname(__file__), "_calls_log.jsonl")
+# Audit M-2 action 7 (2026-09-17): Rule 8's loss trail. The resolver appends one
+# JSON line per resolved call (all outcomes, not just losses) with a deterministic
+# root_cause_hint derived from data it already holds (MFE/MAE/hold/activation).
+_AUDIT_LOG_PATH = os.path.join(os.path.dirname(__file__), "audit.log.json")
 _CALLS_POLL_SECONDS = float(os.getenv("CALLS_POLL_SECONDS", "2.5"))
 _CALLS_ACTIVATE_TTL_H = float(os.getenv("CALLS_ACTIVATE_TTL_H", "12.0"))
 _CALLS_ACTIVE_TTL_H = float(os.getenv("CALLS_ACTIVE_TTL_H", "48.0"))
@@ -1205,6 +1351,35 @@ _CALLS_PRICE_URL = "https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol
 # Applied to every resolved outcome as cost_r = (bps/1e4) * mid / risk, converting
 # the price-space cost into R units. Override via CALLS_COST_BPS.
 CALLS_COST_BPS = float(os.getenv("CALLS_COST_BPS", "8.0"))  # 4bp taker x2 + 0 slippage default
+
+# Excursion sanity. MFE/MAE are updated from the SAME single price poll that can resolve a
+# call (one poll apart), so a resolved winner's MFE should be ~its exit R plus at most one
+# poll of overshoot, and a stopped call's MAE should be ~1.0R. Measured on the 15-call track
+# record, 9/16 carried an excursion implying a >1% move inside one poll (20.1R on a 0.287%
+# stop = 5.8%) and stopped calls showed a median MAE of 2.1R instead of 1.0R — i.e.
+# /calls/stats avg_mfe_r was measuring bad prints. Readings above this threshold are
+# excluded from MFE/MAE and appended to the log as `excursion_suspect` events instead.
+_CALLS_POLL_MOVE_SANITY_PCT = float(os.getenv("CALLS_POLL_MOVE_SANITY_PCT", "1.0"))
+
+# Time constant (seconds) of the exponentially-weighted book imbalance published as
+# `imbalance_pct_ema`. A single top-15 snapshot is dominated by sampling noise: measured on
+# the live feed, the mean absolute change between 15s polls is 1.44x the entire cross-symbol
+# spread of per-symbol means, and the cross-symbol ranking does not survive 2 minutes
+# (Spearman -0.62). Consumers should prefer the EMA; `imbalance_pct` is kept unchanged.
+_DOM_IMB_EMA_TAU_S = float(os.getenv("DOM_IMB_EMA_TAU_S", "45.0"))
+
+# Exit mode for newly created calls, recorded on every call so cohorts stay separable.
+#   "logged"     - the fixed-T1 behaviour every call in the track record so far used (default)
+#   "half_at_1r" - half off at +1R, remainder trailed CALLS_TRAIL_R behind the best excursion
+# Measured on the 16-call track record by replaying 1m klines (exit_replay.py): the trailing
+# variant improved the median from -0.55R to +0.24R and net-positive calls from 8 to 9, but
+# its mean advantage (~+0.19R) is inside the noise band for n=16 AND the ground-truth outcome
+# log itself disagrees with exchange prints on long-held calls — so this is OFF by default and
+# meant to be A/B'd on live cohorts, not switched on faith.
+_CALLS_EXIT_MODE = os.getenv("CALLS_EXIT_MODE", "half_at_1r").strip().lower()
+_CALLS_HALF_AT_R = float(os.getenv("CALLS_HALF_AT_R", "1.0"))
+_CALLS_HALF_FRACTION = float(os.getenv("CALLS_HALF_FRACTION", "0.5"))
+_CALLS_TRAIL_R = float(os.getenv("CALLS_TRAIL_R", "0.5"))
 
 _calls: dict[str, dict] = {}               # open/active calls by call_id
 _calls_resolved: deque = deque(maxlen=50)  # recent resolved, oldest -> newest
@@ -1232,6 +1407,154 @@ def _calls_append(event: dict) -> None:
                 f.write(_json.dumps(event) + "\n")
     except Exception as e:
         log.warning("Calls log append failed: %s", e)
+
+
+def _audit_root_cause(c: dict, outcome: str, outcome_r, now: float) -> str:
+    """Deterministic root-cause hint from resolver-held data (audit M-2)."""
+    mfe = c.get("mfe_r", 0.0) or 0.0
+    mae = c.get("mae_r", 0.0) or 0.0
+    if outcome == "t1_hit":
+        return "target_hit"
+    if outcome == "expired_unactivated":
+        return "never_activated"
+    if outcome == "cancelled":
+        return "cancelled"
+    if outcome == "sl_hit":
+        if mfe >= 1.0:
+            return "gave_back_gains_exit_management"
+        return "stopped_no_heat"
+    r = outcome_r if outcome_r is not None else 0.0
+    if r > 0:
+        return "profitable_nonstandard_exit"
+    if r < 0:
+        return "unprofitable_nonstandard_exit"
+    return "flat"
+
+
+_VERIFY_VENUE = "binancefapi-1m"
+
+
+def _verify_path_coverage(symbol: str, direction: str, sl: float, t1: float,
+                          opened_ts: float, resolved_ts: float) -> dict:
+    """Exchange-truth first-touch check (audit B7).
+
+    The resolver polls discretely, so a wick can touch SL and recover to T1
+    between two polls and get logged t1_hit. This walks Binance USDT-M 1m
+    klines over the call's life and reports which level printed first.
+    Returns a path_coverage dict; exchange_verified=False when klines are
+    unreachable (fail-open: never overturns the logged outcome — history is
+    append-only, verification only FLAGS contradictions).
+    """
+    pc: dict = {"venue": _VERIFY_VENUE, "exchange_verified": False,
+                "first_touch": "unverified", "first_touch_ts": None,
+                "contradicts": False, "klines": 0}
+    try:
+        klines = []
+        cur = int((opened_ts - 120) * 1000)
+        end = int((resolved_ts + 120) * 1000)
+        while cur < end:
+            url = (f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}"
+                   f"&interval=1m&startTime={cur}&endTime={end}&limit=1000")
+            with urlopen(url, timeout=20) as r:
+                batch = _json.loads(r.read().decode())
+            if not batch:
+                break
+            klines.extend(batch)
+            cur = batch[-1][0] + 60000
+            if len(batch) < 1000:
+                break
+        pc["klines"] = len(klines)
+        if not klines:
+            return pc
+        long = direction == "long"
+        first_sl = first_t1 = None
+        for k in klines:
+            h, lo = float(k[2]), float(k[3])
+            hit_sl = (lo <= sl) if long else (h >= sl)
+            hit_t1 = (h >= t1) if long else (lo <= t1)
+            if hit_sl and hit_t1:
+                first_sl = first_t1 = k[0]
+                pc["first_touch"] = "ambiguous"
+                break
+            if hit_sl and first_sl is None:
+                first_sl = k[0]
+            if hit_t1 and first_t1 is None:
+                first_t1 = k[0]
+            if first_sl is not None and first_t1 is not None:
+                break
+        if pc["first_touch"] != "ambiguous":
+            if first_sl is not None and (first_t1 is None or first_sl < first_t1):
+                pc["first_touch"] = "sl"
+                pc["first_touch_ts"] = first_sl / 1000.0
+            elif first_t1 is not None:
+                pc["first_touch"] = "t1"
+                pc["first_touch_ts"] = first_t1 / 1000.0
+            else:
+                pc["first_touch"] = "neither"
+        pc["exchange_verified"] = True
+    except Exception as e:  # noqa: BLE001
+        pc["error"] = str(e)[:120]
+    return pc
+
+
+def _verify_call_path_bg(call_id: str, symbol: str, direction: str,
+                         sl: float, t1: float, opened_ts: float,
+                         resolved_ts: float, outcome: str) -> None:
+    """Background worker: exchange-verify one resolution, append `verified`
+    event + audit line. Fire-and-forget (daemon thread)."""
+    try:
+        pc = _verify_path_coverage(symbol, direction, sl, t1,
+                                   opened_ts, resolved_ts)
+        logged_side = {"t1_hit": "t1", "sl_hit": "sl",
+                       "half_sl": "sl"}.get(outcome)
+        if logged_side and pc.get("first_touch") in ("sl", "t1"):
+            pc["contradicts"] = (logged_side != pc["first_touch"])
+        now = time.time()
+        _calls_append({"ev": "verified", "call_id": call_id, "ts": now,
+                       "path_coverage": pc})
+        try:
+            with _CALLS_LOCK:
+                with open(_AUDIT_LOG_PATH, "a") as f:
+                    f.write(_json.dumps({"ts": now, "call_id": call_id,
+                                         "symbol": symbol,
+                                         "verification": pc}) + "\n")
+        except Exception as e:
+            log.warning("Audit verify append failed: %s", e)
+        if pc.get("contradicts"):
+            log.warning("Call %s: logged %s contradicts exchange first-touch %s",
+                        call_id, outcome, pc.get("first_touch"))
+            _telegram_send_sync(
+                f"⚠️ <b>{symbol} {outcome}</b> — exchange first touch was "
+                f"<b>{pc.get('first_touch').upper()}</b> ({pc.get('klines')} 1m bars checked)\n"
+                f"call {call_id} is mislabelled by the poll loop; it stays in the record as "
+                f"logged but is <b>excluded from the verified cut</b> of the stats.")
+    except Exception as e:  # noqa: BLE001
+        log.warning("Path verification failed for %s: %s", call_id, e)
+
+
+def _audit_append(c: dict, outcome: str, outcome_r, now: float) -> None:
+    """Append one Rule-8 audit line per resolved call (best-effort)."""
+    try:
+        snap = c.get("snapshot") or {}
+        with _CALLS_LOCK:
+            with open(_AUDIT_LOG_PATH, "a") as f:
+                f.write(_json.dumps({
+                    "ts": now,
+                    "call_id": c["call_id"],
+                    "symbol": c["symbol"],
+                    "direction": c.get("direction"),
+                    "entry": [_calls_entry_mid(c), c.get("sl"), c.get("t1")],
+                    "outcome": outcome,
+                    "outcome_r": outcome_r,
+                    "mfe_r": c.get("mfe_r", 0.0),
+                    "mae_r": c.get("mae_r", 0.0),
+                    "hold_s": round(now - c.get("opened_ts", now), 1),
+                    "activated": c.get("activated_ts") is not None,
+                    "signal_validated": bool(snap),
+                    "root_cause_hint": _audit_root_cause(c, outcome, outcome_r, now),
+                }) + "\n")
+    except Exception as e:
+        log.warning("Audit log append failed: %s", e)
 
 
 def _calls_iter_events():
@@ -1306,18 +1629,40 @@ def _calls_resolve_locked(c: dict, now: float, outcome: str,
         "outcome": outcome, "outcome_r": outcome_r, "price": price,
         "mfe_r": c.get("mfe_r", 0.0), "mae_r": c.get("mae_r", 0.0),
     })
+    _audit_append(c, outcome, outcome_r, now)
+    # B7: exchange-truth verification runs in background (network I/O must
+    # never block the resolver). Skipped for cancelled (no market exposure).
+    # Kill-switch: CALLS_VERIFY_PATH=0.
+    if outcome != "cancelled" and os.getenv("CALLS_VERIFY_PATH", "1") == "1":
+        try:
+            _args = (c["call_id"], c["symbol"], c.get("direction"),
+                     float(c["sl"]), float(c["t1"]),
+                     float(c.get("opened_ts") or now), now, outcome)
+            threading.Thread(target=_verify_call_path_bg, args=_args,
+                             daemon=True).start()
+        except Exception as e:  # noqa: BLE001
+            log.warning("Verify scheduling failed for %s: %s", c["call_id"], e)
     if notify:
-        emoji = {"t1_hit": "✅", "sl_hit": "❌"}.get(outcome, "⏱")
+        emoji = {"t1_hit": "✅", "sl_hit": "❌", "trail": "🟡", "half_sl": "🟠",
+                 "expired_open": "⏱"}.get(outcome, "⏱")
         r_txt = f"{outcome_r:+.2f}R" if outcome_r is not None else "no trade"
-        bias = (f" | bias {c['bias_score']}"
-                if c.get("bias_score") is not None else "")
-        notify(
-            f"{emoji} CALL {c['symbol']} {c['direction'].upper()} — {outcome}\n"
-            f"entry {c['entry_low']}-{c['entry_high']} | SL {c['sl']} | "
-            f"T1 {c['t1']}\n"
-            f"result {r_txt} | MFE +{c.get('mfe_r', 0.0):.2f}R | "
-            f"MAE {c.get('mae_r', 0.0):.2f}R{bias}"
-        )
+        g = c.get("geometry") or {}
+        cost = g.get("cost_r")
+        net_txt = ""
+        if cost is not None and outcome_r is not None:
+            net_txt = f" → <b>net {outcome_r - cost:+.2f}R</b> (taker cost {cost:.2f}R)"
+        held = c.get("activated_ts")
+        hold_txt = (f" · held {int((now - held) / 60)}m" if held else " · never activated")
+        lines = [f"{emo} <b>CALL {c['symbol']} {c['direction'].upper()}</b> — {outcome}",
+                 f"entry {c['entry_low']:.6g}–{c['entry_high']:.6g} | SL {c['sl']:.6g} | "
+                 f"T1 {c['t1']:.6g}",
+                 f"result {r_txt}{net_txt}{hold_txt}",
+                 f"MFE +{c.get('mfe_r', 0.0):.2f}R / MAE {c.get('mae_r', 0.0):.2f}R · "
+                 f"exit {c.get('exit_mode', '?')}"]
+        if c.get("excursion_suspect_count"):
+            lines.append(f"⚠️ {c['excursion_suspect_count']} suspect print(s) excluded from MFE/MAE")
+        lines.append("exchange verification running (first-touch check)")
+        notify("\n".join(lines))
 
 
 def _calls_step(now: float, prices: dict, notify=None) -> None:
@@ -1332,6 +1677,7 @@ def _calls_step(now: float, prices: dict, notify=None) -> None:
             price = prices.get(c["symbol"])
             if price is None or price <= 0:
                 continue
+            _prev_price = c.get("last_price")
             c["last_price"] = price
             long = c["direction"] == "long"
             mid = _calls_entry_mid(c)
@@ -1351,12 +1697,61 @@ def _calls_step(now: float, prices: dict, notify=None) -> None:
 
             # active: update excursions (R vs zone mid), then resolve
             r = ((price - mid) if long else (mid - price)) / risk
-            c["mfe_r"] = max(c.get("mfe_r", 0.0), r)
-            c["mae_r"] = max(c.get("mae_r", 0.0), -r)
+
+            # Excursion sanity gate. This pass is the same one that can resolve the
+            # call, so a legitimate reading can only exceed the resolve boundary by a
+            # fraction of one poll. A bigger single-poll move is a bad/stale print:
+            # record it as an event, exclude it from MFE/MAE, but still resolve on it
+            # (dropping the resolve would leave the call open on a genuine spike).
+            _poll_move_pct = None
+            if _prev_price and _prev_price > 0:
+                _poll_move_pct = abs(price - _prev_price) / _prev_price * 100.0
+            _suspect = (_poll_move_pct is not None
+                        and _poll_move_pct > _CALLS_POLL_MOVE_SANITY_PCT)
+            if _suspect:
+                c["excursion_suspect_count"] = int(c.get("excursion_suspect_count", 0)) + 1
+                c["excursion_suspect_last"] = {"ts": now, "price": price,
+                                               "prev_price": _prev_price,
+                                               "move_pct": round(_poll_move_pct, 3)}
+                _calls_append({"ev": "excursion_suspect", "call_id": cid, "ts": now,
+                               "price": price, "prev_price": _prev_price,
+                               "move_pct": round(_poll_move_pct, 3),
+                               "implied_r": round(r, 4)})
+                log.warning("Call %s: suspect print %.3f%% in one poll (%.6g -> %.6g) — "
+                            "excluded from MFE/MAE", cid, _poll_move_pct, _prev_price, price)
+            else:
+                c["mfe_r"] = max(c.get("mfe_r", 0.0), r)
+                c["mae_r"] = max(c.get("mae_r", 0.0), -r)
 
             sl_hit = price <= c["sl"] if long else price >= c["sl"]
             t1_hit = price >= c["t1"] if long else price <= c["t1"]
-            if sl_hit:
+            _mode = (c.get("exit_mode") or _CALLS_EXIT_MODE)
+            if _mode == "half_at_1r":
+                # Half off at +1R, remainder trailed. Default since 2026-09-17
+                # (audit M-5): fixed-T1 exits never managed the advertised T2
+                # runner (max realised 1.165R vs 6.41x median T2/stop).
+                if not c.get("half_taken") and r >= _CALLS_HALF_AT_R:
+                    c["half_taken"] = True
+                    c["half_r"] = round(_CALLS_HALF_AT_R * _CALLS_HALF_FRACTION, 4)
+                    c["half_ts"] = now
+                    c["best_r"] = max(r, _CALLS_HALF_AT_R)
+                    _calls_append({"ev": "partial", "call_id": cid, "ts": now, "price": price,
+                                   "r": _CALLS_HALF_AT_R, "fraction": _CALLS_HALF_FRACTION})
+                elif c.get("half_taken"):
+                    c["best_r"] = max(c.get("best_r") or 0.0, r)
+                _exit = None
+                if sl_hit:
+                    _exit = (("half_sl", c["half_r"] - _CALLS_HALF_FRACTION)
+                             if c.get("half_taken") else ("sl_hit", -1.0))
+                elif c.get("half_taken"):
+                    _lvl = c["best_r"] - _CALLS_TRAIL_R
+                    if r <= _lvl:
+                        _exit = ("trail", c["half_r"] + _CALLS_HALF_FRACTION * _lvl)
+                if _exit:
+                    _calls_resolve_locked(c, now, _exit[0], round(_exit[1], 4), price, notify)
+                elif now - c["activated_ts"] > _CALLS_ACTIVE_TTL_H * 3600:
+                    _calls_resolve_locked(c, now, "expired_open", round(r, 4), price, notify)
+            elif sl_hit:
                 _calls_resolve_locked(c, now, "sl_hit", -1.0, price, notify)
             elif t1_hit:
                 t1_r = ((c["t1"] - mid) if long else (mid - c["t1"])) / risk
@@ -1422,20 +1817,43 @@ def _calls_stats() -> dict:
         elif ev.get("ev") == "resolved" and ev["call_id"] in calls:
             calls[ev["call_id"]].update({
                 "outcome": ev["outcome"], "outcome_r": ev.get("outcome_r"),
-                "mfe_r": ev.get("mfe_r"), "mae_r": ev.get("mae_r"),
+                "mfe_r": ev.get("mfe_r", 0.0), "mae_r": ev.get("mae_r", 0.0),
                 "resolved_ts": ev["ts"],
             })
+        elif ev.get("ev") == "verified" and ev["call_id"] in calls:
+            # B7: exchange-truth first-touch marker joins the call record so
+            # stats can split on it below.
+            calls[ev["call_id"]]["path_coverage"] = ev.get("path_coverage")
     resolved = [calls[cid] for cid in order if calls[cid].get("outcome")]
     traded = [c for c in resolved
               if c["outcome"] in ("t1_hit", "sl_hit", "expired_open")]
 
     def _cost_r(c: dict) -> float:
-        """Round-trip cost in R units for one call."""
+        """Round-trip cost in R units for one call: taker fees + funding.
+
+        Audit M-4 action 8 (2026-09-17): funding is systematic in this regime
+        (live +10% ann on majors) and the book was always on the paying side
+        (10 long / 5 short). Funding accrues over the ACTUAL hold
+        (resolved_ts - opened_ts) at the snapshot fundingRate (per-8h): longs
+        pay positive funding, shorts receive it. Kill-switch:
+        CALLS_FUNDING_INCLUDE=0. Legacy calls without snapshot funding fall
+        back to taker-only (funding 0, honest)."""
         mid = _calls_entry_mid(c)
         risk = _calls_risk(c)
         if mid <= 0 or risk <= 0:
             return 0.0
-        return (CALLS_COST_BPS / 10000.0) * mid / risk
+        base = (CALLS_COST_BPS / 10000.0) * mid / risk
+        fund = 0.0
+        if os.getenv("CALLS_FUNDING_INCLUDE", "1") == "1":
+            try:
+                fr = float((c.get("snapshot") or {}).get("funding_rate") or 0.0)
+                hold_s = (c.get("resolved_ts") or 0) - (c.get("opened_ts") or 0)
+                if fr and hold_s > 0:
+                    direction = 1.0 if c.get("direction") == "long" else -1.0
+                    fund = direction * fr * (hold_s / 28800.0) * mid / risk
+            except Exception:  # noqa: BLE001
+                fund = 0.0
+        return base + fund
 
     def _subset_metrics(subset: list[dict]) -> dict:
         gross = [(c.get("outcome_r") or 0.0) for c in subset]
@@ -1443,7 +1861,15 @@ def _calls_stats() -> dict:
         net = [(c.get("outcome_r") or 0.0) - _cost_r(c) for c in subset]
         n = len(net)
         if n == 0:
-            return {"n": 0}
+            # EVERY key must exist even for an empty subset. The endpoint built
+            # its headline from all_m["wins"] etc., so an empty log raised
+            # KeyError: 'wins' and /calls/stats returned 500 — it was broken
+            # exactly when there was nothing to report yet (0 calls).
+            return {"n": 0, "wins": 0, "losses": 0, "zeros": 0,
+                    "winrate": None, "expectancy_r_net": None,
+                    "expectancy_r_gross": None, "profit_factor_net": None,
+                    "avg_mfe_r": None, "avg_mae_r": None,
+                    "cost_bps": CALLS_COST_BPS}
         wins = sum(1 for r in net if r > 0)
         losses = sum(1 for r in net if r < 0)
         zeros = n - wins - losses
@@ -1469,6 +1895,21 @@ def _calls_stats() -> dict:
     traded_valid = [c for c in traded if c.get("snapshot")]
     traded_legacy = [c for c in traded if not c.get("snapshot")]
 
+    # B7: split the traded set by exchange-truth path verification.
+    # verified_clean = kline first-touch agrees with the logged outcome;
+    # contradicted = exchange printed the other level first (polling artifact);
+    # unverified = no verified event yet (resolutions pre-date the marker).
+    def _pc(c: dict) -> dict:
+        return c.get("path_coverage") or {}
+
+    traded_verified_clean = [
+        c for c in traded
+        if _pc(c).get("exchange_verified") and not _pc(c).get("contradicts")]
+    traded_contradicted = [
+        c for c in traded if _pc(c).get("contradicts")]
+    traded_unverified = [
+        c for c in traded if not _pc(c).get("exchange_verified")]
+
     def _bucket(subset: list[dict], key: str) -> dict:
         out: dict[str, dict] = {}
         for c in subset:
@@ -1486,6 +1927,8 @@ def _calls_stats() -> dict:
     all_m = _subset_metrics(traded)
     valid_m = _subset_metrics(traded_valid)
     legacy_m = _subset_metrics(traded_legacy)
+    verified_clean_m = _subset_metrics(traded_verified_clean)
+    contradicted_m = _subset_metrics(traded_contradicted)
 
     # ---- Research-grade extensions (Wilson, bootstrap, edge-decay, splits) ----
     def _wilson(successes: int, n: int, z: float = 1.96) -> list[float]:
@@ -1641,11 +2084,12 @@ def _calls_stats() -> dict:
         "cost_bps": CALLS_COST_BPS,
         "expectancy_r_net": all_m["expectancy_r_net"],
         "expectancy_r_gross": all_m["expectancy_r_gross"],
-        "profit_factor_gross": round(
-            (lambda gw, gl: gw / gl if gl > 0 else None)(
-                sum(max((c.get("outcome_r") or 0.0), 0) for c in traded),
-                abs(sum(min((c.get("outcome_r") or 0.0), 0) for c in traded))),
-            3),
+        # round() on a None crashed the whole endpoint (TypeError: type NoneType
+        # doesn't define __round__) whenever no trade had closed yet — the second
+        # landmine from the same never-exercised empty-log path.
+        "profit_factor_gross": (lambda gw, gl: round(gw / gl, 3) if gl > 0 else None)(
+            sum(max((c.get("outcome_r") or 0.0), 0) for c in traded),
+            abs(sum(min((c.get("outcome_r") or 0.0), 0) for c in traded))),
         # audit H1: validated (phase-2, snapshot-attached) vs legacy split
         "validated": {
             **valid_m,
@@ -1659,6 +2103,20 @@ def _calls_stats() -> dict:
             **legacy_m,
             "note": "calls without order-flow snapshots — NOT signal-validated",
         },
+        # B7: exchange-truth split. contradicted outcomes keep their as-logged
+        # figures everywhere above; this cut shows what the record looks like
+        # when polling artifacts are set aside. History is never rewritten.
+        "exchange_verified": {
+            **verified_clean_m,
+            "by_symbol": _bucket(traded_verified_clean, "symbol"),
+            "note": "kline first-touch agrees with logged outcome",
+        },
+        "contradicted": {
+            **contradicted_m,
+            "call_ids": [c.get("call_id") for c in traded_contradicted],
+            "note": "exchange printed the other level first — polling artifact, excluded from verified cut",
+        },
+        "unverified_path_n": len(traded_unverified),
         "by_symbol": _bucket(traded, "symbol"),
         "by_direction": _bucket(traded, "direction"),
         "confidence": ("high" if all_m["n"] >= 100 else "medium" if all_m["n"] >= 30
@@ -1722,8 +2180,7 @@ def _read_live_data() -> dict | None:
                 age = now - os.path.getmtime(path)
                 if age > _LIVE_STALE_LIMIT_SECONDS:
                     continue
-                with open(path, "r") as f:
-                    content = f.read()
+                content = _shared_read.read_text(path)
                 if content.strip():
                     data = _json.loads(content)
                     # Legacy frozen files carry an old internal timestamp too —
@@ -1742,6 +2199,33 @@ def _read_live_data() -> dict | None:
     except Exception as e:
         log.warning("Could not read live indicators: %s", e)
         return None
+
+
+def _newest_live_indicator_path() -> str | None:
+    """Newest per-symbol LiveExporter file — the one /indicators actually serves.
+
+    The DLL writes `_live_indicators_<SYMBOL>.json` (LiveExporter.cs); the legacy
+    single `_live_indicators.json` is frozen and no longer updated. Health/watchdog
+    used to stat only the legacy path, so a healthy exporter was reported as
+    `stale 9999s` / `degraded` and a dead one looked identical. Falls back to the
+    legacy path only when no per-symbol file exists at all.
+    """
+    import glob as _glob
+    best, best_m = None, 0.0
+    for d in (_LIVEEXPORTER_OUTPUT_DIR, os.path.dirname(os.path.abspath(__file__))):
+        if not d or not os.path.isdir(d):
+            continue
+        for p in _glob.glob(os.path.join(d, "_live_indicators_*.json")):
+            try:
+                m = os.path.getmtime(p)
+            except OSError:
+                continue
+            if m > best_m:
+                best, best_m = p, m
+    if best:
+        return best
+    return _LIVE_INDICATORS_FILE if os.path.exists(_LIVE_INDICATORS_FILE) else None
+
 
 @app.get("/indicators")
 async def live_indicators():
@@ -1780,9 +2264,23 @@ async def live_indicators():
 
 @app.get("/cvd")
 async def cvd_all():
-    """CVD (cumulative volume delta) state for all tracked symbols."""
+    """CVD state for all symbols — LIVE SOURCES ONLY.
+
+    A symbol is included only while its ATAS exporter file is being written.
+    When a chart stops calculating, its symbol is dropped from this response
+    rather than served at a frozen cumulative value, which on a chart is
+    indistinguishable from a genuinely flat CVD.
+    """
+    live = _live_indicator_symbols()
     with _CVD_LOCK:
-        return {sym: _cvd_public(sym, st) for sym, st in _cvd_state.items()}
+        out = {}
+        for sym, st in _cvd_state.items():
+            if sym not in live:
+                continue
+            pub = _cvd_public(sym, st)
+            pub["source_age_s"] = round(live[sym], 1)
+            out[sym] = pub
+        return out
 
 
 @app.get("/cvd/{symbol}")
@@ -1868,12 +2366,42 @@ async def log_all_requests(request: Request, call_next):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    """Health check — returns bridge status and current tickers in memory."""
+    """Health check — returns bridge status and current tickers in memory.
+
+    Aggregates alone can hide a partial failure: the exporter writes one file
+    per symbol, so a frozen chart stays invisible while `status` reads "ok".
+    `live_symbols` (fresh, with age) and `frozen_exporter_files` (present but
+    stale, with age) are both reported so a dead leg is named, not inferred.
+    """
+    live = _live_indicator_symbols()
+    frozen = {}
+    import glob as _glob
+    seen = set()
+    for d in (_LIVEEXPORTER_OUTPUT_DIR, _BRIDGE_DIR):
+        if not d or not os.path.isdir(d):
+            continue
+        for path in _glob.glob(os.path.join(d, "_live_indicators_*.json")):
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                age = time.time() - os.path.getmtime(path)
+            except OSError:
+                continue
+            base = os.path.basename(path)
+            sym = base[len("_live_indicators_"):-len(".json")].upper()
+            if sym not in live and age <= 86400:
+                frozen[sym] = round(age)
+
+    status = "ok" if live else "degraded"
     return {
-        "status": "ok",
+        "status": status,
         "tickers_in_buffer": list(ticker_buffers.keys()),
         "buffer_maxlen": BUFFER_MAXLEN,
         "dom_symbols": list(dom_state.keys()),
+        "live_symbols": {k: round(v, 1) for k, v in sorted(live.items())},
+        "frozen_exporter_files": frozen,
+        "live_max_age_s": _LIVE_MAX_AGE_SECONDS,
     }
 
 
@@ -1913,10 +2441,19 @@ async def dom_symbol(symbol: str):
 @app.get("/state")
 async def state_all():
     """Return current buffer state for all tickers."""
+    live = _live_indicator_symbols()
     result = {}
     for ticker, buf in ticker_buffers.items():
+        if ticker.upper() not in live:
+            continue
         async with ticker_locks[ticker]:
             snapshot = list(buf)
+        if not snapshot:
+            continue
+        # Only alerts inside the live window may be called "current state".
+        newest = max((a.get("ts", 0) for a in snapshot), default=0)
+        if newest and (time.time() - newest) > _LIVE_MAX_AGE_SECONDS:
+            continue
         result[ticker] = {
             "window_size": len(snapshot),
             "alerts": snapshot,
@@ -2071,7 +2608,7 @@ async def process_atas_alert(request: Request):
             await _require_auth(request)
 
         log.info("=== ATAS WEBHOOK === method=%s body=%s", method, raw_text[:2000])
-        with open("C:\\atas-bridge\\_last_raw_alert.json", "w") as f:
+        with open(os.path.join(_BRIDGE_DIR, "_last_raw_alert.json"), "w") as f:
             f.write(raw_text)
 
         if method == "POST":
@@ -2784,16 +3321,83 @@ async def quant_state(symbol: str):
 @app.get("/quant")
 async def quant_state_all():
     """Return all quant alerts."""
+    live = _live_indicator_symbols()
     result = {}
+    now = time.time()
     for sym, buf in quant_buffers.items():
+        if sym.upper() not in live:
+            continue
         async with quant_locks[sym]:
-            result[sym] = {"window_size": len(buf), "alerts": list(buf)}
+            alerts = [a for a in buf
+                      if now - (a.get("ts", 0) or 0) <= _LIVE_MAX_AGE_SECONDS]
+        if not alerts:
+            continue
+        result[sym] = {"window_size": len(alerts), "alerts": alerts}
     return result
 
 
 # ---------------------------------------------------------------------------
 # Trade call endpoints
 # ---------------------------------------------------------------------------
+def _telegram_send_sync(text: str) -> bool:
+    """Blocking Telegram send for background threads (verification, etc.)."""
+    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "none":
+        return False
+    try:
+        payload = f"chat_id={TELEGRAM_CHAT_ID}&text={quote(text)}&parse_mode=HTML"
+        req = URLRequest(TELEGRAM_API, data=payload.encode(), method="POST")
+        with urlopen(req, timeout=8):
+            return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("Telegram sync send failed: %s", e)
+        return False
+
+
+def _plan_alert_text(c: dict) -> str:
+    """Opening alert for a logged call: what, why, the geometry it will be judged by,
+    and where the order-flow numbers came from (audit trail — a plan without provenance
+    cannot be reviewed later)."""
+    import re as _re
+    g = c.get("geometry") or {}
+    s = c.get("snapshot") or {}
+    long_ = c.get("direction") == "long"
+    emo = "🟢" if long_ else "🔴"
+    note = c.get("note") or ""
+    m = _re.search(r"score\s*([+-]?\d+(?:\.\d+)?)", note)
+    score = float(m.group(1)) if m else None
+    prov = s.get("source") or ("binance_only" if s else "no snapshot")
+    lines = [f"{emo} <b>NEW {c['symbol']} {c.get('direction','').upper()}</b> @ "
+             f"{g.get('entry_mid', (c['entry_low'] + c['entry_high']) / 2):.6g}"]
+    if score is not None:
+        lines.append(f"trigger {score:+.1f} (|score| ≥ 20 fires) · exit mode {c.get('exit_mode', '?')}")
+    lines.append(f"entry {c['entry_low']:.6g}–{c['entry_high']:.6g} | SL {c['sl']:.6g} | "
+                 f"T1 {c['t1']:.6g}" + (f" | T2 {c['t2']:.6g}" if c.get("t2") else ""))
+    if g:
+        lines.append(f"stop {g.get('stop_pct')}% · T1/stop {g.get('t1_over_sl')} · "
+                     f"cost {g.get('cost_r')}R → breakeven {g.get('breakeven_winrate')}")
+    if g.get("warnings"):
+        lines.append("⚠️ " + "; ".join(g["warnings"]))
+    f_lines = []
+    if s.get("dom_imbalance_pct") is not None:
+        f_lines.append(f"DOM {s['dom_imbalance_pct']:+.1f}%")
+    if s.get("cvd_usd_delta_win") is not None:
+        f_lines.append(f"flow {s['cvd_usd_delta_win']:+,.0f}$/{s.get('hist_seconds', 0):.0f}s")
+    if s.get("oi_delta_win") is not None:
+        f_lines.append(f"OIΔ {s['oi_delta_win']:+,.0f}")
+    if s.get("funding_rate") is not None:
+        f_lines.append(f"fund {s['funding_rate'] * 3 * 365 * 100:+.1f}%/yr")
+    if s.get("ls_ratio") is not None:
+        f_lines.append(f"L/S {s['ls_ratio']:.2f}")
+    if s.get("va_location"):
+        f_lines.append(f"{s['va_location']}")
+    if s.get("atr_percentile_rank") is not None:
+        f_lines.append(f"ATR p{float(s['atr_percentile_rank']):.0f}")
+    if f_lines:
+        lines.append(" · ".join(f_lines))
+    lines.append(f"source: {prov}" + (f" · atas {s.get('atas_status')}" if s.get("atas_status") else ""))
+    return "\n".join(lines)
+
+
 @app.post("/calls")
 async def calls_open(call: TradeCall, request: Request):
     """Log a new trade call (entry zone, SL, T1) for outcome tracking."""
@@ -2816,14 +3420,69 @@ async def calls_open(call: TradeCall, request: Request):
             raise HTTPException(
                 status_code=400,
                 detail="short: sl must be above entry zone, t1 below it")
+    # Symbol/price coherence (2026-09-17: SOLUSDT-20260917-7a5f52 was logged
+    # with SUI's $0.73 price — wrong-symbol contamination from a mixed feed).
+    # Rejects entries >MAX_ENTRY_DEVIATION_PCT from the bridge's live price.
+    # Fail-open when no live price is available for the symbol.
+    try:
+        _ds = dom_state.get(sym) or dom_state.get(sym.lower()) or {}
+        _live_px = _ds.get("best_bid") or 0
+        _max_dev = float(os.getenv("CALLS_MAX_ENTRY_DEVIATION_PCT", "10.0"))
+        _emid = (call.entry_low + call.entry_high) / 2.0
+        if _live_px > 0 and _emid > 0:
+            _dev = abs(_emid - _live_px) / _live_px * 100.0
+            if _dev > _max_dev:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"entry_mid {_emid} deviates {_dev:.1f}% from live "
+                           f"{sym} price {_live_px} (max {_max_dev}%) — "
+                           f"wrong-symbol feed?")
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001
+        pass
     now = time.time()
     cid = f"{sym}-{time.strftime('%Y%m%d')}-{uuid.uuid4().hex[:6]}"
+
+    # Geometry guard. cost_r = CALLS_COST_BPS applied over the entry-to-SL distance, so a
+    # tight stop is not "lower risk" — it is a larger share of the trade paid to the
+    # exchange — and a T1 closer than the stop cannot pay for that cost at any win rate.
+    # Measured on the 15-call track record: mean stop 0.538% -> mean cost_r 0.21R,
+    # T1/stop 1.02 -> breakeven win rate 59.9% against a realised 53.3%. Recorded on the
+    # call (and warned about) rather than rejected, so the generator's output stays
+    # comparable over time instead of silently changing shape.
+    entry_mid = (call.entry_low + call.entry_high) / 2.0
+    risk_abs = abs(entry_mid - call.sl)
+    t1_abs = abs(call.t1 - entry_mid)
+    geom: dict = {}
+    if entry_mid > 0 and risk_abs > 0:
+        geom["entry_mid"] = round(entry_mid, 8)
+        geom["stop_pct"] = round(100 * risk_abs / entry_mid, 4)
+        geom["t1_over_sl"] = round(t1_abs / risk_abs, 4)
+        geom["cost_r"] = round((CALLS_COST_BPS / 1e4) * entry_mid / risk_abs, 4)
+        geom["breakeven_winrate"] = round(
+            (1 + geom["cost_r"]) / (1 + geom["t1_over_sl"]), 4)
+        if call.t2:
+            geom["t2_over_sl"] = round(abs(call.t2 - entry_mid) / risk_abs, 4)
+        _warns = []
+        if geom["cost_r"] > 0.25:
+            _warns.append(f"cost_r {geom['cost_r']:.3f}R on a {geom['stop_pct']:.3f}% stop")
+        if geom["t1_over_sl"] < 0.5:
+            _warns.append(f"t1 only {geom['t1_over_sl']:.3f}x the stop")
+        if geom["breakeven_winrate"] > 0.55:
+            _warns.append(f"breakeven winrate {geom['breakeven_winrate']:.3f}")
+        if _warns:
+            geom["warnings"] = _warns
+            log.warning("Call %s geometry: %s", cid, "; ".join(_warns))
+
     c = {
         "call_id": cid, "symbol": sym, "direction": direction,
         "entry_low": call.entry_low, "entry_high": call.entry_high,
         "sl": call.sl, "t1": call.t1, "t2": call.t2,
         "bias_score": call.bias_score, "note": call.note,
         "snapshot": call.snapshot,        # order-flow snapshot (validation)
+        "geometry": geom,                 # cost / reward geometry at creation time
+        "exit_mode": _CALLS_EXIT_MODE,    # which exit rule this call ran under (cohorts)
         "status": "open", "opened_ts": now, "activated_ts": None,
         "mfe_r": 0.0, "mae_r": 0.0, "last_price": None,
         "resolved_ts": None, "outcome_r": None,
@@ -2831,6 +3490,10 @@ async def calls_open(call: TradeCall, request: Request):
     with _CALLS_LOCK:
         _calls[cid] = c
     _calls_append({"ev": "open", "ts": now, "call": c})
+    try:
+        asyncio.ensure_future(send_telegram(_plan_alert_text(c)))
+    except Exception as e:  # noqa: BLE001
+        log.warning("Plan alert send failed: %s", e)
     return {"status": "logged", "call_id": cid}
 
 
@@ -2910,14 +3573,14 @@ async def _heartbeat():
             try:
                 import watchdog as _wd  # type: ignore
                 # Feed live file mtime
-                if os.path.exists(_LIVE_INDICATORS_FILE):
-                    _wd.STATE.last_indicator_file_mtime = os.path.getmtime(_LIVE_INDICATORS_FILE)
+                _live_path = _newest_live_indicator_path()
+                if _live_path and os.path.exists(_live_path):
+                    _wd.STATE.last_indicator_file_mtime = os.path.getmtime(_live_path)
                     try:
-                        with open(_LIVE_INDICATORS_FILE, "r") as f:
-                            data = _json.loads(f.read() or "{}")
-                            ts = data.get("timestamp") or 0
-                            if ts:
-                                _wd.STATE.last_indicator_ts = float(ts)
+                        data = _json.loads(_shared_read.read_text(_live_path) or "{}")
+                        ts = data.get("timestamp") or 0
+                        if ts:
+                            _wd.STATE.last_indicator_ts = float(ts)
                     except Exception:
                         pass
                 # CVD save freshness
@@ -2933,10 +3596,11 @@ async def _heartbeat():
                 pass
             # Also log warnings on critical staleness
             try:
-                if os.path.exists(_LIVE_INDICATORS_FILE):
-                    age = time.time() - os.path.getmtime(_LIVE_INDICATORS_FILE)
+                _live_path = _newest_live_indicator_path()
+                if _live_path and os.path.exists(_live_path):
+                    age = time.time() - os.path.getmtime(_live_path)
                     if age > 30:
-                        log.warning("Watchdog: live indicators stale %.0fs", age)
+                        log.warning("Watchdog: live indicators stale %.0fs (%s)", age, _live_path)
             except Exception:
                 pass
         except Exception as e:
@@ -2956,7 +3620,7 @@ async def health_detailed():
         with _CALLS_LOCK:
             open_n = len(_calls)
         return _wd.collect(
-            live_file=_LIVE_INDICATORS_FILE,
+            live_file=_newest_live_indicator_path() or _LIVE_INDICATORS_FILE,
             dom_state=dom_snap,
             cvd_state=cvd_snap,
             calls_open=open_n,

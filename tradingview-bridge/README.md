@@ -11,7 +11,7 @@
 |---|---|
 | `morning_brief` | Une seule commande qui analyse votre watchlist, lit tous vos indicateurs, et retourne des données structurées pour que Claude génère votre biais de session |
 | `session_save` / `session_get` | Sauvegarde votre brief quotidien dans `~/.claudeverstradingview/sessions/` pour comparer aujourd'hui vs hier |
-| `rules.json` | Écrivez vos règles de trading une seule fois (critères de biais, règles de risque, watchlist). Le brief matinal les applique automatiquement chaque jour |
+| `morning-rules.json` | Écrivez vos règles de trading une seule fois (critères de biais, règles de risque, watchlist). Le brief matinal les applique automatiquement chaque jour |
 | Correction du bug de lancement | Compatibilité avec TradingView Desktop v2.14+ |
 | CLI `claudeverstradingview brief` | Lancez votre brief matinal depuis le terminal en un mot |
 
@@ -25,7 +25,7 @@ Collez ceci dans Claude Code, il s'occupe de tout :
 Configure Claude vs TradingView pour moi.
 Clone le repo dans ~/claudeverstradingview, lance npm install, puis ajoute-le à ma config MCP dans ~/.claude/.mcp.json (fusionne avec les serveurs existants, ne les écrase pas).
 Le bloc de config est : { "mcpServers": { "claudeverstradingview": { "command": "node", "args": ["/Users/VOTRE_USERNAME/claudeverstradingview/src/server.js"] } } } — remplace VOTRE_USERNAME par mon nom d'utilisateur réel.
-Ensuite copie rules.example.json vers rules.json et ouvre-le.
+Ensuite copie morning-rules.example.json vers morning-rules.json et ouvre-le.
 Enfin redémarre et vérifie avec tv_health_check.
 ```
 
@@ -55,10 +55,10 @@ npm install
 ### 2. Configurer vos règles
 
 ```bash
-cp rules.example.json rules.json
+cp morning-rules.example.json morning-rules.json
 ```
 
-Ouvrez `rules.json` et renseignez votre watchlist, vos critères de biais et vos règles de risque.
+Ouvrez `morning-rules.json` et renseignez votre watchlist, vos critères de biais et vos règles de risque.
 
 ### 3. Lancer TradingView avec CDP
 
@@ -132,7 +132,7 @@ Global : Prudence sur les métaux. BTC le plus solide des trois.
 
 | Outil | Ce qu'il fait |
 |---|---|
-| `morning_brief` | Scanne la watchlist, lit les indicateurs, retourne les données de biais. Lit `rules.json` automatiquement. |
+| `morning_brief` | Scanne la watchlist, lit les indicateurs, retourne les données de biais. Lit `morning-rules.json` automatiquement. |
 | `session_save` | Sauvegarde le brief dans `~/.claudeverstradingview/sessions/YYYY-MM-DD.json` |
 | `session_get` | Récupère le brief du jour (ou d'hier si aujourd'hui non sauvegardé) |
 
@@ -212,7 +212,7 @@ Aide complète : `claudeverstradingview --help`
 | `ECONNREFUSED` | TradingView non lancé ou port 9222 bloqué |
 | Serveur MCP absent de Claude Code | Vérifiez la syntaxe de `~/.claude/.mcp.json`, redémarrez Claude Code |
 | Commande introuvable | Lancez `npm link` depuis le répertoire du projet |
-| "No rules.json found" | `cp rules.example.json rules.json` puis remplissez-le |
+| "No morning-rules.json found" | `cp morning-rules.example.json morning-rules.json` puis remplissez-le |
 | Données obsolètes | TradingView charge encore, attendez quelques secondes |
 
 ---

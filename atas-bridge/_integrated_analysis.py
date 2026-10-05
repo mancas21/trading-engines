@@ -12,6 +12,16 @@ import urllib.request
 from urllib.parse import quote
 
 from signal_engine import build_snapshot_from_live, compute_signal
+from orderflow_calls import build_plan as _canonical_build_plan
+
+if __name__ != "__main__":
+    # 2026-09-17: this is a SCRIPT (fetches live data, POSTs /calls, sends
+    # Telegram on import). Importing it from any process — UI, supervisor,
+    # REPL, validator — fires live side effects (it logged SOLUSDT-20260917-7a5f52
+    # with a contaminated SOL+SUI price mix). Run it directly instead.
+    raise ImportError(
+        "_integrated_analysis is a run-directly script, not a module: "
+        "importing it fires live /calls POSTs + Telegram sends.")
 
 # Load .env (same pattern as bridge_server.py)
 _env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -97,7 +107,7 @@ sig = compute_signal(snap) if snap else None
 if sig:
     bias_icon = "🟢" if sig.bias_label == "bullish" else ("🔴" if sig.bias_label == "bearish" else "🟡")
     lines.append(f"\n<b>🎯 SIGNAL ENGINE SCORE: {sig.bias_score:.0f}/100 {bias_icon}</b>")
-    lines.append(f"Bias: {sig.bias_label.upper()} {'✅' if sig.trade_plan_allowed else '⛔ No trade plan (Rule 10)'}")
+    lines.append(f"Bias: {sig.bias_label.upper()} {'✅' if sig.trade_plan_allowed else '⛔ blocked by hard veto'}")
     for k, v in sig.sub_scores.items():
         lines.append(f"  {k}: {v:.1f}/10")
     if sig.rule_2_exhaustion:
@@ -209,27 +219,26 @@ if live_price and sig:
         if reasons:
             why = " | ".join(reasons)
         else:
-            why = "zona neutral 40-59 (Rule 10)"
+            why = "hard veto (rule 2/6/7 or low coverage)"
         lines.append(f"\n<b>📋 TRADE PLAN</b>")
         lines.append(f"  ⛔ WAIT FOR CONFIRMATION — bias {sig.bias_score:.0f} (cov {cov:.0%}). Sin plan: {why}.")
     else:
         direction = "LONG" if sig.bias_label == "bullish" else "SHORT"
-        # Entry zone = live ±0.15% (tied to spread/va), SL = entry ±0.85*exp_med, T1 = entry ±1.0*exp_med, T2 = entry ±1.8*exp_p90
-        half_entry = live_price * 0.0015
-        sl_dist = live_price * (exp_med/100) * 0.85
-        t1_dist = live_price * (exp_med/100)
-        t2_dist = live_price * (exp_med/100) * 1.8
-        if direction == "LONG":
-            entry_low, entry_high = live_price - half_entry, live_price + half_entry
-            sl, t1, t2 = entry_low - sl_dist, entry_high + t1_dist, entry_high + t2_dist
-        else:
-            entry_low, entry_high = live_price - half_entry, live_price + half_entry
-            sl, t1, t2 = entry_high + sl_dist, entry_low - t1_dist, entry_low - t2_dist
+        # Single source of truth (audit H-4 action 5): canonical builder.
+        plan = _canonical_build_plan(
+            {"mid": live_price, "exp_move_med": exp_med, "exp_move_p90": exp_p90},
+            direction.lower())
+        if plan is None:
+            lines.append(f"\n<b>📋 TRADE PLAN — {direction} (bias {sig.bias_score:.0f})</b>")
+            lines.append("  ⛔ Geometry suppressed (cost_r>max) — no plan logged.")
+            print("\n".join(lines)); print("---END---"); sys.exit()
+        entry_low, entry_high = plan["entry_low"], plan["entry_high"]
+        sl, t1, t2 = plan["sl"], plan["t1"], plan["t2"]
         lines.append(f"\n<b>📋 TRADE PLAN — {direction} (bias {sig.bias_score:.0f}, cov {getattr(sig, 'data_coverage', 1.0):.0%})</b>")
-        lines.append(f"  Entry: ${entry_low:.2f} – ${entry_high:.2f} (live ${live_price:.2f} ±0.15%)")
+        lines.append(f"  Entry: ${entry_low:.2f} – ${entry_high:.2f} (live ${live_price:.2f} ±0.05%)")
         lines.append(f"  SL: ${sl:.2f} (invalida {'cierre < SL' if direction=='LONG' else 'cierre > SL'})")
         lines.append(f"  T1: ${t1:.2f} | T2: ${t2:.2f} (med {exp_med:.2f}% / p90 {exp_p90:.2f}%)")
-        # Auto-log call for track record (Rule 10 + audit) — attach compact
+        # Auto-log call for track record (audit) — attach compact
         # order-flow snapshot so the call is signal-validated (phase 2).
         try:
             import urllib.request as _ur
@@ -255,14 +264,13 @@ if live_price and sig:
                 "cvd_bar_deltas": _cvd_d.get("bar_deltas", []),
                 "value_area": (ctx.get("value_area", {}) if isinstance(ctx, dict) else {}),
                 "expected_move": (ctx.get("expected_move", {}) if isinstance(ctx, dict) else {}),
-                "bias_score": sig.bias_score,
                 "data_coverage": getattr(sig, "data_coverage", 1.0),
             }
             _bt = os.getenv("BRIDGE_TOKEN", "")
             payload = json.dumps({"symbol": SYMBOL, "direction": direction.lower(),
                                   "entry_low": round(entry_low,4), "entry_high": round(entry_high,4),
                                   "sl": round(sl,4), "t1": round(t1,4), "t2": round(t2,4),
-                                  "bias_score": sig.bias_score, "snapshot": snap_compact,
+                                  "snapshot": snap_compact,
                                   "note": f"auto-plan live-anchored {live_price:.2f}"}).encode()
             hdrs = {"Content-Type": "application/json"}
             if _bt:

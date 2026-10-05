@@ -11,16 +11,33 @@ node_modules/
 dist/
 build/
 
+# .NET build output — these were tracked (56 files) and showed as modified on
+# every single build, burying real changes in `git status`. Regenerate with
+# `dotnet build -c Release`; the deployable copy lives at
+# %APPDATA%/ATAS X/Indicators/AtasExporter.dll, not in the repo.
+obj/
+bin/
+*.user
+
 # Runtime / logs / data (regenerable or machine-local)
 *.log
 *.log.*
 *.db
 *.db-journal
 *.jsonl
+*.bak-*
+*.pid
 atas-bridge/_*.json
 data/
 logs/
 screenshots/
+card_live/raw/
+
+# Stray runtime artifacts that don't match a pattern above:
+# INFO is a log the engine wrote because log_file was passed as "INFO"
+quant-alert-engine/INFO
+*.err
+.watchdog_failcount
 
 # Secrets — NEVER commit live .env files (ship .env.example instead)
 .env

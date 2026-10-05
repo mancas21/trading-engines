@@ -17,10 +17,10 @@ If the user specifies a different install path, use that instead of `~/tradingvi
 Copy the example rules file and open it for the user to fill in:
 
 ```bash
-cp ~/tradingview-mcp-jackson/rules.example.json ~/tradingview-mcp-jackson/rules.json
+cp ~/tradingview-mcp-jackson/morning-rules.example.json ~/tradingview-mcp-jackson/morning-rules.json
 ```
 
-Tell the user: "Open `rules.json` and fill in your watchlist (the symbols you trade), your bias criteria (what makes something bullish/bearish for you), and your risk rules. This is what the morning brief uses every day."
+Tell the user: "Open `morning-rules.json` and fill in your watchlist (the symbols you trade), your bias criteria (what makes something bullish/bearish for you), and your risk rules. This is what the morning brief uses every day."
 
 ## Step 3: Add to MCP Config
 
@@ -93,7 +93,7 @@ If `cdp_connected: false`, TradingView is not running with `--remote-debugging-p
 
 Ask Claude: *"Run morning_brief and give me my session bias"*
 
-Claude will scan your watchlist, read your indicators, apply your `rules.json` criteria, and print your bias for each symbol.
+Claude will scan your watchlist, read your indicators, apply your `morning-rules.json` criteria, and print your bias for each symbol.
 
 To save it: *"Save this brief using session_save"*
 
@@ -123,7 +123,7 @@ Then `tv status`, `tv quote`, `tv pine compile`, etc. work from anywhere.
 
 ## What to Read Next
 
-- `rules.json` — Your personal trading rules (fill this in before using morning_brief)
+- `morning-rules.json` — Your personal trading rules (fill this in before using morning_brief)
 - `CLAUDE.md` — Decision tree for which tool to use when (auto-loaded by Claude Code)
 - `README.md` — Full tool reference including morning brief workflow
 - `RESEARCH.md` — Research context and open questions

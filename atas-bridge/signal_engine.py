@@ -32,8 +32,10 @@ class Snapshot:
     value_area_high: float = 0.0
     value_area_low: float = 0.0
 
-    # DOM
+    # DOM (raw snapshot + 45s EMA; scoring and rules 6/7 MUST use the EMA —
+    # audit C-3 action 3, 2026-09-17 — with raw fallback when EMA unavailable)
     dom_imbalance_pct: float = 0.0
+    dom_imbalance_ema: float = 0.0
     cumulative_bid_vol: float = 0.0
     cumulative_ask_vol: float = 0.0
 
@@ -65,6 +67,10 @@ class SignalResult:
     rule_7_active: bool
     data_coverage: float = 1.0     # 0-1: fraction of scoring weight backed by real data
     plan_blocked_reasons: list[str] = field(default_factory=list)
+    # Audit H-1/H-2 action 4 (2026-09-17): explicit footprint verifiability for
+    # rules 6/7 — "ok" (4+ levels: both evaluable), "partial" (1-3: only rule 7
+    # structurally evaluable), "absent" (0: neither evaluable, NOT neutral).
+    footprint_status: str = "absent"
 
 
 # ---------------------------------------------------------------------------
@@ -105,11 +111,17 @@ def _score_footprint_depth(s: Snapshot) -> float:
     return ratio * 10.0
 
 
+def _dom_ema(s: Snapshot) -> float:
+    """45s-averaged DOM imbalance; raw fallback when EMA unavailable
+    (backtester/validator snapshots predate the EMA field)."""
+    return s.dom_imbalance_ema if s.dom_imbalance_ema != 0.0 else s.dom_imbalance_pct
+
+
 def _score_dom_imbalance(s: Snapshot) -> float:
     """Score DOM imbalance: centered at 5, soft-saturated via sigmoid so the
     full observed crypto range (±40%..±75%) keeps discriminating instead of
     clipping at ±40 (audit C3). imb=0 -> 5, asymptotes 0/10 at extreme tails."""
-    imb = s.dom_imbalance_pct
+    imb = _dom_ema(s)
     # scale: 1.0 at imb≈±75 maps to ~8.8/1.2; 10/0 only in pathological tails
     try:
         x = imb / 40.0
@@ -206,7 +218,7 @@ def _check_rule_6_distribution(s: Snapshot) -> bool:
             sell_dominated += 1
     if sell_dominated < 4:
         return False
-    if s.dom_imbalance_pct >= 5:
+    if _dom_ema(s) >= 5:
         return False
     return True
 
@@ -231,7 +243,7 @@ def _check_rule_7_accumulation(s: Snapshot) -> bool:
             buy_dominated += 1
     if buy_dominated < 3:
         return False
-    if s.dom_imbalance_pct <= 10:
+    if _dom_ema(s) <= 10:
         return False
     return True
 
@@ -255,8 +267,9 @@ def _data_coverage(s: Snapshot, weights: dict) -> float:
             real += w
         elif k == "footprint_confirmation" and len(s.footprint_levels) >= 2:
             real += w
-        elif k == "dom_imbalance" and (s.cumulative_bid_vol > 0 or s.cumulative_ask_vol > 0
-                                       or s.dom_imbalance_pct != 0.0):
+        elif k == "dom_imbalance" and (_dom_ema(s) != 0.0
+                                        or s.cumulative_bid_vol > 0 or s.cumulative_ask_vol > 0
+                                        or s.dom_imbalance_pct != 0.0):
             real += w
         elif k == "tape_ratio" and (s.tape_buy_vol > 0 or s.tape_sell_vol > 0
                                     or s.tape_buy_count > 0 or s.tape_sell_count > 0):
@@ -304,25 +317,36 @@ def compute_signal(snapshot: Snapshot) -> SignalResult:
     coverage = _data_coverage(snapshot, weights)
     reasons: list[str] = []
 
-    # Rule 10: no trade plan in neutral zone
-    trade_plan_allowed = bias_score >= 60 or bias_score <= 40
-    if trade_plan_allowed:
-        # Rule 2 (hard): exhaustion spike is NOT a continuation call (audit C2).
-        if rule_2_exhaustion:
-            trade_plan_allowed = False
-            reasons.append("rule_2_exhaustion_veto")
-        # Rule 6 (hard): confirmed distribution contradicts a bullish plan.
-        if rule_6_active and bias_label == "bullish":
-            trade_plan_allowed = False
-            reasons.append("rule_6_distribution_contradicts_long")
-        # Rule 7 (hard): confirmed accumulation contradicts a bearish plan.
-        if rule_7_active and bias_label == "bearish":
-            trade_plan_allowed = False
-            reasons.append("rule_7_accumulation_contradicts_short")
-        # C4: no phantom plans from single-source / missing-data scores.
-        if coverage < 0.5:
-            trade_plan_allowed = False
-            reasons.append(f"low_data_coverage_{coverage:.2f}")
+    # Footprint verifiability for rules 6/7 (audit H-1: ATAS charts one symbol;
+    # for the rest the legs cannot be evaluated at all — report it, don't
+    # silently score missing footprint as neutral).
+    _fp_n = len(snapshot.footprint_levels)
+    footprint_status = "ok" if _fp_n >= 4 else ("partial" if _fp_n >= 1 else "absent")
+
+    # Rule 10 DELETED (audit C-1 action 1, 2026-09-17): the composite score no
+    # longer permits or forbids plans — it only ranks. trade_plan_allowed
+    # defaults True; the hard vetoes below can still block.
+    trade_plan_allowed = True
+    # Rule 2 (hard): exhaustion spike is NOT a continuation call (audit C2).
+    if rule_2_exhaustion:
+        trade_plan_allowed = False
+        reasons.append("rule_2_exhaustion_veto")
+    # Rule 6 (hard): confirmed distribution contradicts a bullish plan.
+    if rule_6_active and bias_label == "bullish":
+        trade_plan_allowed = False
+        reasons.append("rule_6_distribution_contradicts_long")
+    # Rule 7 (hard): confirmed accumulation contradicts a bearish plan.
+    if rule_7_active and bias_label == "bearish":
+        trade_plan_allowed = False
+        reasons.append("rule_7_accumulation_contradicts_short")
+    # C4/H-2: no phantom plans from single-source / missing-data scores.
+    # Gate raised 0.5 -> 0.75 (audit H-2 action 4): with no footprint at all
+    # coverage is 0.60, which must NOT pass.
+    if coverage < 0.75:
+        trade_plan_allowed = False
+        reasons.append(f"low_data_coverage_{coverage:.2f}")
+    if footprint_status != "ok" and not trade_plan_allowed:
+        reasons.append(f"rules_67_unverifiable_footprint_{footprint_status}")
 
     return SignalResult(
         bias_score=round(bias_score, 1),
@@ -334,6 +358,7 @@ def compute_signal(snapshot: Snapshot) -> SignalResult:
         rule_7_active=rule_7_active,
         data_coverage=round(coverage, 2),
         plan_blocked_reasons=reasons,
+        footprint_status=footprint_status,
     )
 
 
@@ -360,6 +385,7 @@ def build_snapshot_from_live(live: dict, cvd: dict | None = None) -> Snapshot | 
         value_area_high=fp.get("value_area_high", 0),
         value_area_low=fp.get("value_area_low", 0),
         dom_imbalance_pct=dom.get("imbalance_pct", 0),
+        dom_imbalance_ema=dom.get("imbalance_pct_ema", 0),
         cumulative_bid_vol=dom.get("cumulative_bid_vol", 0),
         cumulative_ask_vol=dom.get("cumulative_ask_vol", 0),
         tape_buy_vol=tape.get("buy_vol", 0),

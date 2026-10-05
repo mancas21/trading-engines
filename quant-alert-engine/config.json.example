@@ -9,7 +9,6 @@
     "XAU/USDT:USDT"
   ],
   "timeframes": [
-    "1m",
     "5m",
     "15m",
     "30m",
@@ -121,6 +120,15 @@
     "max_concurrent_requests": 3,
     "max_retries": 3,
     "gate_signals": false
+  },
+  "ml": {
+    "enabled": false,
+    "gate_signals": false,
+    "model_path": "data/ml/meta_model.json",
+    "min_prob": 0.55,
+    "fail_open": true,
+    "window": 200,
+    "log_features": true
   },
   "database": "data/alerts.db"
 }

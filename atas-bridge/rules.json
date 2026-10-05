@@ -49,7 +49,9 @@
         "cvd_consecutive_down_min": 2,
         "footprint_levels_min": 4,
         "footprint_sell_pct_min": 70,
-        "dom_imbalance_max": 5
+        "dom_imbalance_max": 5,
+        "dom_ema_field": "imbalance_pct_ema",
+        "dom_persistence_polls_min": 3
       }
     },
     {
@@ -61,7 +63,9 @@
         "cvd_consecutive_up_min": 2,
         "footprint_levels_min": 3,
         "footprint_buy_pct_min": 70,
-        "dom_imbalance_min": 10
+        "dom_imbalance_min": 10,
+        "dom_ema_field": "imbalance_pct_ema",
+        "dom_persistence_polls_min": 3
       }
     },
     {
@@ -72,15 +76,14 @@
     },
     {
       "id": 9,
-      "title": "Asset Independence",
-      "description": "SUI and SOL analyzed independently. Decoupling means correlation = 0. Do not cross-use weakness/strength as evidence for the other.",
-      "enforcement": "hard"
-    },
-    {
-      "id": 10,
-      "title": "No Trade Plan In Neutral Zone",
-      "description": "No trade plan if bias score is 40-59. Output 'WAIT FOR CONFIRMATION' instead of Setup A/B. Trade plan only when bias >= 60 (long) or <= 40 (short).",
-      "enforcement": "hard"
+      "title": "Correlated Pairs Count Once",
+      "description": "SUI-SOL correlation measured 0.811 (15m) / 0.679 (1h) on 2026-09-17 (audit: 0.889/0.803) — they move together, NOT independently. Same-direction SUI+SOL signals are ONE bet, not two independent confirmations: do not double-count evidence across highly correlated pairs. Cross-asset confirmation requires basket breadth, not a second ticker saying the same thing.",
+      "enforcement": "hard",
+      "conditions": {
+        "sui_sol_corr_15m": 0.811,
+        "sui_sol_corr_1h": 0.679,
+        "measured_at": "2026-09-17"
+      }
     }
   ],
   "scoring_weights": {
@@ -90,5 +93,15 @@
     "volume_climax": 15,
     "footprint_confirmation": 15
   },
-  "version": "3.2"
+  "trigger_weights": {
+    "taker_flow": 3.0,
+    "book_imbalance": 3.0,
+    "wall_pressure": 2.0,
+    "value_location": 2.0,
+    "oi_delta": 1.5,
+    "funding_crowding": 1.5,
+    "ls_ratio_crowding": 1.5
+  },
+  "version": "3.3",
+  "changelog": "3.3 (2026-09-17): Rule 10 DELETED per audit C-1 action 1 — score ranks only, never gates plans; bias_score removed from logged call payloads."
 }

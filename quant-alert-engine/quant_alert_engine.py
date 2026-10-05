@@ -31,6 +31,17 @@ import ccxt
 from config_schema import Config, load_config
 from logging_setup import setup_logging, context_filter
 
+# ── ML meta-labeling (v2.8): canonical feature vector + trained filter ──
+# Guarded imports: a missing/broken model must never stop alerts from firing.
+try:
+    from features import FeatureExtractor
+except Exception:  # pragma: no cover
+    FeatureExtractor = None
+try:
+    from ml_filter import MetaLabelFilter
+except Exception:  # pragma: no cover
+    MetaLabelFilter = None
+
 # Ensure dirs exist before logging setup
 os.makedirs('logs', exist_ok=True)
 os.makedirs('data', exist_ok=True)
@@ -420,9 +431,17 @@ class CostModel:
         base = self.commission_pct + self.slippage_pct
         return base * 2 * (self.dryup_slippage_mult if dryup else 1.0)
 
-    def funding_cost(self, price, bars_held, qty=1.0):
-        interval_bars = int(self.funding_interval_hours * 3600 / 300)  # 5m bars
-        intervals = max(0, bars_held // max(interval_bars, 1))
+    def funding_cost(self, price, bars_held, qty=1.0, bar_seconds=300):
+        """Funding paid over the holding period.
+
+        Funding accrues on TIME, not on bars. The original counted bars assuming
+        a fixed 5-minute bar regardless of the timeframe, so a 1h position held
+        12 bars (12 real hours) was charged zero intervals when the true answer
+        is one. That silently under-charged every backtest above 5m.
+        """
+        bar_seconds = max(int(bar_seconds), 1)
+        interval_bars = max(1, int(self.funding_interval_hours * 3600 / bar_seconds))
+        intervals = max(0, bars_held // interval_bars)
         return price * self.funding_rate_pct * intervals * qty
 
 
@@ -578,6 +597,28 @@ class AlertManager:
                                     signal_type TEXT, price REAL, bar_key TEXT,
                                     fired_ts REAL, forward_bars INTEGER,
                                     forward_return REAL, resolved INTEGER DEFAULT 0)''')
+            # ── ML feature store (v2.8) ──
+            # The canonical feature vector at the moment each signal fired. The
+            # outcomes table alone only holds metadata (symbol / name / tf), and
+            # a model trained on metadata scored AUC 0.443 — below chance. The
+            # features are what make the track record learnable.
+            self._conn.execute('''CREATE TABLE IF NOT EXISTS signal_features
+                                   (signal_id TEXT PRIMARY KEY,
+                                    symbol TEXT, timeframe TEXT, signal_name TEXT,
+                                    signal_type TEXT, direction INTEGER,
+                                    fired_ts REAL, features_json TEXT)''')
+            # Direction actually used at emit time. Resolution used to re-infer
+            # direction from the signal name, which disagrees with the emit-time
+            # hint for some names, silently flipping the sign of the stored
+            # forward return (and therefore of every downstream expectancy gate).
+            try:
+                _cols = {r[1] for r in self._conn.execute("PRAGMA table_info(signal_outcomes)")}
+                if "direction" not in _cols:
+                    self._conn.execute(
+                        "ALTER TABLE signal_outcomes ADD COLUMN direction INTEGER DEFAULT 0")
+                    logger.info("Migrated signal_outcomes: added direction column")
+            except Exception as e:
+                logger.debug("signal_outcomes direction migration skipped: %s", e)
             self._conn.commit()
         self._prune()
 
@@ -588,8 +629,17 @@ class AlertManager:
                 self._conn.execute('DELETE FROM fired_alerts WHERE timestamp < ?', (cutoff,))
                 # Keep resolved outcome rows for 7 days of stats; unresolved rows
                 # are kept until their forward window has a chance to resolve.
-                self._conn.execute('DELETE FROM signal_outcomes WHERE resolved = 1 AND fired_ts < ?',
-                                   (time.time() - 7 * 86400,))
+                #
+                # Rows carrying an ML feature vector are EXEMPT: they are the
+                # model's training corpus. Pruning them would cap training at a
+                # rolling 7-day window forever — with ~1.6k labeled signals per
+                # week, that is the hard blocker on ever training a model that
+                # beats the rule-based gates (see ml_train.py).
+                self._conn.execute(
+                    '''DELETE FROM signal_outcomes
+                       WHERE resolved = 1 AND fired_ts < ?
+                         AND signal_id NOT IN (SELECT signal_id FROM signal_features)''',
+                    (time.time() - 7 * 86400,))
                 self._conn.commit()
         except Exception as e:
             logger.warning(f"Prune failed: {e}")
@@ -639,18 +689,34 @@ class AlertManager:
     # ── Outcome tagging (quant audit fix #3) ──
     def tag_signal(self, signal_name: str, symbol: str, price: float,
                    timeframe: str, bar_key: str, signal_type: str,
-                   forward_bars: int):
-        """Record a fired signal so its forward N-bar return can be resolved later."""
+                   forward_bars: int,
+                   features: Optional[Dict[str, float]] = None,
+                   direction: int = 0):
+        """Record a fired signal so its forward N-bar return can be resolved later.
+
+        v2.8: also persists the canonical feature vector (features.py) and the
+        emit-time direction, so the model trains on exactly the numbers
+        production saw and the stored return keeps the correct sign.
+        """
+        signal_id = f"{symbol}_{signal_name}_{timeframe}_{bar_key}"
         try:
             with self._db_lock:
                 self._conn.execute(
                     '''INSERT OR IGNORE INTO signal_outcomes
                        (signal_id, symbol, timeframe, signal_name, signal_type,
-                        price, bar_key, fired_ts, forward_bars, resolved)
-                       VALUES (?,?,?,?,?,?,?,?,?,0)''',
-                    (f"{symbol}_{signal_name}_{timeframe}_{bar_key}", symbol, timeframe,
+                        price, bar_key, fired_ts, forward_bars, resolved, direction)
+                       VALUES (?,?,?,?,?,?,?,?,?,0,?)''',
+                    (signal_id, symbol, timeframe,
                      signal_name, signal_type, float(price), bar_key, time.time(),
-                     int(forward_bars)))
+                     int(forward_bars), int(direction)))
+                if features:
+                    self._conn.execute(
+                        '''INSERT OR REPLACE INTO signal_features
+                           (signal_id, symbol, timeframe, signal_name, signal_type,
+                            direction, fired_ts, features_json)
+                           VALUES (?,?,?,?,?,?,?,?)''',
+                        (signal_id, symbol, timeframe, signal_name, signal_type,
+                         int(direction), time.time(), json.dumps(features)))
                 self._conn.commit()
         except Exception as e:
             logger.warning(f"tag_signal failed: {e}")
@@ -659,7 +725,8 @@ class AlertManager:
         try:
             with self._db_lock:
                 cur = self._conn.execute(
-                    '''SELECT signal_id, bar_key, price, forward_bars, signal_name FROM signal_outcomes
+                    '''SELECT signal_id, bar_key, price, forward_bars, signal_name, direction
+                       FROM signal_outcomes
                        WHERE symbol = ? AND timeframe = ? AND resolved = 0
                        ORDER BY fired_ts LIMIT ?''',
                     (symbol, timeframe, int(limit)))
@@ -714,7 +781,8 @@ class AlertManager:
     def emit_alert(self, signal_name: str, symbol: str, price: float,
                    signal_type: str = "SIGNAL", color: str = "info",
                    bar_key: str = "", timeframe: str = "",
-                   market_data: Optional[Dict[str, Any]] = None):
+                   market_data: Optional[Dict[str, Any]] = None,
+                   direction: int = 0):
         signal_id = f"{symbol}_{signal_name}_{timeframe}_{bar_key}"
         if self._is_fired(signal_id):
             return
@@ -740,6 +808,8 @@ class AlertManager:
                 reg = market_data['regime']
                 reg_str = "UP" if reg > 0 else ("DOWN" if reg < 0 else "NEU")
                 md_parts.append(f"regime={reg_str}")
+            if market_data.get("ml_prob") is not None:
+                md_parts.append(f"ml={market_data['ml_prob']:.2f}")
             _mm = market_data.get("macro")
             if isinstance(_mm, dict) and not _mm.get("stale", True):
                 _mp = []
@@ -760,7 +830,9 @@ class AlertManager:
 
         # Outcome tagging: store this signal for forward-return resolution
         self.tag_signal(signal_name, symbol, price, timeframe, bar_key, signal_type,
-                        self.config.get('general.outcome_forward_bars', 12))
+                        self.config.get('general.outcome_forward_bars', 12),
+                        features=(market_data or {}).get("features"),
+                        direction=direction)
 
         if self.config.get('general.enable_sound', True) and winsound:
             try:
@@ -899,14 +971,36 @@ class SignalAnalyzer:
                 for _s in _symbols_cfg:
                     _base = str(_s).split('/')[0].split(':')[0].lower()
                     _tracked[_s] = _COIN_ID_MAP.get(_base, _base)
+                # Web macro providers (info/context only — never gates signals).
+                try:
+                    from web_macro_providers import DEFAULT_WEB_SOURCES as _WEB_DEFAULTS
+                except ImportError:
+                    _WEB_DEFAULTS = []
+                _raw_ws = self.config.get('macro.web_sources', None)
+                _web_sources = []
+                for _w in (_raw_ws if isinstance(_raw_ws, list) else _WEB_DEFAULTS):
+                    if hasattr(_w, 'model_dump'):
+                        try:
+                            _web_sources.append(_w.model_dump())
+                            continue
+                        except Exception:
+                            pass
+                    if isinstance(_w, dict) and _w.get('id'):
+                        _web_sources.append(dict(_w))
+                if not _web_sources:
+                    _web_sources = [dict(d) for d in _WEB_DEFAULTS]
                 _mcfg = MacroConfig(
                     enabled=True,
                     coingecko_key=str(self.config.get('macro.coingecko_key', '') or ''),
+                    cmc_api_key=str(self.config.get('macro.cmc_api_key', '') or ''),
                     cache_ttl_seconds=float(self.config.get('macro.cache_ttl_seconds', 60.0) or 60.0),
                     predictive_weight=self._extmacro_weight,
                     max_concurrent_requests=int(self.config.get('macro.max_concurrent_requests', 3) or 3),
                     max_retries=int(self.config.get('macro.max_retries', 3) or 3),
+                    ath_bear_pct=float(self.config.get('macro.ath_bear_pct', -12.0) or -12.0),
+                    ath_bull_pct=float(self.config.get('macro.ath_bull_pct', 15.0) or 15.0),
                     tracked_coins=_tracked,
+                    web_sources=_web_sources,
                 )
                 self._extmacro_pipeline = MacroContextPipeline(_mcfg)
                 _t = threading.Thread(
@@ -921,6 +1015,47 @@ class SignalAnalyzer:
                 logger.warning("Macro pipeline disabled (init failed, fail-open): %s", str(e)[:150])
                 self._extmacro_enabled = False
                 self._extmacro_pipeline = None
+        # ── ML meta-label filter (v2.8) ──
+        # The feature extractor is created whenever feature logging is on (it is
+        # the training data pipeline, independent of whether a model exists yet).
+        # The filter itself only loads when ml.enabled, and any failure leaves
+        # alerts flowing (fail-open).
+        self._ml_enabled = bool(self.config.get('ml.enabled', False))
+        self._ml_gate_signals = bool(self.config.get('ml.gate_signals', False))
+        try:
+            self._ml_min_prob = float(self.config.get('ml.min_prob', 0.55) or 0.55)
+        except (TypeError, ValueError):
+            self._ml_min_prob = 0.55
+        self._ml_fail_open = bool(self.config.get('ml.fail_open', True))
+        self._ml_log_features = bool(self.config.get('ml.log_features', True))
+        try:
+            self._ml_window = int(self.config.get('ml.window', 200) or 200)
+        except (TypeError, ValueError):
+            self._ml_window = 200
+        self._ml_gated_count: int = 0
+        self._ml_scored_count: int = 0
+        self._ml_scored_cache: Dict[str, Dict[str, Any]] = {}
+        # Fix VOL-1: per-symbol volume baseline cache + persistence counters
+        self._vol_base_cache: Dict[str, Any] = {}
+        self._vol_base_ttl = float(self.config.get('volume.baseline_ttl_seconds', 21600))
+        self._vol_pending: Dict[str, int] = {}
+        self._fx = FeatureExtractor(window=self._ml_window) if (FeatureExtractor and self._ml_log_features) else None
+        self._ml_filter = None
+        if self._ml_enabled and MetaLabelFilter is not None:
+            try:
+                self._ml_filter = MetaLabelFilter(self.config.get('ml.model_path', 'data/ml/meta_model.json'))
+                if not getattr(self._ml_filter, "ok", False):
+                    logger.warning("ML filter unavailable (%s) — alerts fail-open",
+                                   getattr(self._ml_filter, "error", "unknown"))
+                    self._ml_filter = None
+                else:
+                    logger.info("ML meta-label filter loaded: %s (gate=%s, min_prob=%.2f)",
+                                self._ml_filter.describe(), self._ml_gate_signals, self._ml_min_prob)
+            except Exception as e:
+                logger.warning("ML filter init failed (fail-open): %s", e)
+                self._ml_filter = None
+        elif self._ml_enabled and MetaLabelFilter is None:
+            logger.warning("ml.enabled but ml_filter.py could not be imported — ML layer disabled")
         self._macro_enabled = bool(self.config.get('general.macro_regime_enabled', False))
         self._macro_symbols: List[str] = list(self.config.get('general.macro_regime_symbols', ["BTC/USDT:USDT", "ETH/USDT:USDT"]) or ["BTC/USDT:USDT", "ETH/USDT:USDT"])
         self._outcome_enabled = bool(self.config.get('general.outcome_gating_enabled', False))
@@ -937,6 +1072,12 @@ class SignalAnalyzer:
         self._macro_cache_ts: float = 0.0
         self._macro_cache_ttl: float = 60.0
         self._macro_gated_count: int = 0
+        # Debounce state (v2.6): a regime flip must persist for N consecutive
+        # evaluations AND respect a minimum hold time before it is committed.
+        # Prevents the macro gate from whipsawing when BTC/ETH hover near EMA.
+        self._macro_regime_pending: str = "neutral"
+        self._macro_regime_pending_count: int = 0
+        self._macro_regime_last_flip: float = 0.0
         self._outcome_cache: Dict[Tuple[str, str], Tuple[float, int]] = {}
         self._outcome_muted: set = set()
         self._outcome_cache_ts: float = 0.0
@@ -1006,6 +1147,33 @@ class SignalAnalyzer:
                     flat["poly_question"] = str(sent[0].get("question", ""))[:80]
                 except (TypeError, ValueError):
                     pass
+        # Web macro overlay (info/context only — never gates signals).
+        try:
+            from web_macro_providers import summarize_web_macro as _web_summary
+            from web_macro_providers import web_freshness as _web_freshness
+            _web = mctx.get("web_macro", {}) if isinstance(mctx.get("web_macro"), dict) else {}
+            _wf = _web_freshness(_web)
+            flat["web_fresh"] = int(_wf.get("fresh", 0))
+            flat["web_total"] = int(_wf.get("total", 0))
+            flat["web_stale"] = bool(_wf.get("total", 0) and not _wf.get("fresh", 0))
+            flat["web_summary"] = str(_web_summary(_web))[:220]
+            # CMC market-wide context (fear/greed + global metrics, info-only).
+            _gw = mctx.get("web_macro_global", {}) if isinstance(mctx.get("web_macro_global"), dict) else {}
+            _fg = _gw.get("fear_greed", {}) if isinstance(_gw.get("fear_greed"), dict) else {}
+            _gl = _gw.get("global", {}) if isinstance(_gw.get("global"), dict) else {}
+            if _fg.get("value") is not None:
+                try:
+                    flat["fear_greed"] = int(_fg["value"])
+                    flat["fear_greed_class"] = str(_fg.get("classification", ""))[:20]
+                except (TypeError, ValueError):
+                    pass
+            if _gl.get("btc_dominance_pct") is not None:
+                try:
+                    flat["btc_dominance"] = float(_gl["btc_dominance_pct"])
+                except (TypeError, ValueError):
+                    pass
+        except Exception:
+            pass
         return flat
 
     def macro_context_health(self) -> Dict[str, Any]:
@@ -1025,8 +1193,30 @@ class SignalAnalyzer:
             ages = [now - ts for ts, _ in cache.values()]
             fresh = sum(1 for a in ages if a < ttl)
             oldest = round(max(ages), 1) if ages else None
+            # Web macro freshness across cached symbol contexts (info-only).
+            web_fresh, web_total, web_oldest = 0, 0, None
+            try:
+                from web_macro_providers import is_fresh as _web_is_fresh
+                for _ts, _data in cache.values():
+                    _web = _data.get("web_macro", {}) if isinstance(_data, dict) else {}
+                    for _rec in _web.values() if isinstance(_web, dict) else []:
+                        if not isinstance(_rec, dict):
+                            continue
+                        web_total += 1
+                        try:
+                            _rts = datetime.fromisoformat(str(_rec.get("retrieved_at", ""))).timestamp()
+                        except (ValueError, TypeError):
+                            continue
+                        _age = now - _rts
+                        web_oldest = _age if web_oldest is None or _age > web_oldest else web_oldest
+                        if _web_is_fresh(_rec, now):
+                            web_fresh += 1
+                web_oldest = round(web_oldest, 1) if web_oldest is not None else None
+            except Exception:
+                pass
         except Exception:
             fresh, oldest = 0, None
+            web_fresh, web_total, web_oldest = 0, 0, None
         alive = bool(self._extmacro_thread and self._extmacro_thread.is_alive())
         ok = bool(alive and fresh)
         return {
@@ -1038,6 +1228,9 @@ class SignalAnalyzer:
                 "oldest_cache_age_s": oldest,
                 "gated_total": self._extmacro_gated_count,
                 "gate_signals": 1 if self._extmacro_gate else 0,
+                "web_fresh": web_fresh,
+                "web_total": web_total,
+                "web_oldest_age_s": web_oldest,
             },
         }
 
@@ -1264,6 +1457,19 @@ class SignalAnalyzer:
             except Exception:
                 pass
 
+        # ── ML feature vector (v2.8) ──
+        # Computed ONCE per scan, from CLOSED bars only, through features.py, so
+        # the vector persisted to signal_features is identical to what
+        # ml_backfill.py reconstructs from klines. Any failure is non-fatal.
+        if self._fx is not None:
+            try:
+                _fv = self._fx.vector(o, h, l, c, v)
+                if _fv:
+                    _bar_ts = df_sig['timestamp'].iloc[-1].timestamp()
+                    market_data["features"] = FeatureExtractor.add_time_features(_fv, _bar_ts)
+            except Exception as _fe:
+                logger.debug("feature extraction failed for %s %s: %s", symbol, timeframe, _fe)
+
         if self.config.get('volume.enabled'):
             self._check_volume(symbol, price, c, v, bar_key, timeframe, vol_avg, conf, market_data=market_data)
         if self.config.get('cvd.enabled'):
@@ -1272,8 +1478,11 @@ class SignalAnalyzer:
             self._check_rsi(symbol, price, c, bar_key, timeframe, rsi_arr, conf, market_data=market_data)
         if self.config.get('macd.enabled'):
             self._check_macd(symbol, price, c, bar_key, timeframe, ml, sl, hist, conf, market_data=market_data)
-        if self.config.get('stochastic.enabled'):
-            self._check_stoch(symbol, price, h, l, c, bar_key, timeframe, k, d, conf, market_data=market_data)
+        # STOCH alerts REMOVED (2026-09-17): the 4 stochastic signals (Bullish/
+        # Bearish Cross, Entered Overbought/Oversold) are no longer emitted, and
+        # the GUI/Telegram no longer display stoch values. The indicator still
+        # computes under stochastic.enabled because it is a confluence factor
+        # (see _confluence) — internal scoring only, never user-visible.
         if self.config.get('volatility.enabled'):
             self._check_vol(symbol, price, h, l, c, bar_key, timeframe, upper, mid, lower, atr_arr, conf, market_data=market_data)
 
@@ -1314,9 +1523,6 @@ class SignalAnalyzer:
             snap['macd_line'] = self._safe_last(ml)
             snap['macd_signal'] = self._safe_last(sl)
             snap['macd_hist'] = self._safe_last(hist)
-        if k is not None:
-            snap['stoch_k'] = self._safe_last(k)
-            snap['stoch_d'] = self._safe_last(d)
         if upper is not None:
             snap['bb_upper'] = self._safe_last(upper)
             snap['bb_lower'] = self._safe_last(lower)
@@ -1344,12 +1550,23 @@ class SignalAnalyzer:
         except Exception:
             return 0
 
-    # ── Macro regime (v2.3) ──
+    # ── Macro regime (v2.3, debounced v2.6) ──
     def _macro_regime(self) -> str:
         """BTC/ETH macro regime from last close vs EMA(trend_len).
+
         Fetches closes for macro_regime_symbols (default BTC/ETH) and votes:
-        bull if close > EMA, bear if <, neutral otherwise. Majority vote;
-        mixed -> neutral. Cached 60s."""
+        bull if close > EMA*(1+band), bear if close < EMA*(1-band), else
+        neutral. Majority vote; mixed -> neutral. Cached 60s.
+
+        Asymmetric EMA band (v2.6): a close must clear the EMA by
+        `macro_regime_ema_band` (default 0.5%) to vote directionally, so a
+        price hovering on the EMA votes neutral instead of flipping the gate.
+
+        Debounce (v2.6): a regime CHANGE is only committed after it has
+        persisted for `macro_regime_debounce_cycles` consecutive evaluations
+        AND at least `macro_regime_min_hold_s` seconds have elapsed since the
+        last committed flip. This stops the macro overlay from whipsawing and
+        mass-gating signals when BTC/ETH oscillate around the EMA."""
         if not self._macro_enabled:
             return "neutral"
         now = time.time()
@@ -1358,6 +1575,7 @@ class SignalAnalyzer:
                 return self._macro_cache
         try:
             trend_len = int(self.config.get('general.regime_trend_len', 50) or 50)
+            band = float(self.config.get('general.macro_regime_ema_band', 0.005) or 0.005)
             votes_bull = 0
             votes_bear = 0
             for sym in self._macro_symbols:
@@ -1371,26 +1589,51 @@ class SignalAnalyzer:
                     if np.isnan(ema):
                         continue
                     last = float(closes[-1])
-                    if last > ema:
+                    if last > ema * (1.0 + band):
                         votes_bull += 1
-                    elif last < ema:
+                    elif last < ema * (1.0 - band):
                         votes_bear += 1
                 except Exception as e:
                     logger.debug("macro regime fetch failed for %s: %s", sym, e)
                     continue
             total = votes_bull + votes_bear
             if total == 0:
-                regime = "neutral"
+                raw_regime = "neutral"
             elif votes_bull == total:
-                regime = "bull"
+                raw_regime = "bull"
             elif votes_bear == total:
-                regime = "bear"
+                raw_regime = "bear"
             else:
-                regime = "neutral"
+                raw_regime = "neutral"
+
+            # ── Debounce: only commit a CHANGE after it persists ──
+            debounce_cycles = int(self.config.get('general.macro_regime_debounce_cycles', 3) or 3)
+            min_hold_s = float(self.config.get('general.macro_regime_min_hold_s', 300.0) or 300.0)
             with self._state_lock:
-                self._macro_cache = regime
+                committed = self._macro_cache
+                if raw_regime == committed:
+                    # Stable — reset any pending flip.
+                    self._macro_regime_pending = raw_regime
+                    self._macro_regime_pending_count = 0
+                else:
+                    if raw_regime == self._macro_regime_pending:
+                        self._macro_regime_pending_count += 1
+                    else:
+                        self._macro_regime_pending = raw_regime
+                        self._macro_regime_pending_count = 1
+                    held_long_enough = (now - self._macro_regime_last_flip) >= min_hold_s
+                    if self._macro_regime_pending_count >= debounce_cycles and held_long_enough:
+                        old = committed
+                        committed = raw_regime
+                        self._macro_regime_last_flip = now
+                        self._macro_regime_pending_count = 0
+                        logger.info(
+                            "Macro regime committed flip %s -> %s (persisted %d cycles)",
+                            old, raw_regime, debounce_cycles,
+                        )
+                self._macro_cache = committed
                 self._macro_cache_ts = now
-            return regime
+            return committed
         except Exception as e:
             logger.debug("macro regime error: %s", e)
             with self._state_lock:
@@ -1398,9 +1641,20 @@ class SignalAnalyzer:
 
     # ── Outcome-aware gating (v2.3) ──
     def _refresh_outcome_cache(self):
-        """Query signal_outcomes for trailing lookback days per (signal_name, symbol).
+        """Query signal_outcomes for trailing lookback days per signal_name.
+
         Muted if expectancy (AVG forward_return) < 0 and n >= min_n. Refreshed every 60s.
-        Fix H3: Grouped by signal_name rather than signal_type to distinguish long and short signals."""
+
+        Fix H3: grouped by signal_name rather than signal_type, to distinguish long/short.
+
+        Fix OUT-1 (2026-09-27): this used to be keyed per (signal_name, SYMBOL), so each
+        cell needed min_n=30 samples of one signal on one symbol inside the lookback. The
+        engine's own table has 55 such cells in 7 days and the LARGEST is n=21 — the gate
+        could never fire, which is why outcome.gating_enabled was set to false and nothing
+        was muted. Expectancy is a property of the SIGNAL, not of the symbol: the same
+        setup behaves the same on SOL as on HYPE. Now pooled per signal_name, with a
+        per-symbol cell honoured only when it has enough samples of its own.
+        """
         now = time.time()
         with self._state_lock:
             if now - self._outcome_cache_ts < self._outcome_cache_ttl:
@@ -1414,34 +1668,47 @@ class SignalAnalyzer:
         try:
             cutoff = now - self._outcome_lookback_days * 86400
             with self.alert_mgr._db_lock:
-                cur = self.alert_mgr._conn.execute(
-                    """SELECT symbol, signal_name, AVG(forward_return) as exp, COUNT(*) as n
+                rows = self.alert_mgr._conn.execute(
+                    """SELECT signal_name, AVG(forward_return) as exp, COUNT(*) as n
                        FROM signal_outcomes
                        WHERE resolved = 1 AND fired_ts >= ?
-                       GROUP BY symbol, signal_name""",
-                    (cutoff,))
-                rows = cur.fetchall()
-            cache: Dict[Tuple[str, str], Tuple[float, int]] = {}
+                       GROUP BY signal_name""",
+                    (cutoff,)).fetchall()
+                sym_rows = self.alert_mgr._conn.execute(
+                    """SELECT signal_name, symbol, AVG(forward_return) as exp, COUNT(*) as n
+                       FROM signal_outcomes
+                       WHERE resolved = 1 AND fired_ts >= ?
+                       GROUP BY signal_name, symbol""",
+                    (cutoff,)).fetchall()
+            cache: Dict[str, Tuple[float, int]] = {}
             muted: set = set()
-            for sym, sname, exp, n in rows:
+            for sname, exp, n in rows:
                 if exp is None or n is None:
                     continue
-                key = (str(sname), str(sym))
-                cache[key] = (float(exp), int(n))
+                cache[str(sname)] = (float(exp), int(n))
                 if float(exp) < 0 and int(n) >= self._outcome_min_n:
-                    muted.add(key)
+                    muted.add(str(sname))          # pooled: applies to every symbol
+            for sname, sym, exp, n in sym_rows:
+                if exp is None or n is None:
+                    continue
+                if float(exp) < 0 and int(n) >= self._outcome_min_n:
+                    muted.add((str(sname), str(sym)))   # per-symbol override
             with self._state_lock:
                 self._outcome_cache = cache
                 self._outcome_muted = muted
         except Exception as e:
-            logger.debug("outcome gating refresh failed: %s", e)
+            logger.warning("outcome gating refresh failed: %s: %s", type(e).__name__, str(e)[:160])
 
     def _is_outcome_muted(self, symbol: str, signal_name: str) -> bool:
         if not self._outcome_enabled:
             return False
         self._refresh_outcome_cache()
         with self._state_lock:
-            return (str(signal_name), str(symbol)) in self._outcome_muted
+            # Fix OUT-1: a pooled per-signal mute applies to every symbol; a per-symbol
+            # cell, when it has enough samples, is the more specific answer.
+            if (str(signal_name), str(symbol)) in self._outcome_muted:
+                return True
+            return str(signal_name) in self._outcome_muted
 
     # ── Time gating (v2.4) ──
     def _refresh_time_cache(self):
@@ -1540,6 +1807,33 @@ class SignalAnalyzer:
                     "signal_cooldown_seconds": self._signal_cooldown_seconds,
                     "metrics": {"blocked": blocked_count,
                                 "active_symbols": active_syms}}
+        except Exception as e:
+            return {"status": "unhealthy", "error": str(e)}
+
+    def ml_health(self) -> dict:
+        """ML meta-label layer health: model presence, shadow vs gating, counters."""
+        try:
+            with self._state_lock:
+                scored = self._ml_scored_count
+                gated = self._ml_gated_count
+            if not self._ml_enabled:
+                status = "disabled"
+            elif self._ml_filter is None:
+                # gating configured but no model = the gate is silently open
+                status = "degraded" if self._ml_gate_signals else "unavailable"
+            elif self._ml_gate_signals:
+                status = "healthy"
+            else:
+                status = "shadow"
+            out = {"status": status, "enabled": self._ml_enabled,
+                   "gate_signals": self._ml_gate_signals,
+                   "min_prob": self._ml_min_prob, "window": self._ml_window,
+                   "log_features": self._ml_log_features and self._fx is not None,
+                   "model": self._ml_filter.describe() if self._ml_filter is not None else None,
+                   "metrics": {"scored": scored, "gated": gated}}
+            if self._ml_filter is None and self._ml_enabled:
+                out["error"] = "model not loaded (see ml.model_path / ml_train.py)"
+            return out
         except Exception as e:
             return {"status": "unhealthy", "error": str(e)}
 
@@ -1839,7 +2133,38 @@ class SignalAnalyzer:
                     self._extmacro_gated_count += 1
                 logger.info("ExtMacro-gated %s %s %s (macro %s vs %s)", sym, tf, name, _mhint, direction)
                 return False
-        self.alert_mgr.emit_alert(name, sym, p, stype, color, bk, tf, market_data=market_data)
+        # ML meta-label gate (v2.8). Shadow by default: the probability is
+        # attached to market_data (so it lands in the log, Telegram and the
+        # signal_features row) and only blocks emission when ml.gate_signals is
+        # true. Fail-open by default — a scoring error must not blackhole alerts.
+        _dir_sign = get_signal_direction(name, direction)
+        if self._ml_filter is not None:
+            _p = None
+            try:
+                _p = self._ml_filter.score((market_data or {}).get("features") or {},
+                                           stype, _dir_sign)
+            except Exception as _me:
+                logger.warning("ML scoring failed for %s %s %s: %s", sym, tf, name, _me)
+            if _p is None:
+                if not self._ml_fail_open:
+                    with self._state_lock:
+                        self._ml_gated_count += 1
+                    logger.info("ML-gated %s %s %s (no score, fail-closed)", sym, tf, name)
+                    return False
+            else:
+                with self._state_lock:
+                    self._ml_scored_count += 1
+                if market_data is not None:
+                    market_data["ml_prob"] = round(float(_p), 4)
+                    market_data["ml_dir"] = int(_dir_sign)
+                if self._ml_gate_signals and float(_p) < self._ml_min_prob:
+                    with self._state_lock:
+                        self._ml_gated_count += 1
+                    logger.info("ML-gated %s %s %s (p=%.3f < %.2f)",
+                                sym, tf, name, float(_p), self._ml_min_prob)
+                    return False
+        self.alert_mgr.emit_alert(name, sym, p, stype, color, bk, tf,
+                                  market_data=market_data, direction=_dir_sign)
         try:
             t0 = datetime.fromisoformat(bk).timestamp() if bk else 0.0
         except (ValueError, TypeError):
@@ -1901,13 +2226,105 @@ class SignalAnalyzer:
                 if not base or np.isnan(base):
                     continue
                 raw_ret = float(closes[idx + int(fwd_bars)]) / base - 1.0
-                dir_sign = get_signal_direction(sig_name)
+                # Prefer the direction recorded at emit time; the name-based
+                # inference disagrees with the emit-time hint for some signals
+                # and would store the return with the wrong sign.
+                stored_dir = 0
+                try:
+                    stored_dir = int(row[5]) if len(row) > 5 and row[5] is not None else 0
+                except (TypeError, ValueError):
+                    stored_dir = 0
+                dir_sign = stored_dir if stored_dir else get_signal_direction(sig_name)
                 # Fix C1: Short signals profit when price falls
                 directional_ret = -raw_ret if dir_sign == -1 else raw_ret
                 self.alert_mgr.resolve_outcome(signal_id, directional_ret)
                 logger.debug("Resolved outcome %s: %+.4f (%d bars, dir=%+d)", signal_id, directional_ret, int(fwd_bars), dir_sign)
         except Exception as e:
             logger.debug("Outcome resolution failed: %s", e)
+
+    def _vol_baseline(self, sym: str) -> Optional[float]:
+        """Per-symbol volume baseline: the symbol's own median bar volume.
+
+        Fix VOL-1: a fixed 0.5x-of-20-bar-mean dryup threshold is inside the normal
+        distribution of low-liquidity instruments (NVDA is under it 45% of the time), so
+        the same "dryup" fires and re-fires all session. Each symbol must be measured
+        against itself. Cached in-process; refreshed lazily, never blocking.
+
+        NB Binance caps /klines at limit=1500 and answers HTTP 400 above that — asking for
+        2880 rows (a month of 15m bars) returns nothing, which would have made the
+        baseline silently unavailable and silently kept the old behaviour. 1500 rows of
+        15m is 15.6 days, which is the baseline we get.
+        """
+        cached = self._vol_base_cache.get(sym)
+        if cached and (time.time() - cached[0]) < self._vol_base_ttl:
+            return cached[1] or None
+        # The engine passes TradingView-style symbols ('SOL/USDT:USDT'); /fapi needs
+        # 'SOLUSDT'. Sending the raw form 400s, which silently left every symbol on the
+        # 20-bar-mean fallback path.
+        api_sym = str(sym).split(":")[0].replace("/", "").replace("-", "").upper()
+        try:
+            req = _urllib.Request(
+                f"https://fapi.binance.com/fapi/v1/klines?symbol={api_sym}&interval=15m&limit=1500",
+                headers={"User-Agent": "quant-alert-engine"})
+            with _urllib.urlopen(req, timeout=20) as resp:
+                rows = json.loads(resp.read().decode())
+            vols = sorted(float(r[5]) for r in rows)
+            if not vols:
+                return None
+            med = vols[len(vols) // 2]
+            self._vol_base_cache[sym] = (time.time(), med)
+            logger.debug("vol baseline %s = %.2f (%d bars)", sym, med, len(vols))
+            return med
+        except Exception as e:  # noqa: BLE001
+            logger.warning("vol baseline fetch failed for %s: %s: %s",
+                           sym, type(e).__name__, str(e)[:120])
+            self._vol_base_cache[sym] = (time.time(), None)
+            return None
+
+    def _vol_state_persisted(self, sym: str, tf: str, state: str, bar_key: str) -> bool:
+        """True when `state` has held for N consecutive CLOSED BARS.
+
+        Fix VOL-1: without this a ratio sitting on the threshold re-enters and exits the
+        state between bars and every re-entry is a fresh alert. Volume regime is a slow
+        thing; it must persist before it is called an event.
+
+        Counted in BARS, not polls, and that distinction is the whole fix: the engine
+        polls every 5s (general.check_interval) and re-evaluates the SAME closed bar ~60
+        times on a 5m timeframe, so a poll counter would reach its threshold in 15 seconds
+        without the market changing at all. The bar_key is the closed bar's open time, so
+        the same bar key repeating means "no new information" and must not advance the
+        count.
+        """
+        need = int(self.config.get('volume.state_persistence_bars', 2))
+        if need <= 1:
+            return True
+        key = f"{sym}_{tf}_vol_hold"
+        prev_key, hold = self._vol_pending.get(key, (None, 0))
+        if bar_key == prev_key:
+            return hold >= need            # same bar seen again: no progress, no reset
+        hold = hold + 1 if state == self._vol_pending.get(f"{sym}_{tf}_vol_state") else 1
+        self._vol_pending[key] = (bar_key, hold)
+        self._vol_pending[f"{sym}_{tf}_vol_state"] = state
+        return hold >= need
+
+    def _obv_break_persisted(self, sym: str, tf: str, side: str, bar_key: str) -> bool:
+        """True when the OBV break has held for N consecutive CLOSED BARS.
+
+        Fix VOL-2. Counted in bars via bar_key, for the same reason as the volume state:
+        the engine polls every 5s and re-evaluates one closed bar ~60 times on 5m, so a
+        poll counter would fire instantly and mean nothing.
+        """
+        need = int(self.config.get('volume.obv_break_bars', 2))
+        if need <= 1:
+            return True
+        key = f"{sym}_{tf}_obv_hold"
+        prev_key, hold = self._vol_pending.get(key, (None, 0))
+        if bar_key == prev_key:
+            return hold >= need
+        hold = hold + 1 if side == self._vol_pending.get(f"{sym}_{tf}_obv_side") else 1
+        self._vol_pending[key] = (bar_key, hold)
+        self._vol_pending[f"{sym}_{tf}_obv_side"] = side
+        return hold >= need
 
     def _check_volume(self, sym, p, c, v, bk, tf, vol_avg, conf,
                        market_data: Optional[Dict[str, Any]] = None):
@@ -1916,25 +2333,81 @@ class SignalAnalyzer:
 
         if vol_avg is None or np.isnan(vol_avg): return
 
+        # ── Fix VOL-1 (2026-09-27): the volume-state thresholds were absolute multiples
+        # of a 20-bar mean, so they measured the INSTRUMENT, not the event. Measured over
+        # 300 5m bars: NVDA's volume/avg(20) is below 0.5x 44.8% of the time and SPCX
+        # 37.7% (median ratio 0.62 / 0.63). "Dryup" was therefore NVDA's steady state and
+        # the engine re-fired on every exit from it: 43 of 48 alerts today were VOL states,
+        # and you received Dryup/Spike/Climax repeatedly for the same quiet tape.
+        #
+        # Two changes, both measured rather than guessed:
+        #  1. Hysteresis: a state must CLEAR a wider exit band before it can change, so a
+        #     ratio hovering on the threshold cannot machine-gun transitions.
+        #  2. The thresholds are now PER-SYMBOL, from the symbol's own 30-day median
+        #     ratio (cached in SQLite). A 0.5x-of-own-median bar is genuinely rare for
+        #     every instrument instead of ordinary for NVDA.
+        # The 20-bar mean is still used when no per-symbol baseline is available yet.
+        base = self._vol_baseline(sym)
+        ratio_txt = ""
+        if base:
+            e_hi = self.config.get('volume.climax_mult', 3.5)
+            e_mid = self.config.get('volume.spike_mult', 2.0)
+            e_lo = self.config.get('volume.dryup_mult', 0.5)
+            ratio = cur_vol / base
+            ratio_txt = f" vs own 30d median ({ratio:.2f}x)"
+        else:
+            d_hi = self.config.get('volume.dryup_exit_mult', 0.8) * vol_avg
+            e_hi = self.config.get('volume.climax_mult', 3.5) * vol_avg
+            e_mid = self.config.get('volume.spike_mult', 2.0) * vol_avg
+            e_lo = self.config.get('volume.dryup_mult', 0.5) * vol_avg
+            ratio = cur_vol / vol_avg if vol_avg else 0.0
+
         # Transition logic for volume (state persisted in SQLite, survives restarts)
         cur_state = "normal"
-        if cur_vol > vol_avg * self.config.get('volume.climax_mult', 3.5): cur_state = "climax"
-        elif cur_vol > vol_avg * self.config.get('volume.spike_mult', 2.0): cur_state = "spike"
-        elif cur_vol < vol_avg * self.config.get('volume.dryup_mult', 0.5): cur_state = "dryup"
+        if ratio > e_hi: cur_state = "climax"
+        elif ratio > e_mid: cur_state = "spike"
+        elif ratio < e_lo: cur_state = "dryup"
 
         prev_state = self._STATE_CODE_TO_NAME.get(self.alert_mgr.get_state_val(state_key), "normal")
         if cur_state != "normal" and cur_state != prev_state:
-            self._emit(f"Volume {cur_state.capitalize()}", sym, p, "VOL", "red", bk, tf, conf, market_data=market_data)
+            if self._vol_state_persisted(sym, tf, cur_state, bk):
+                self._emit(f"Volume {cur_state.capitalize()}", sym, p, "VOL", "red", bk, tf,
+                           conf, market_data=market_data)
         self.alert_mgr.set_state_val(state_key, self._STATE_NAME_TO_CODE[cur_state])
+        if cur_state == "normal":
+            self._vol_pending.pop(f"{sym}_{tf}_vol_hold", None)
+            self._vol_pending.pop(f"{sym}_{tf}_vol_state", None)
 
-        # OBV Cross
+        # OBV Cross — Fix VOL-2 (2026-09-27): this was a bare one-bar crossover of OBV
+        # against its own SMA, with no persistence and no distance filter. Measured over
+        # 300 bars x 7 symbols x 2 timeframes that is 443 raw crosses, and the engine's
+        # own track record shows OBV Bullish Break at n=67 averaging -0.038% forward —
+        # it was the single noisiest emitter in the feed and no better than a coin flip.
+        # Now: the cross must persist N bars AND clear a margin proportional to OBV's own
+        # volatility, so a graze through the line is not an event.
         obv = np.cumsum(np.sign(np.diff(c, prepend=c[0])) * v)
         obv_sma = self.ind.sma(obv, self.config.get('volume.obv_len', 20))
         if not np.isnan(obv_sma[-1]) and not np.isnan(obv_sma[-2]):
-            if obv[-1] > obv_sma[-1] and obv[-2] <= obv_sma[-2]:
-                self._emit("OBV Bullish Break", sym, p, "VOL", "green", bk, tf, conf, "bull", market_data=market_data)
-            elif obv[-1] < obv_sma[-1] and obv[-2] >= obv_sma[-2]:
-                self._emit("OBV Bearish Break", sym, p, "VOL", "red", bk, tf, conf, "bear", market_data=market_data)
+            # FIX (crash): ind.sma() returns a SAME-LENGTH array (pandas rolling, NaN-padded
+            # at the front), not a shortened one. Slicing obv[19:] against it produced
+            # shapes (180,) vs (199,) and killed the engine thread 112 times on 2026-09-28.
+            # Drop the leading window of BOTH arrays so they stay aligned.
+            _w = len(obv) - 19
+            if _w < 2 or len(obv_sma) != len(obv):
+                return
+            resid = obv[19:] - obv_sma[19:]            # signed distance to the line
+            sd = float(np.std(resid[-100:])) if len(resid) >= 20 else 0.0
+            margin = self.config.get('volume.obv_break_sigma', 0.75) * sd
+            d_now, d_prev = resid[-1], resid[-2]
+            side = "bull" if d_now > margin else ("bear" if d_now < -margin else "flat")
+            prev_side = "bull" if d_prev > margin else ("bear" if d_prev < -margin else "flat")
+            if side != "flat" and side != prev_side:
+                if self._obv_break_persisted(sym, tf, side, bk):
+                    self._emit("OBV Bullish Break" if side == "bull" else "OBV Bearish Break",
+                               sym, p, "VOL", "green" if side == "bull" else "red", bk, tf,
+                               conf, side, market_data=market_data)
+            if side == "flat":
+                self._vol_pending.pop(f"{sym}_{tf}_obv_hold", None)
 
     def _check_cvd(self, sym, p, c, bk, tf, cvd_cum, cvd_smooth, conf,
                    market_data: Optional[Dict[str, Any]] = None):
@@ -1979,73 +2452,30 @@ class SignalAnalyzer:
 
     def _check_macd(self, sym, p, c, bk, tf, ml, sl, hist, conf,
                       market_data: Optional[Dict[str, Any]] = None):
-        if not np.isnan(ml[-1]):
-            if ml[-1] > sl[-1] and ml[-2] <= sl[-2]:
-                self._emit("MACD Bullish Cross", sym, p, "MACD", "green", bk, tf, conf, "bull", market_data=market_data)
-            elif ml[-1] < sl[-1] and ml[-2] >= sl[-2]:
-                self._emit("MACD Bearish Cross", sym, p, "MACD", "red", bk, tf, conf, "bear", market_data=market_data)
+        # MACD cross/zero/histogram alerts REMOVED (2026-09-21): the 6 MACD signals
+        # (Bullish/Bearish Cross, Crossed Above/Below Zero, Hist Flip Up/Down) are no
+        # longer emitted. Only the 4 MACD divergences below remain.
 
-            if not np.isnan(ml[-2]):
-                if ml[-1] > 0 and ml[-2] <= 0:
-                    self._emit("MACD Crossed Above Zero", sym, p, "MACD", "green", bk, tf, conf, "bull", market_data=market_data)
-                elif ml[-1] < 0 and ml[-2] >= 0:
-                    self._emit("MACD Crossed Below Zero", sym, p, "MACD", "red", bk, tf, conf, "bear", market_data=market_data)
-
-            if self.config.get('macd.histogram_flip', True) and not np.isnan(hist[-2]):
-                if hist[-1] > 0 and hist[-2] <= 0:
-                    self._emit("MACD Hist Flip Up", sym, p, "MACD", "green", bk, tf, conf, "bull", market_data=market_data)
-                elif hist[-1] < 0 and hist[-2] >= 0:
-                    self._emit("MACD Hist Flip Down", sym, p, "MACD", "red", bk, tf, conf, "bear", market_data=market_data)
-
-            rb, ru, hb, hu = self.div.detect_divergence(
-                c, ml, self.config.get('macd.pivot_len', 5),
-                self.config.get('macd.div_lookback', 20), self.config.get('macd.min_gap', 3))
-            self._div_alert("MACD Reg Bear Div", sym, p, bk, tf, "MACD_DIV", "red", conf, "bear", rb, market_data=market_data)
-            self._div_alert("MACD Reg Bull Div", sym, p, bk, tf, "MACD_DIV", "green", conf, "bull", ru, market_data=market_data)
-            self._div_alert("MACD Hidden Bear Div", sym, p, bk, tf, "MACD_DIV", "red", conf, "bear", hb, market_data=market_data)
-            self._div_alert("MACD Hidden Bull Div", sym, p, bk, tf, "MACD_DIV", "green", conf, "bull", hu, market_data=market_data)
-
-    def _check_stoch(self, sym, p, h, l, c, bk, tf, k, d, conf,
-                       market_data: Optional[Dict[str, Any]] = None):
-        ob, ovs = self.config.get('stochastic.overbought', 80), self.config.get('stochastic.oversold', 20)
-
-        if not np.isnan(k[-1]) and not np.isnan(k[-2]):
-            if k[-1] > d[-1] and k[-2] <= d[-2]:
-                self._emit("Stoch Bullish Cross", sym, p, "STOCH", "green", bk, tf, conf, "bull", market_data=market_data)
-            elif k[-1] < d[-1] and k[-2] >= d[-2]:
-                self._emit("Stoch Bearish Cross", sym, p, "STOCH", "red", bk, tf, conf, "bear", market_data=market_data)
-
-            if k[-1] > ob and k[-2] <= ob:
-                self._emit("Stoch Entered Overbought", sym, p, "STOCH", "red", bk, tf, conf, "bear", market_data=market_data)
-            elif k[-1] < ovs and k[-2] >= ovs:
-                self._emit("Stoch Entered Oversold", sym, p, "STOCH", "green", bk, tf, conf, "bull", market_data=market_data)
+        rb, ru, hb, hu = self.div.detect_divergence(
+            c, ml, self.config.get('macd.pivot_len', 5),
+            self.config.get('macd.div_lookback', 20), self.config.get('macd.min_gap', 3))
+        self._div_alert("MACD Reg Bear Div", sym, p, bk, tf, "MACD_DIV", "red", conf, "bear", rb, market_data=market_data)
+        self._div_alert("MACD Reg Bull Div", sym, p, bk, tf, "MACD_DIV", "green", conf, "bull", ru, market_data=market_data)
+        self._div_alert("MACD Hidden Bear Div", sym, p, bk, tf, "MACD_DIV", "red", conf, "bear", hb, market_data=market_data)
+        self._div_alert("MACD Hidden Bull Div", sym, p, bk, tf, "MACD_DIV", "green", conf, "bull", hu, market_data=market_data)
 
     def _check_vol(self, sym, p, h, l, c, bk, tf, upper, mid, lower, atr, conf,
-                     market_data: Optional[Dict[str, Any]] = None):
-        if not np.isnan(upper[-1]):
-            if c[-1] > upper[-1] and c[-2] <= upper[-2]:
-                self._emit("BB Breakout Up", sym, p, "VOL", "green", bk, tf, conf, "bull", market_data=market_data)
-            elif c[-1] < lower[-1] and c[-2] >= lower[-2]:
-                self._emit("BB Breakout Down", sym, p, "VOL", "red", bk, tf, conf, "bear", market_data=market_data)
-
-            # BB Squeeze Transition
-            bb_width = (upper - lower) / mid
-            lookback = min(self.config.get('volatility.bb_width_lookback', 100), len(bb_width))
-            threshold = np.nanpercentile(bb_width[-lookback:], self.config.get('volatility.bb_squeeze_pct', 20.0))
-
-            state_key = f"{sym}_{tf}_bb_squeeze"
-            in_squeeze = bb_width[-1] < threshold
-            if in_squeeze and not self.alert_mgr.get_state(state_key):
-                self._emit("BB Squeeze (Entry)", sym, p, "VOL", "yellow", bk, tf, conf, market_data=market_data)
-            self.alert_mgr.set_state(state_key, in_squeeze)
+                       market_data: Optional[Dict[str, Any]] = None):
+        # BB alerts REMOVED (2026-09-21): BB Breakout Up/Down and BB Squeeze (Entry)
+        # are no longer emitted. Only ATR Expansion below remains.
 
         # ATR Expansion Transition
         atr_len = self.config.get('volatility.atr_len', 14)
         if not np.isnan(atr[-1]) and len(atr) > atr_len:
             # Off-by-one fix: exclude current bar from average baseline
             atr_avg = np.mean(atr[-atr_len-1:-1])
+            state_key = f"{sym}_{tf}_atr_exp"
             if atr[-1] > atr_avg * self.config.get('volatility.atr_expansion_mult', 1.8):
-                state_key = f"{sym}_{tf}_atr_exp"
                 if not self.alert_mgr.get_state(state_key):
                     self._emit("ATR Expansion (Vol Surge)", sym, p, "VOL", "yellow", bk, tf, conf, market_data=market_data)
                     self.alert_mgr.set_state(state_key, True)
@@ -2351,6 +2781,17 @@ class QuantAlertEngine:
         self.analyzer = SignalAnalyzer(self.config)
         self.running = True
         self._last_stats_log = time.time()
+        self._snapshot_last_send = time.time()
+        # Periodic-card state (P1/P2 upgrade 2026-09-19):
+        #   _snapshot_inflight  — prevents overlapping builds (card build can
+        #                         outlast the interval; the old code re-launched
+        #                         a thread every cycle and sent duplicate cards)
+        #   _next_snapshot_at   — wall-clock-aligned next fire (:00/:15/:30/:45)
+        #   _last_good_card     — last successfully SENT card, replayed with a
+        #                         stale header if a fresh build fails
+        self._snapshot_inflight = False
+        self._next_snapshot_at = None
+        self._last_good_card = None
         self.executor = ThreadPoolExecutor(max_workers=self.config.get('general.max_workers', 10))
         
         # Health server
@@ -2374,6 +2815,11 @@ class QuantAlertEngine:
                 register_check("outcome_gating", lambda: self.analyzer.gating_health())
                 register_check("time_gating", lambda: self.analyzer.time_health())
                 register_check("macro_context", lambda: self.analyzer.macro_context_health() if hasattr(self.analyzer, 'macro_context_health') else {"status": "healthy", "metrics": {"enabled": 0}})
+                # README documents blackout/level2 checks; they were never
+                # registered. Register them, plus the ML meta-label layer.
+                register_check("blackout", lambda: self.analyzer.blackout_health())
+                register_check("level2", lambda: self.analyzer.level2_health())
+                register_check("ml_filter", lambda: self.analyzer.ml_health())
                 port = self.config.get('general.health_port', 8080)
                 host = self.config.get('general.health_host', '127.0.0.1')
                 self._health_thread = start_health_server(host=host, port=port)
@@ -2388,6 +2834,366 @@ class QuantAlertEngine:
         logger.info(f"Signal {signum} received. Shutting down gracefully...")
         self.running = False
         self.executor.shutdown(wait=False)
+
+    def _send_telegram(self, message: str, parse_mode: str = None, attempts: int = 3) -> bool:
+        """Send one message, retrying transient failures with backoff.
+
+        P1 upgrade (2026-09-19): a single attempt lost the card on any 429/5xx
+        or socket blip. HTTP errors back off too (a 429 without backoff invites
+        a Telegram ban). Returns True only on a confirmed 200.
+        """
+        token = self.config.get('telegram.token', '')
+        chat_id = self.config.get('telegram.chat_id', '')
+        if not token or not chat_id:
+            logger.debug("Telegram disabled: missing token or chat_id")
+            return False
+        # Plain text by default: the legacy "Markdown" parse mode rejects the message
+        # outright when a value contains an underscore (e.g. above_value) — it failed
+        # silently, returning False and logging at debug. Opt in per call if needed.
+        body = {"chat_id": chat_id, "text": message}
+        if parse_mode:
+            body["parse_mode"] = parse_mode
+        delay = 2.0
+        last = ""
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                req = _urllib.Request(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                with _urllib.urlopen(req, timeout=15) as resp:
+                    if resp.status == 200:
+                        logger.info("Telegram snapshot sent to %s (%d chars, attempt %d)",
+                                    chat_id, len(message), attempt)
+                        return True
+                    last = f"HTTP {resp.status}"
+            except Exception as e:
+                last = f"{e}"
+                try:
+                    last += " " + e.read().decode()[:200]   # Telegram's own reason
+                except Exception:
+                    pass
+            if attempt < attempts:
+                logger.warning("Telegram send failed (attempt %d/%d): %s — retrying in %.0fs",
+                               attempt, attempts, last, delay)
+                time.sleep(delay)
+                delay *= 2.0
+        logger.warning("Telegram send gave up after %d attempts: %s", attempts, last)
+        return False
+
+    def _send_telegram_chunked(self, message: str, limit: int = 3800) -> bool:
+        """Send a possibly-long message, splitting on line boundaries.
+
+        Telegram's hard limit is 4096 chars; the card path used to send raw and
+        could fail silently with HTTP 400 once the degraded list grew (P1).
+        Returns True only if every chunk was delivered.
+        """
+        if len(message) <= limit:
+            return self._send_telegram(message)
+        chunks, cur = [], ""
+        for line in message.split("\n"):
+            if len(cur) + len(line) + 1 > limit:
+                if cur:
+                    chunks.append(cur)
+                cur = line
+            else:
+                cur = f"{cur}\n{line}" if cur else line
+        if cur:
+            chunks.append(cur)
+        ok = True
+        for i, ch in enumerate(chunks, 1):
+            if not self._send_telegram(ch):
+                ok = False
+                logger.warning("Telegram chunk %d/%d failed", i, len(chunks))
+        return ok
+
+    def _blackout_active(self):
+        """(active, event_name) from the bridge's macro-event blackout."""
+        st = self._fetch_bridge_data("/blackout/status")
+        if not isinstance(st, dict) or st.get("__error__"):
+            return False, None
+        return bool(st.get("blackout")), ((st.get("active_event") or {}).get("name"))
+
+    def _fetch_bridge_data(self, endpoint: str, symbol: str = "") -> Dict:
+        bridge = getattr(self.config, 'bridge', None)
+        bridge_url = getattr(bridge, 'url', 'http://127.0.0.1:8000') if bridge else 'http://127.0.0.1:8000'
+        url = f"{bridge_url}{endpoint}"
+        if symbol:
+            url = f"{bridge_url}{endpoint}/{symbol}"
+        try:
+            req = _urllib.Request(url, method="GET")
+            with _urllib.urlopen(req, timeout=3) as resp:
+                return json.loads(resp.read().decode())
+        except Exception:
+            return {}
+
+    def send_periodic_snapshot(self):
+        """Build and send the periodic quant card (see P1/P2/P3 upgrade notes)."""
+        ps = self.config.get('periodic_snapshot')
+        if not ps or not getattr(ps, 'enabled', False):
+            self._snapshot_inflight = False
+            return
+        try:
+            self._send_periodic_snapshot_inner(ps)
+        finally:
+            # Always release the in-flight flag, even on an unexpected error, so
+            # one bad cycle cannot permanently wedge the scheduler.
+            self._snapshot_inflight = False
+
+    def _send_periodic_snapshot_inner(self, ps):
+        t0 = time.time()
+        # P2: macro-event blackout — skip the send but keep the schedule moving.
+        blk, event = self._blackout_active()
+        if blk:
+            logger.info("Periodic card skipped — blackout active (%s)", event)
+            return
+        # Preferred: send the SAME card the chat analysis delivers. There is exactly one
+        # implementation of that card (card_live/: fetch_live -> live_read -> live_card)
+        # and card_alert.py just runs it and posts the text, so the phone and the chat can
+        # never drift apart. Falls back to the per-symbol blocks below if it cannot build.
+        try:
+            import card_alert
+            card = card_alert.build_card()
+            build_s = time.time() - t0
+            if self._send_telegram_chunked(card):
+                self._last_good_card = (card, time.time())
+                logger.info("Periodic card sent (build %.1fs, %d chars)", build_s, len(card))
+                return
+            logger.warning("Periodic card built but send failed (build %.1fs, %d chars)",
+                           build_s, len(card))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Card alert failed (%s) — trying last good card", e)
+        # P1: prefer replaying the last SENT card (with a staleness header) over
+        # dropping to the much thinner compact lines — but only while it is
+        # recent. A card hours old is worse than fresh thin lines.
+        if self._last_good_card:
+            card, sent_at = self._last_good_card
+            age_min = int((time.time() - sent_at) / 60)
+            if age_min <= 60:
+                header = (f"⚠️ card stale — fresh build failed, resending from "
+                          f"{time.strftime('%H:%M', time.localtime(sent_at))} ({age_min}m ago)")
+                if self._send_telegram_chunked(header + "\n" + card):
+                    logger.info("Periodic card replayed stale (age %dm)", age_min)
+                    return
+            else:
+                logger.info("Last good card is %dm old — using fresh compact lines instead",
+                            age_min)
+        symbols = getattr(ps, 'symbols', [])
+        # Layout choice: the FULL block (ATAS footprint: tape, POC, value area, bar) only
+        # for the symbol ATAS is charting; every other symbol gets one compact line built
+        # from book + taker data, so the phone message stays readable.
+        atas_sym = self._snapshot_atas_symbol(symbols)
+        messages, rest = [], []
+        for sym in symbols:
+            try:
+                if sym == atas_sym:
+                    msg = self._build_snapshot(sym)
+                    if msg:
+                        messages.append(msg)
+                else:
+                    line = self._build_snapshot_line(sym)
+                    if line:
+                        rest.append(line)
+            except Exception as e:
+                logger.debug("Snapshot error for %s: %s", sym, e)
+        if not atas_sym:
+            messages.append("📊 QUANT SNAPSHOT — ATAS footprint offline, compact lines only")
+        if rest:
+            messages.append("▸ OTHER SYMBOLS  (book + taker flow · ⚡ = |score-50| ≥ 10)\n"
+                            + "\n".join(rest))
+
+        combined = ""
+        for msg in messages:
+            if len(combined) + len(msg) > 3800:
+                self._send_telegram_chunked(combined.rstrip())
+                combined = ""
+            combined += msg + "\n\n"
+        if combined.strip():
+            self._send_telegram_chunked(combined.rstrip())
+        logger.info("Periodic compact snapshot sent (build %.1fs, %d msgs)",
+                    time.time() - t0, len(messages))
+
+    def _build_snapshot(self, sym: str) -> str:
+        """Build a single-symbol snapshot string."""
+        clean = sym.replace("/USDT:USDT", "").replace("/USDT", "")
+        # Bridge symbol forms: /dom and /taker-cvd take the compact lowercase ticker
+        # ("solusdt"), /context takes "SOLUSDT". The previous sym.replace("/", "_")
+        # produced "/dom/SOL_USDT:USDT" and "/context/SOL_USDT:USDT" — both 404 — so the
+        # bid/ask walls, OI, funding, L/S and value-location lines of every periodic
+        # snapshot printed zeros and /indicators was always empty.
+        base = sym.split("/")[0].strip().upper()
+        compact = base.lower() + "usdt"       # /dom and /taker-cvd key by "suiusdt"
+        ind = self._fetch_bridge_data("/indicators")
+        if isinstance(ind, dict):
+            tk = (ind.get("ticker") or "").upper().replace(".P", "")
+            if tk and not tk.startswith(base):
+                ind = {}                  # ATAS is on another chart: no footprint here
+        book = self._fetch_bridge_data("/dom", compact)   # Binance book: walls, OI, funding
+        dom = book                                        # (kept as the legacy name)
+        cvd = self._fetch_bridge_data("/cvd")
+        ctx = self._fetch_bridge_data("/context", base + "USDT")
+        # these two endpoints key by the full ticker ("SUIUSDT"), not the coin name
+        taker = self._fetch_bridge_data("/taker-cvd") or {}
+        tc = taker.get(base + "USDT") or taker.get(compact) or {}
+
+        price = ind.get("price", {}).get("last", 0) if isinstance(ind, dict) else 0
+        if not price and isinstance(book, dict):
+            _bb, _ba = book.get("best_bid"), book.get("best_ask")
+            if _bb and _ba:
+                price = (_bb + _ba) / 2.0     # ATAS is on another chart: use the book mid
+        delta = ind.get("delta", 0) if isinstance(ind, dict) else 0
+        dom_imb = (book.get("imbalance_pct") if isinstance(book, dict) and book.get("imbalance_pct") is not None
+                   else (ind.get("dom", {}).get("imbalance_pct", 0) if isinstance(ind, dict) else 0))
+        bid_ratio = ind.get("dom", {}).get("bid_ask_ratio", 0) if isinstance(ind, dict) else 0
+        tape_net = ind.get("tape", {}).get("net_vol", 0) if isinstance(ind, dict) else 0
+        buy_ct = ind.get("tape", {}).get("buy_count", 0) if isinstance(ind, dict) else 0
+        sell_ct = ind.get("tape", {}).get("sell_count", 0) if isinstance(ind, dict) else 0
+        poc = ind.get("footprint", {}).get("poc", 0) if isinstance(ind, dict) else 0
+        vah = ind.get("footprint", {}).get("value_area_high", 0) if isinstance(ind, dict) else 0
+        val = ind.get("footprint", {}).get("value_area_low", 0) if isinstance(ind, dict) else 0
+        time_str = ind.get("time", "00:00") if isinstance(ind, dict) else "00:00"
+        bid_wall_vol = book.get("bid_wall_vol") or 0 if isinstance(book, dict) else 0
+        ask_wall_vol = book.get("ask_wall_vol") or 0 if isinstance(book, dict) else 0
+        bid_wall_price = book.get("bid_wall_price") or 0 if isinstance(book, dict) else 0
+        ask_wall_price = book.get("ask_wall_price") or 0 if isinstance(book, dict) else 0
+        # /cvd is keyed by the full ticker ({"SUIUSDT": {...}}): reading it flat always
+        # returned 0, which is why every snapshot showed "CVD(ATAS): +0 (Δ+0)".
+        cv = ((cvd or {}).get(base + "USDT") or {}) if isinstance(cvd, dict) else {}
+        cvd_val = cv.get("cvd", 0)
+        cvd_delta = cv.get("last_delta", 0)
+        value_loc = ctx.get("value_area", {}).get("location", "N/A") if isinstance(ctx, dict) else "N/A"
+        atr_pct = ctx.get("volatility_regime", {}).get("atr_percentile_rank", {}).get("value", 0) if isinstance(ctx, dict) else 0
+        oi = (book.get("derivatives") or {}).get("openInterest", 0) if isinstance(book, dict) else 0
+        funding = (book.get("derivatives") or {}).get("fundingRate", 0) if isinstance(book, dict) else 0
+        ls = (book.get("derivatives") or {}).get("longShortRatio", 0) if isinstance(book, dict) else 0
+        vol_total = ind.get("volume", {}).get("total", 0) if isinstance(ind, dict) else 0
+        buy_vol = ind.get("volume", {}).get("ask", 0) if isinstance(ind, dict) else 0
+        sell_vol = ind.get("volume", {}).get("bid", 0) if isinstance(ind, dict) else 0
+        imb_ema = book.get("imbalance_pct_ema") if isinstance(book, dict) else None
+        tc_1m = tc.get("cvd_usd_1m")
+        tc_5m = tc.get("cvd_usd_5m")
+        tc_pos = tc.get("range_pos_usd")
+
+        bias = self._calc_bias(dom_imb, delta, tape_net, cvd_val, cvd_delta, bid_ratio,
+                               vol_total, buy_vol, sell_vol,
+                               imb_ema=imb_ema, flow_1m=tc_1m, flow_5m=tc_5m)
+        bias_label, bias_emoji = self._bias_label(bias)
+
+        msg = f"📊 {clean}/USDT — QUANT SNAPSHOT | ${price:.4f} [{time_str}]"
+        msg += f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        msg += f"\n⚡ Score: {bias:.0f}/100 {bias_emoji} {bias_label} (book+taker proxy · ⚡ = |score-50| ≥ 10)"
+        msg += f"\n📈 CVD(ATAS): {cvd_val:+,.0f} (Δ{cvd_delta:+,.0f})"
+        if tc_1m is not None:
+            msg += f"\n🌊 Taker flow: 1m {tc_1m:+,.0f}$ / 5m {tc_5m:+,.0f}$"
+            if tc_pos is not None:
+                msg += f" | session pos {tc_pos:.2f}"
+        dom_line = f"\n🏦 DOM: {dom_imb:+.1f}%"
+        if imb_ema is not None:
+            dom_line += f" raw | {imb_ema:+.1f}% avg45s"
+        msg += dom_line + f" | ratio {bid_ratio:.2f}"
+        msg += f"\n📋 Tape: {buy_ct}/{sell_ct} | net {tape_net:+,.0f}"
+        msg += f"\n📍 POC {poc:.4f} | VAH {vah:.4f} | VAL {val:.4f}"
+        msg += f"\n🏚️ Value: {value_loc} | ATR {atr_pct:.0f}%"
+        _oi_notional = (oi * price) if price else 0
+        msg += (f"\n💰 OI: {oi/1e6:.1f}M contracts (~${_oi_notional/1e6:.0f}M) | "
+                f"fund: {funding * 3 * 365 * 100:+.1f}%/yr | LS: {ls:.2f}")
+        msg += f"\n📊 Bid wall: {bid_wall_price:.4f}({bid_wall_vol:.0f}) | Ask wall: {ask_wall_price:.4f}({ask_wall_vol:.0f})"
+        msg += f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        if not ind:
+            msg += "\n🅰️ ATAS footprint is on another symbol — CVD/tape/POC lines n/a here"
+        return msg
+
+    def _calc_bias(self, dom_imb, delta, tape_net, cvd, cvd_delta, bid_ratio,
+                   volume=0.0, tape_buy=0.0, tape_sell=0.0,
+                   imb_ema=None, flow_1m=None, flow_5m=None) -> float:
+        """Snapshot score, 0-100, FIXED composition so it means the same thing on every
+        symbol.
+
+        Terms (all bounded, identical for every symbol):
+            25 * tanh(imb_ema / 30)        45s-averaged book imbalance
+            10 * tanh(flow_1m / 50_000)    taker flow, USD per minute
+            10 * tanh(flow_5m / 200_000)   taker flow, USD per 5 minutes
+             5 * tanh(log(bid_ask_ratio))  book depth ratio
+
+        The earlier version mixed raw-unit terms (delta/100000, tape_net/1000,
+        cvd_delta/100000), so the number tracked contract size: on live data it printed
+        100.0 for SUI, SOL and XAU alike. The ATAS footprint fields (tape, POC, bar
+        delta) still appear as raw numbers in the message but no longer feed the score,
+        because they exist only for the one symbol ATAS is charting.
+        DISPLAY ONLY: the plan trigger is orderflow_calls.py's |composite| >= min_score.
+        This is a proxy — it is not the generator's number.
+        """
+        import math as _m
+        s = 50.0
+        if imb_ema is None:
+            imb_ema = dom_imb
+        if imb_ema is not None:
+            s += 25.0 * _m.tanh((imb_ema or 0) / 30.0)
+        if flow_1m is not None:
+            s += 10.0 * _m.tanh((flow_1m or 0) / 50000.0)
+        if flow_5m is not None:
+            s += 10.0 * _m.tanh((flow_5m or 0) / 200000.0)
+        if bid_ratio and bid_ratio > 0:
+            s += 5.0 * _m.tanh(_m.log(bid_ratio))
+        return round(max(0.0, min(100.0, s)), 1)
+
+    def _snapshot_atas_symbol(self, symbols):
+        """Which configured symbol ATAS is actually exporting right now (or None)."""
+        ind = self._fetch_bridge_data("/indicators")
+        tk = (ind.get("ticker") or "").upper().replace(".P", "") if isinstance(ind, dict) else ""
+        if not tk:
+            return None
+        for s in symbols:
+            if tk == s.split("/")[0].strip().upper() + "USDT":
+                return s
+        return None
+
+    def _build_snapshot_line(self, sym: str) -> str:
+        """One compact line for the symbols without an ATAS footprint: price, score,
+        book imbalance, taker flow, funding, L/S, walls, ATR rank — book + taker only,
+        so every line is the same shape and the score is comparable across symbols."""
+        clean = sym.replace("/USDT:USDT", "").replace("/USDT", "")
+        base = sym.split("/")[0].strip().upper()
+        book = self._fetch_bridge_data("/dom", base.lower() + "usdt")
+        book = book if isinstance(book, dict) else {}
+        ctx = self._fetch_bridge_data("/context", base + "USDT")
+        ctx = ctx if isinstance(ctx, dict) else {}
+        taker = self._fetch_bridge_data("/taker-cvd") or {}
+        tc = taker.get(base + "USDT") or {}
+        bb, ba = book.get("best_bid"), book.get("best_ask")
+        price = (bb + ba) / 2.0 if (bb and ba) else 0
+        imb_raw, imb_ema = book.get("imbalance_pct"), book.get("imbalance_pct_ema")
+        flow_1m, flow_5m = tc.get("cvd_usd_1m"), tc.get("cvd_usd_5m")
+        score = self._calc_bias(imb_raw, 0, 0, 0, 0, book.get("bid_ask_ratio") or 0,
+                                imb_ema=imb_ema, flow_1m=flow_1m, flow_5m=flow_5m)
+        trig = "⚡" if abs(score - 50) >= 10 else "·"
+        parts = [f"{trig} {clean:<5} {('$%.6g' % price) if price else 'n/a':>10} {score:>4.0f}/100"]
+        if imb_ema is not None:
+            parts.append(f"DOM {imb_ema:+.1f}%/45s")
+        elif imb_raw is not None:
+            parts.append(f"DOM {imb_raw:+.1f}%")
+        if flow_1m is not None:
+            parts.append(f"flow {flow_1m:+,.0f}$/1m")
+        der = book.get("derivatives") or {}
+        if der.get("fundingRate") is not None:
+            parts.append(f"fund {der['fundingRate'] * 3 * 365 * 100:+.1f}%/yr")
+        if der.get("longShortRatio"):
+            parts.append(f"LS {der['longShortRatio']:.2f}")
+        wp, ap = book.get("bid_wall_price"), book.get("ask_wall_price")
+        if wp and ap:
+            parts.append(f"walls {wp:.6g}({book.get('bid_wall_vol', 0):,.0f})/"
+                         f"{ap:.6g}({book.get('ask_wall_vol', 0):,.0f})")
+        atr = ((ctx.get("volatility_regime") or {}).get("atr_percentile_rank") or {}).get("value")
+        if atr is not None:
+            parts.append(f"ATR p{float(atr):.0f}")
+        return " · ".join(parts)
+
+    def _bias_label(self, score: float) -> tuple:
+        if score >= 60: return "BULLISH", "🟢"
+        if score <= 40: return "BEARISH", "🔴"
+        return "NEUTRAL", "🟡"
 
     def _interruptible_sleep(self, seconds: float):
         for _ in range(int(seconds)):
@@ -2445,7 +3251,32 @@ class QuantAlertEngine:
                 self._last_stats_log = time.time()
                 self._log_outcome_stats()
 
+            # Periodic quant snapshot — wall-clock aligned (P2, 2026-09-19).
+            # Cards land on :00/:15/:30/:45 (epoch multiples of interval) instead
+            # of drifting from process start. The in-flight guard stops the old
+            # bug where a build outlasting the interval spawned a second thread
+            # and sent a duplicate card.
+            ps = self.config.get('periodic_snapshot')      # pydantic block, not an attribute
+            ps_interval = getattr(ps, 'interval_seconds', 900) if ps else 900
+            ps_enabled = getattr(ps, 'enabled', False) if ps else False
+            if ps_enabled:
+                now_ps = time.time()
+                if self._next_snapshot_at is None:
+                    self._next_snapshot_at = self._next_snapshot_boundary(now_ps, ps_interval)
+                if now_ps >= self._next_snapshot_at and not self._snapshot_inflight:
+                    self._snapshot_inflight = True
+                    self._snapshot_last_send = now_ps
+                    self._next_snapshot_at = self._next_snapshot_boundary(now_ps, ps_interval)
+                    threading.Thread(target=self.send_periodic_snapshot, daemon=True).start()
+
             self._interruptible_sleep(sleep_time)
+
+    @staticmethod
+    def _next_snapshot_boundary(now: float, interval: float) -> float:
+        """Next epoch time strictly after `now` aligned to `interval` seconds
+        (900 -> the next :00/:15/:30/:45)."""
+        iv = max(60, int(interval))
+        return (int(now) // iv + 1) * iv
 
     def _log_outcome_stats(self):
         try:

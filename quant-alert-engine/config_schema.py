@@ -67,6 +67,11 @@ class VolumeConfig(BaseModel):
     spike_mult: float = Field(2.0, gt=0)
     climax_mult: float = Field(3.5, gt=0)
     dryup_mult: float = Field(0.5, gt=0, lt=1)
+    dryup_exit_mult: float = Field(0.8, gt=0, lt=2)
+    state_persistence_bars: int = Field(2, ge=1, le=10)
+    baseline_ttl_seconds: float = Field(21600, gt=0)
+    obv_break_sigma: float = Field(0.75, ge=0, le=5)
+    obv_break_bars: int = Field(2, ge=1, le=10)
     obv_len: int = Field(20, ge=1, le=200)
 
 
@@ -211,6 +216,30 @@ class Level2Config(BaseModel):
     cache_ttl_seconds: float = Field(4.0, ge=1.0, le=60.0, description="Cache bridge reads per symbol to avoid hammering")
 
 
+class WebMacroSourceConfig(BaseModel):
+    """One mandatory-attempt web macro source (info/context only).
+
+    These providers complement CoinGecko/Polymarket/funding with web context
+    (CoinStats, TradingKey, DiarioBitcoin, Coinpedia). They never gate
+    signals; missing pages fail open as unavailable/not_covered."""
+    id: str = Field(..., description="Provider id: coinstats|tradingkey_ta|tradingkey_movers|diariobitcoin|coinpedia")
+    enabled: bool = Field(True, description="Attempt this provider every refresh cycle")
+    ttl_seconds: float = Field(300.0, ge=30.0, le=86400.0, description="Freshness window per provider record")
+    timeout_seconds: float = Field(12.0, ge=3.0, le=60.0, description="Per-request timeout for provider pages")
+    confidence: str = Field("medium", description="Analyst trust tier: high|medium|low")
+
+
+def _default_web_sources() -> List["WebMacroSourceConfig"]:
+    return [
+        WebMacroSourceConfig(id="coinstats", enabled=True, ttl_seconds=120.0, timeout_seconds=12.0, confidence="high"),
+        WebMacroSourceConfig(id="coinmarketcap", enabled=True, ttl_seconds=120.0, timeout_seconds=12.0, confidence="high"),
+        WebMacroSourceConfig(id="tradingkey_ta", enabled=True, ttl_seconds=300.0, timeout_seconds=12.0, confidence="medium"),
+        WebMacroSourceConfig(id="tradingkey_movers", enabled=True, ttl_seconds=900.0, timeout_seconds=12.0, confidence="low"),
+        WebMacroSourceConfig(id="diariobitcoin", enabled=True, ttl_seconds=900.0, timeout_seconds=12.0, confidence="medium"),
+        WebMacroSourceConfig(id="coinpedia", enabled=True, ttl_seconds=1800.0, timeout_seconds=12.0, confidence="low"),
+    ]
+
+
 class MacroConfig(BaseModel):
     """External macro/market-context pipeline (CoinGecko + DefiLlama +
     Polymarket + Binance funding). Complements the engine's technical and
@@ -219,11 +248,40 @@ class MacroConfig(BaseModel):
     signal emission."""
     enabled: bool = Field(False, description="Enable the macro context background pipeline")
     coingecko_key: str = Field("", description="CoinGecko API key (free tier works empty)")
+    cmc_api_key: str = Field("", description="CoinMarketCap API key (env-only; empty = keyless public API)")
     cache_ttl_seconds: float = Field(60.0, ge=10.0, le=900.0, description="Seconds between macro refreshes per symbol")
     predictive_weight: float = Field(0.3, ge=0.0, le=1.0, description="How much Polymarket sentiment influences macro score (0=info only, 1=full gate)")
     max_concurrent_requests: int = Field(3, ge=1, le=10, description="Max concurrent HTTP requests to external APIs")
     max_retries: int = Field(3, ge=1, le=10, description="Max retries per request")
     gate_signals: bool = Field(False, description="If true, suppress counter-macro directional signals; if false, macro is info-only overlay")
+    ath_bear_pct: float = Field(-12.0, ge=-90.0, le=0.0, description="24h change below this flags the overlay bear (asymmetric; wider than the old -10%)")
+    ath_bull_pct: float = Field(15.0, ge=0.0, le=200.0, description="24h change above this flags the overlay bull (asymmetric; wider than the old +10%)")
+    web_sources: List[WebMacroSourceConfig] = Field(default_factory=_default_web_sources, description="Mandatory-attempt web macro providers (info/context only, fail-open)")
+
+
+class MLConfig(BaseModel):
+    """Meta-labeling layer: a supervised filter trained on the engine's own
+    tagged signal outcomes (ml_train.py), scored against the canonical feature
+    vector from features.py.
+
+    Shadow by default: the model scores every signal and records P(pays), but
+    only blocks emission when gate_signals is true. That lets a model be
+    validated live against the existing track record before it is trusted.
+    Fail-open: a missing or broken model never blackholes alerts.
+    """
+    enabled: bool = Field(False, description="Load the meta-label model and score every signal")
+    gate_signals: bool = Field(False, description="If true, suppress signals below min_prob (shadow/log-only when false)")
+    model_path: str = Field("data/ml/meta_model.json", description="Model bundle written by ml_train.py")
+    min_prob: float = Field(0.55, ge=0.0, le=1.0, description="Minimum P(signal pays) required to emit when gating")
+    fail_open: bool = Field(True, description="If the model is missing/broken, keep emitting")
+    window: int = Field(200, ge=60, le=1000, description="Trailing bars for the feature window (must match ml_backfill)")
+    log_features: bool = Field(True, description="Persist the feature vector of every fired signal into signal_features")
+
+
+class PeriodicSnapshotConfig(BaseModel):
+    enabled: bool = False
+    interval_seconds: int = 900
+    symbols: List[str] = Field(default_factory=list)
 
 
 class Settings(BaseSettings):
@@ -250,6 +308,8 @@ class Settings(BaseSettings):
     bridge: BridgeConfig = BridgeConfig()
     level2: Level2Config = Level2Config()
     macro: MacroConfig = MacroConfig()
+    ml: MLConfig = MLConfig()
+    periodic_snapshot: PeriodicSnapshotConfig = PeriodicSnapshotConfig()
     database: str = "data/alerts.db"
 
     @field_validator("timeframes")
@@ -308,7 +368,7 @@ class Config:
             json_data = _normalize_legacy_config(json_data)
             # Strip empty secrets from json so .env / env vars can populate them
             # (otherwise Settings(**json_data) would pass "" and override env)
-            for section, keys in [("telegram", ["token", "chat_id"]), ("exchange", ["api_key", "secret"]), ("macro", ["coingecko_key"])]:
+            for section, keys in [("telegram", ["token", "chat_id"]), ("exchange", ["api_key", "secret"]), ("macro", ["coingecko_key", "cmc_api_key"])]:
                 sec = json_data.get(section)
                 if isinstance(sec, dict):
                     for k in keys:
@@ -392,6 +452,7 @@ class Config:
                 ("exchange", "api_key"): "",
                 ("exchange", "secret"): "",
                 ("macro", "coingecko_key"): "",
+                ("macro", "cmc_api_key"): "",
             }
             if os.path.exists(self.config_file):
                 try:

@@ -16,6 +16,16 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
 
 import aiohttp
 
+from web_macro_providers import (
+    CMC_GLOBAL_TTL_SECONDS,
+    DEFAULT_WEB_SOURCES,
+    fetch_cmc_shared,
+    is_fresh as _web_is_fresh,
+    refresh_web_macro,
+    summarize_cmc_global,
+    summarize_web_macro,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,9 +54,20 @@ class MacroConfig:
     max_concurrent_requests: int = 3
     cache_ttl_seconds: float = 60.0
     predictive_weight: float = 0.3
+    # Asymmetric ATH/drawdown regime thresholds (v2.6). A 24h change must
+    # breach the bear/bull bands to flag the overlay; the wide neutral band
+    # between them absorbs normal chop instead of flipping every cycle.
+    ath_bear_pct: float = -12.0
+    ath_bull_pct: float = 15.0
     # Symbols to track (coin IDs for CoinGecko, protocol slugs for DefiLlama)
     tracked_coins: Dict[str, str] = field(default_factory=dict)  # symbol -> coin_id
     tracked_protocols: List[str] = field(default_factory=list)
+    # CoinMarketCap API key (env-only, never committed). Empty = keyless
+    # public API (lower limits, curated endpoint subset, same envelope).
+    cmc_api_key: str = ""
+    # Web macro providers (info/context only — never gates signals).
+    # Each entry: {id, enabled, ttl_seconds, timeout_seconds, confidence}.
+    web_sources: List[Dict[str, Any]] = field(default_factory=lambda: [dict(d) for d in DEFAULT_WEB_SOURCES])
 
 
 # --------------------------------------------------------------------------- #
@@ -68,6 +89,10 @@ class MacroContextPipeline:
         self._semaphore = asyncio.Semaphore(self.cfg.max_concurrent_requests)
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        # CoinMarketCap market-wide context (fear/greed + global metrics),
+        # cached separately on its own TTL — shared by all symbols.
+        self._cmc_global: Optional[Dict[str, Any]] = None
+        self._cmc_global_ts: float = 0.0
 
     # ------------------------------------------------------------------- #
     # Shared HTTP helper (retry + jitter + concurrency throttle)
@@ -115,6 +140,47 @@ class MacroContextPipeline:
                     return {"ok": False, "error": f"Bad JSON from {url}: {str(e)}"}
         logger.error("All %d retries exhausted for %s: %s", self.cfg.max_retries, url, last_err)
         return {"ok": False, "error": last_err}
+
+    async def _fetch_text(
+        self, session: aiohttp.ClientSession, url: str, timeout: float
+    ) -> Dict[str, Any]:
+        """Page fetch for web-macro providers (HTML). Fail-open."""
+        try:
+            from web_macro_providers import fetch_text as _provider_fetch
+        except ImportError as e:
+            return {"ok": False, "status": 0, "error": f"web providers unavailable: {e}"}
+        return await _provider_fetch(session, url, timeout, max_retries=self.cfg.max_retries)
+
+    async def _fetch_shared_web_pages(self, session: aiohttp.ClientSession) -> Dict[str, Any]:
+        """Fetch once-per-cycle shared pages (bubbles snapshot, movers listing)."""
+        shared: Dict[str, Any] = {}
+        defs = {d.get("id"): d for d in (self.cfg.web_sources or []) if isinstance(d, dict)}
+        if defs.get("coinstats", {}).get("enabled", True):
+            res = await self._fetch_text(
+                session, "https://coinstats.app/crypto-bubbles/",
+                float(defs["coinstats"].get("timeout_seconds", 12.0)),
+            )
+            if res.get("ok"):
+                shared["coinstats_bubbles"] = res["text"]
+        if defs.get("tradingkey_movers", {}).get("enabled", True):
+            res = await self._fetch_text(
+                session, "https://www.tradingkey.com/news/market-movers",
+                float(defs["tradingkey_movers"].get("timeout_seconds", 12.0)),
+            )
+            if res.get("ok"):
+                shared["tk_movers_listing"] = res["text"]
+        # CoinMarketCap shared batch: quotes + fear/greed + global metrics.
+        if defs.get("coinmarketcap", {}).get("enabled", True):
+            try:
+                shared["cmc"] = await fetch_cmc_shared(
+                    session,
+                    api_key=self.cfg.cmc_api_key or "",
+                    timeout=float(defs["coinmarketcap"].get("timeout_seconds", 12.0)),
+                    max_retries=self.cfg.max_retries,
+                )
+            except Exception as e:
+                logger.debug("CMC shared fetch failed (fail-open): %s", str(e)[:100])
+        return shared
 
     # ------------------------------------------------------------------- #
     # CoinGecko v4: spot price, volume, 24h change
@@ -309,13 +375,20 @@ class MacroContextPipeline:
     # ATH/DWD: distance from all-time high
     # ------------------------------------------------------------------- #
     def compute_ath_dwd(self, price_usd: Optional[float], change_24h: Optional[float]) -> Dict[str, Any]:
-        """Heuristic ATH/DWD from CoinGecko data + 24h change."""
+        """Heuristic ATH/DWD from CoinGecko data + 24h change.
+
+        Asymmetric bands (v2.6): a 24h drawdown must breach
+        `ath_bear_pct` (default -12%) to flag bear and a 24h rally must
+        breach `ath_bull_pct` (default +15%) to flag bull. The wide neutral
+        band between them stops a normal pullback from flipping the overlay."""
         if price_usd is None:
             return {"ath_dwd": None, "regime_hint": "unknown"}
+        bear_pct = float(getattr(self.cfg, "ath_bear_pct", -12.0) or -12.0)
+        bull_pct = float(getattr(self.cfg, "ath_bull_pct", 15.0) or 15.0)
         # If 24h change is very negative, likely far from ATH (distribution)
-        if change_24h is not None and change_24h < -10:
+        if change_24h is not None and change_24h < bear_pct:
             return {"ath_dwd": "deep_drawdown", "regime_hint": "bear"}
-        elif change_24h is not None and change_24h > 10:
+        elif change_24h is not None and change_24h > bull_pct:
             return {"ath_dwd": "near_ath", "regime_hint": "bull"}
         return {"ath_dwd": "moderate", "regime_hint": "neutral"}
 
@@ -349,7 +422,7 @@ class MacroContextPipeline:
                 "macro_prediction_sentiment": results[2],
             }
         if session is None:
-            async with aiohttp.ClientSession() as s:
+            async with aiohttp.ClientSession(max_line_size=65536, max_field_size=65536) as s:
                 return await _do_gather(s)
         return await _do_gather(session)
 
@@ -400,6 +473,19 @@ class MacroContextPipeline:
                     parts.append(f"Prediction '{q}' active")
         else:
             parts.append("No prediction markets found")
+
+        web = context.get("web_macro")
+        if isinstance(web, dict) and web:
+            try:
+                parts.append(summarize_web_macro(web))
+            except Exception:
+                pass
+        gweb = context.get("web_macro_global")
+        if isinstance(gweb, dict) and (gweb.get("fear_greed") or gweb.get("global")):
+            try:
+                parts.append(summarize_cmc_global(gweb))
+            except Exception:
+                pass
 
         return " | ".join(parts)
 
@@ -462,18 +548,26 @@ class MacroContextPipeline:
         """
         while self._running:
             try:
-                async with aiohttp.ClientSession() as session:
+                # Raised header limits: some editorial pages (Coinpedia) send
+                # very large response headers that trip aiohttp's defaults.
+                async with aiohttp.ClientSession(max_line_size=65536, max_field_size=65536) as session:
                     coin_ids = [
                         self.cfg.tracked_coins.get(s, s.lower().replace("/", "-"))
                         for s in symbols
                     ]
                     batch_pricing = await self.fetch_token_metrics_batch(session, coin_ids)
+                    # Shared web-macro pages, fetched once per cycle (fail-open).
+                    try:
+                        shared_pages = await self._fetch_shared_web_pages(session)
+                    except Exception as e:
+                        logger.debug("Shared web pages fetch failed (fail-open): %s", str(e)[:100])
+                        shared_pages = {}
 
                     async def _delayed(i: int, sym: str, cid: str) -> None:
                         if i:
                             await asyncio.sleep(i * 1)
                         pr = batch_pricing.get(cid, {"error": "batch pricing unavailable"})
-                        await self._refresh_symbol(session, sym, cid, pricing=pr)
+                        await self._refresh_symbol(session, sym, cid, pricing=pr, shared_pages=shared_pages)
 
                     await asyncio.gather(
                         *(_delayed(i, s, c) for i, (s, c) in enumerate(zip(symbols, coin_ids))),
@@ -495,11 +589,13 @@ class MacroContextPipeline:
         symbol: str,
         coin_id: str,
         pricing: Optional[Dict[str, Any]] = None,
+        shared_pages: Optional[Dict[str, Any]] = None,
     ):
         """Fetch and cache macro data for a single symbol.
 
         Pricing comes pre-fetched from the per-cycle batch call; only
-        Polymarket sentiment + funding are fetched here.
+        Polymarket sentiment + funding are fetched here. Web macro providers
+        (info/context only) refresh here too — fail-open, never blocking.
         """
         try:
             if pricing is None:
@@ -513,6 +609,50 @@ class MacroContextPipeline:
             price = pricing.get("price_usd") if isinstance(pricing, dict) else None
             chg = pricing.get("change_24h_percent") if isinstance(pricing, dict) else None
             ath_dwd = self.compute_ath_dwd(price, chg)
+            # Web macro context (info-only): reuse fresh records, fail-open.
+            base = (symbol.split("/")[0] if "/" in symbol else symbol).split(":")[0]
+            prev_ctx = self._cache.get(symbol)
+            prev_web = prev_ctx[1].get("web_macro") if isinstance(prev_ctx, tuple) else None
+
+            # Bind the per-cycle session. refresh_web_macro invokes its fetch
+            # callable as fetch_text_fn(url, timeout) — 2 args — whereas
+            # _fetch_text takes (session, url, timeout). Passing the unbound
+            # method raised TypeError on every crypto fetch and blanked the
+            # whole web_macro context (web_total=0).
+            async def _web_fetch(url: str, timeout: float) -> Dict[str, Any]:
+                return await self._fetch_text(session, url, timeout)
+
+            try:
+                web_macro = await refresh_web_macro(
+                    _web_fetch, symbol, base, coin_id,
+                    sources=self.cfg.web_sources,
+                    shared=shared_pages or {},
+                    previous=prev_web if isinstance(prev_web, dict) else {},
+                    cmc_api_key=self.cfg.cmc_api_key or "",
+                )
+            except Exception as e:
+                logger.debug("Web macro refresh failed for %s (fail-open): %s", symbol, str(e)[:100])
+                web_macro = prev_web if isinstance(prev_web, dict) else {}
+            # CoinMarketCap market-wide context (fear/greed + global metrics):
+            # symbol-independent, cached on its own TTL, attached to every
+            # symbol context as info-only context.
+            try:
+                _cmc = (shared_pages or {}).get("cmc") or {}
+                if _cmc.get("fear_greed") or _cmc.get("global"):
+                    self._cmc_global = {
+                        "retrieved_at": _cmc.get("retrieved_at"),
+                        "keyed": bool(_cmc.get("keyed")),
+                        "fear_greed": _cmc.get("fear_greed"),
+                        "global": _cmc.get("global"),
+                        "errors": _cmc.get("errors") or {},
+                    }
+                    self._cmc_global_ts = time.time()
+                web_macro_global: Dict[str, Any] = {}
+                if self._cmc_global and (time.time() - self._cmc_global_ts) < CMC_GLOBAL_TTL_SECONDS:
+                    web_macro_global = self._cmc_global
+            except Exception as e:
+                logger.debug("CMC global attach failed for %s (fail-open): %s", symbol, str(e)[:100])
+                web_macro_global = {}
 
             full_context = {
                 "market_pricing": pricing,
@@ -521,6 +661,8 @@ class MacroContextPipeline:
                 "funding_rate": fr.get("funding_rate"),
                 "next_funding_rate": fr.get("next_funding_rate"),
                 "ath_dwd": ath_dwd,
+                "web_macro": web_macro,
+                "web_macro_global": web_macro_global,
             }
             self.set_context(symbol, full_context)
             logger.debug("Macro context refreshed for %s: price=%s, regime=%s", symbol, price, ath_dwd.get("regime_hint"))

@@ -34,7 +34,7 @@ quant-alert-engine ──POSTs──▶ atas-bridge /quant-alert (one-way forwar
 - `quant-alert-engine/`: `setup_windows.bat` (creates `venv`), copy config template,
   create `.env` from `.env.example`, `pip install -r requirements.txt`
 - `atas-bridge/`: `pip install -r requirements.txt`, create `.env` from `.env.example`
-- `tradingview-bridge/`: `npm install`, copy `rules.example.json` → `rules.json`
+- `tradingview-bridge/`: `npm install`, copy `morning-rules.example.json` → `morning-rules.json`
 
 ## Secret hygiene
 

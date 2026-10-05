@@ -195,6 +195,10 @@ async function runAnalysis() {
   try { ctx = await lxRequest(`/context/${ticker}`).catch(()=>null); } catch(_){ ctx=null; }
   let stats = null;
   try { stats = await lxRequest(`/calls/stats`).catch(()=>null); } catch(_){ stats=null; }
+  // Binance book for the 45s-averaged DOM (audit C-3: scoring MUST use the EMA,
+  // never the raw top-15 snapshot). Fail-soft: raw ATAS imbalance as fallback.
+  let domBook = null;
+  try { domBook = await lxRequest(`/dom/${ticker.toLowerCase()}`).catch(()=>null); } catch(_){ domBook=null; }
   let expMed = ctx?.expected_move?.value ?? 0.44; // percent points (0.44 = 0.44%)
   let expP90 = ctx?.expected_move?.confidence_interval?.[1] ?? expMed * 4.6;
   // Normalize if API returns fraction (<0.05) vs percent points
@@ -208,26 +212,89 @@ async function runAnalysis() {
   const buyLvls = lvls.filter(l=> (l.delta||0) > 0).length;
   const sellLvls = lvls.filter(l=> (l.delta||0) < 0).length;
   const fpDepth = lvls.length ? buyLvls/lvls.length : 0.5;
-  // Scores 0-10
-  const sDom = Math.max(0, Math.min(10, 5 + Number(domImb||0)*0.125)); // 40% -> 0/10, fixes 20% cap
+  // Scores 0-10 — SAME formulas as signal_engine.py (audit 2026-09-21).
+  // sDom: sigmoid on the 45s EMA (audit C-3). imb=0 -> 5, ±75 -> ~8.8/1.2.
+  const emaImbRaw = (domBook && domBook.imbalance_pct_ema != null) ? domBook.imbalance_pct_ema : domImb;
+  const emaImb = Number(emaImbRaw) || 0;
+  const emaSrc = (domBook && domBook.imbalance_pct_ema != null) ? 'avg45s' : 'raw-fallback';
+  const _sx = emaImb / 40.0;
+  const sDom = Math.max(0, Math.min(10, Math.round((5.0 + 5.0 * (2.0 / (1.0 + Math.exp(-_sx)) - 1.0)) * 100) / 100));
   const totalVol = (Number(buyVol)||0) + (Number(sellVol)||0);
   const volRatio = totalVol ? (Number(buyVol)||0)/totalVol : 0.5;
   const cntRatio = (Number(buyPct)||50)/100;
   const sTape = Math.round(((0.70*volRatio + 0.30*cntRatio)*10)*100)/100; // volume-weighted 70/30
-  const sClimax = deltaRatio < 0.05 ? 3.0 : deltaRatio > 0.40 ? 8.5 : 6.0; // absorption
+  // sClimax SIGNED (audit C1): +1 all-buying -> 10, 0 absorbed -> 5, -1 all-selling -> 0.
+  // The old discrete version scored a sell climax 8.5/10 = bullish. Never again.
+  const _dr = volTotal ? Math.max(-1, Math.min(1, deltaNum / volTotal)) : 0;
+  const sClimax = Math.round((5.0 + 5.0 * Math.tanh(_dr / 0.25)) * 100) / 100; // absorption
   const sFpDepth = fpDepth*10;
   const sFpConf = lvls.length >= 2 ? 10 : 5;
-  // Weighted bias (rules.json weights 25/25/20/15/15) — same as signal_engine.py
+  // Weighted bias (rules.json scoring_weights 25/25/20/15/15) — same as signal_engine.py
   biasScore = Math.round(((sFpDepth*25 + sDom*25 + sTape*20 + sClimax*15 + sFpConf*15)/100)*10);
   biasScore = Math.max(0, Math.min(100, biasScore));
-  if (sDom >= 6.5) biasReasons.push(`DOM ${(Number(domImb)).toFixed(1)}% bid (${sDom.toFixed(1)}/10)`);
-  else if (sDom <= 3.5) biasReasons.push(`DOM ${(Number(domImb)).toFixed(1)}% ask (${sDom.toFixed(1)}/10)`);
-  else biasReasons.push(`DOM neutral ${(Number(domImb)).toFixed(1)}%`);
+  const biasLabel = biasScore >= 60 ? 'bullish' : (biasScore <= 40 ? 'bearish' : 'neutral');
+  // Coverage gate 0.75 + explicit footprint verifiability (audit H-2).
+  // No footprint at all scores 0.60 and MUST NOT pass.
+  const covReal = (lvls.length > 0 ? 25 : 0) + (lvls.length >= 2 ? 15 : 0)
+    + ((emaImb !== 0 || Number(domImb) !== 0) ? 25 : 0)
+    + (((Number(buyVol) || 0) > 0 || (Number(sellVol) || 0) > 0) ? 20 : 0)
+    + (volTotal > 0 ? 15 : 0);
+  const coverage = covReal / 100;
+  const fpStatus = lvls.length >= 4 ? 'ok' : (lvls.length >= 1 ? 'partial' : 'absent');
+  // R6/R7 full legs (rules.json v3.3). CVD consecutives from closed bar_deltas;
+  // footprint legs need ≥70% one-sided volume; DOM leg on the EMA, not raw.
+  const cvT = (cvd && cvd[ticker]) || {};
+  const _deltas = Array.isArray(cvT.bar_deltas) ? cvT.bar_deltas : [];
+  const _cleanCvd = (cvT.continuity || 'clean') !== 'post-gap';
+  let _up = 0, _dn = 0;
+  for (let i = _deltas.length - 1; i >= 0; i--) { if (_deltas[i] > 0) _up++; else break; }
+  for (let i = _deltas.length - 1; i >= 0; i--) { if (_deltas[i] < 0) _dn++; else break; }
+  const _lvlSide = (l, side) => { const t = (Number(l.bid) || 0) + (Number(l.ask) || 0); return t > 0 && ((Number(l[side]) || 0) / t) >= 0.70; };
+  const _sellDomLvls = lvls.filter((l) => _lvlSide(l, 'bid')).length;
+  const _buyDomLvls = lvls.filter((l) => _lvlSide(l, 'ask')).length;
+  const r6 = _cleanCvd && _dn >= 2 && lvls.length >= 4 && _sellDomLvls >= 4 && emaImb < 5;
+  const r7 = _cleanCvd && _up >= 2 && lvls.length >= 3 && _buyDomLvls >= 3 && emaImb > 10;
+  // Trigger + contradiction vetoes (v3.3: score ranks/triggers, never band-gates).
+  const compScore = Math.round(2.0 * (biasScore - 50) * 10) / 10; // generator scale
+  const MIN_SCORE = 20.0;
+  let tradePlanAllowed = true;
+  const blockReasons = [];
+  if (r6 && biasLabel === 'bullish') { tradePlanAllowed = false; blockReasons.push('R6 distribution contradicts long'); }
+  if (r7 && biasLabel === 'bearish') { tradePlanAllowed = false; blockReasons.push('R7 accumulation contradicts short'); }
+  if (coverage < 0.75) { tradePlanAllowed = false; blockReasons.push(`low_data_coverage_${coverage.toFixed(2)}`); }
+  if (fpStatus !== 'ok') { blockReasons.push(`rules_67_unverifiable_footprint_${fpStatus}`); }
+  // DOM-leg persistence: EMA side must hold 3 consecutive analyses (audit C-3).
+  if (!globalThis.__legc) globalThis.__legc = {};
+  const _streak = globalThis.__legc[ticker] || [];
+  _streak.push(emaImb > 10 ? 1 : (emaImb < 5 ? -1 : 0));
+  while (_streak.length > 3) _streak.shift();
+  globalThis.__legc[ticker] = _streak;
+  const _want = compScore > 0 ? 1 : -1;
+  const persistOk = _streak.length === 3 && _streak.every((x) => x === _want);
+  // Canonical geometry + cost gate (plan_gate.py equivalent — audit C-2/action 9).
+  const _mid = Number(price) || 0;
+  const _half = _mid * 0.0005;
+  const _slD = _mid * (expMed / 100) * 0.85;
+  let _t1D = _mid * (expMed / 100) * 1.0;
+  const _t2D = _mid * (expMed / 100) * 1.8 * ((expMed && expP90) ? (expP90 / expMed) : 4.6);
+  const _costR = (_mid > 0 && _slD > 0) ? (8.0 / 10000) * _mid / _slD : Infinity;
+  _t1D = Math.max(_t1D, 1.5 * _slD);
+  const _t1OverSl = _slD > 0 ? _t1D / _slD : 0;
+  const _breakeven = (1 + Math.min(_costR, 9)) / (1 + _t1OverSl);
+  const gateRejects = [];
+  if (_costR > 0.25) gateRejects.push(`cost_r ${_costR.toFixed(3)}R > 0.25R`);
+  if (_breakeven > 0.55) gateRejects.push(`breakeven ${_breakeven.toFixed(3)} > 0.55`);
+  const fires = tradePlanAllowed && Math.abs(compScore) >= MIN_SCORE && persistOk && gateRejects.length === 0 && _mid > 0;
+  if (sDom >= 6.5) biasReasons.push(`DOM ${emaImb.toFixed(1)}% ${emaSrc} bid (${sDom.toFixed(1)}/10)`);
+  else if (sDom <= 3.5) biasReasons.push(`DOM ${emaImb.toFixed(1)}% ${emaSrc} ask (${sDom.toFixed(1)}/10)`);
+  else biasReasons.push(`DOM neutral ${emaImb.toFixed(1)}% ${emaSrc}`);
   biasReasons.push(`Tape ${sTape.toFixed(1)}/10 vol-wtd` + (Number(sellPct)>60?` Sell ${sellPct}%`:` Buy ${buyPct}%`));
-  biasReasons.push(`Climax ${sClimax}/10 (Δ/vol ${(deltaRatio*100).toFixed(1)}%)`);
-  biasReasons.push(`Footprint ${buyLvls}B/${sellLvls}S ${sFpDepth.toFixed(0)}/10`);
+  biasReasons.push(`Climax ${sClimax}/10 signed (Δ/vol ${(100 * (volTotal ? deltaNum / volTotal : 0)).toFixed(1)}%)`);
+  biasReasons.push(`Footprint ${buyLvls}B/${sellLvls}S ${sFpDepth.toFixed(0)}/10 (coverage ${coverage.toFixed(2)}, fp ${fpStatus})`);
+  biasReasons.push(`R6 ${r6 ? 'PASS' : `fail(dn${_dn}/lvl${_sellDomLvls}/ema${emaImb.toFixed(0)})`} · R7 ${r7 ? 'PASS' : `fail(up${_up}/lvl${_buyDomLvls}/ema${emaImb.toFixed(0)})`}`);
   biasReasons.push(Number(cvdVal) > Number(prevCvd) ? 'CVD subiendo' : 'CVD bajando');
   if (deltaNum > 0) biasReasons.push(`Delta +${deltaNum.toFixed(1)}`); else biasReasons.push(`Delta ${deltaNum.toFixed(1)}`);
+  biasReasons.push(`Trigger |score| ${Math.abs(compScore).toFixed(1)} vs ${MIN_SCORE} · persist [${_streak.join(',')}]${persistOk ? '' : ' WAIT'} · cost ${_costR === Infinity ? 'n/a' : _costR.toFixed(3) + 'R'}`);
 
   let bias = 'NEUTRO';
   if (biasScore >= 60) bias = 'BULL';
@@ -235,34 +302,34 @@ async function runAnalysis() {
 
   let plan = '';
   const p = Number(price) || 0;
-  if (biasScore >= 60) {
-    const halfEntry = p * 0.0015; // 0.15% zone around live
-    const slDist = p * (expMed/100) * 0.85;
-    const t1Dist = p * (expMed/100);
-    const t2Dist = p * (expMed/100) * 1.8;
-    const entryLow = p - halfEntry, entryHigh = p + halfEntry;
-    plan = `🟢 PLAN LONG\nEntry: ${entryLow.toFixed(2)} – ${entryHigh.toFixed(2)} (live $${p.toFixed(2)} ±0.15%)\nStop: ${(entryLow - slDist).toFixed(2)} (invalida cierre < SL)\nT1: ${(entryHigh + t1Dist).toFixed(2)} | T2: ${(entryHigh + t2Dist).toFixed(2)} (med ${expMed.toFixed(2)}% / p90 ${expP90.toFixed(2)}%)`;
-    // log call for stats
+  // REAL (audit 2026-09-21): canonical builder math, same as
+  // atas-bridge/orderflow_calls.build_plan (entry ±0.05%, stop 0.85×med,
+  // T1 ≥ 1.5×stop, T2 1.8×med×p90/med). A plan posts to /calls ONLY when
+  // fires = vetoes pass + trigger + 3-poll persistence + cost gate.
+  // Legacy ±0.15%/T1-1.16x geometry is gone; so is band gating (R10 v3.3).
+  const _planBody = (direction, entryLow, entryHigh, sl, t1, t2) => {
+    const tag = direction === 'long' ? '🟢 PLAN LONG' : '🔴 PLAN SHORT';
+    const inv = direction === 'long' ? 'cierre < SL' : 'cierre > SL';
+    import('http').then(h=>{
+      const body=JSON.stringify({symbol:ticker,direction,entry_low:Number(entryLow.toFixed(2)),entry_high:Number(entryHigh.toFixed(2)),sl:Number(sl.toFixed(2)),t1:Number(t1.toFixed(2)),t2:Number(t2.toFixed(2)),note:`tg-bot live-anchored ${p.toFixed(2)}`});
+      const req=h.request({hostname:'127.0.0.1',port:8000,path:'/calls',method:'POST',headers:{'Content-Type':'application/json'}},()=>{});
+      req.on('error',()=>{}); req.write(body); req.end();
+    }).catch(()=>{});
+    return `${tag}\nEntry: ${entryLow.toFixed(2)} – ${entryHigh.toFixed(2)} (live $${p.toFixed(2)} ±0.05%)\nStop: ${sl.toFixed(2)} (invalida ${inv})\nT1: ${t1.toFixed(2)} | T2: ${t2.toFixed(2)} (med ${expMed.toFixed(2)}% / p90 ${expP90.toFixed(2)}% · T1/SL ${_t1OverSl.toFixed(2)} · cost ${_costR.toFixed(3)}R)`;
+  };
+  if (fires && compScore > 0) {
+    plan = _planBody('long', _mid - _half, _mid + _half, (_mid - _half) - _slD, (_mid + _half) + _t1D, (_mid + _half) + _t2D);
     try { await lxRequest(`/calls`); } catch(_){}
-    import('http').then(h=>{
-      const body=JSON.stringify({symbol:ticker,direction:'long',entry_low:Number(entryLow.toFixed(2)),entry_high:Number(entryHigh.toFixed(2)),sl:Number((entryLow-slDist).toFixed(2)),t1:Number((entryHigh+t1Dist).toFixed(2)),t2:Number((entryHigh+t2Dist).toFixed(2)),bias_score:biasScore,note:`tg-bot live-anchored ${p.toFixed(2)}`});
-      const req=h.request({hostname:'127.0.0.1',port:8000,path:'/calls',method:'POST',headers:{'Content-Type':'application/json'}},()=>{});
-      req.on('error',()=>{}); req.write(body); req.end();
-    }).catch(()=>{});
-  } else if (biasScore <= 40) {
-    const halfEntry = p * 0.0015;
-    const slDist = p * (expMed/100) * 0.85;
-    const t1Dist = p * (expMed/100);
-    const t2Dist = p * (expMed/100) * 1.8;
-    const entryLow = p - halfEntry, entryHigh = p + halfEntry;
-    plan = `🔴 PLAN SHORT\nEntry: ${entryLow.toFixed(2)} – ${entryHigh.toFixed(2)} (live $${p.toFixed(2)} ±0.15%)\nStop: ${(entryHigh + slDist).toFixed(2)} (invalida cierre > SL)\nT1: ${(entryLow - t1Dist).toFixed(2)} | T2: ${(entryLow - t2Dist).toFixed(2)} (med ${expMed.toFixed(2)}% / p90 ${expP90.toFixed(2)}%)`;
-    import('http').then(h=>{
-      const body=JSON.stringify({symbol:ticker,direction:'short',entry_low:Number(entryLow.toFixed(2)),entry_high:Number(entryHigh.toFixed(2)),sl:Number((entryHigh+slDist).toFixed(2)),t1:Number((entryLow-t1Dist).toFixed(2)),t2:Number((entryLow-t2Dist).toFixed(2)),bias_score:biasScore,note:`tg-bot live-anchored ${p.toFixed(2)}`});
-      const req=h.request({hostname:'127.0.0.1',port:8000,path:'/calls',method:'POST',headers:{'Content-Type':'application/json'}},()=>{});
-      req.on('error',()=>{}); req.write(body); req.end();
-    }).catch(()=>{});
+  } else if (fires && compScore < 0) {
+    plan = _planBody('short', _mid - _half, _mid + _half, (_mid + _half) + _slD, (_mid - _half) - _t1D, (_mid - _half) - _t2D);
+    try { await lxRequest(`/calls`); } catch(_){}
   } else {
-    plan = `🟡 NEUTRO — Esperar confirmación (bias ${biasScore} en 40-59, Rule 10: sin plan)`;
+    const why = [];
+    if (!tradePlanAllowed) why.push(...blockReasons);
+    if (Math.abs(compScore) < MIN_SCORE) why.push(`trigger ${Math.abs(compScore).toFixed(1)}<${MIN_SCORE}`);
+    if (!persistOk) why.push(`persist [${_streak.join(',')}]`);
+    why.push(...gateRejects);
+    plan = `🟡 SIN PLAN — ${why.join(' · ') || 'sin dirección'}`;
   }
 
   const timestamp = new Date().toLocaleString('es-ES', { timeZone: 'America/Mexico_City' });

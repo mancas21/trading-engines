@@ -5,13 +5,13 @@ import * as core from "../core/morning.js";
 export function registerMorningTools(server) {
   server.tool(
     "morning_brief",
-    "Scan your watchlist, read all indicator values, and return structured data for a session brief. Reads rules.json for your bias criteria and watchlist. Claude applies the rules to generate your daily bias.",
+    "Scan your watchlist, read all indicator values, and return structured data for a session brief. Reads morning-rules.json for your bias criteria and watchlist. Claude applies the rules to generate your daily bias.",
     {
       rules_path: z
         .string()
         .optional()
         .describe(
-          "Optional path to rules.json. Defaults to rules.json in the project root.",
+          "Optional path to morning-rules.json. Defaults to morning-rules.json in the project root.",
         ),
     },
     async ({ rules_path } = {}) => {
