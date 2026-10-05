@@ -1640,22 +1640,38 @@ class QuantAlertUI(QMainWindow):
 
 
 if __name__ == "__main__":
-    from quant_alert_engine import SingleInstanceLock
+    from quant_alert_engine import SingleInstanceLock, ALREADY_RUNNING_EXIT
     _lock = SingleInstanceLock('data/engine.lock')
     if not _lock.acquire():
-        # Phase 5: silent exit left users thinking the app was broken.
-        # No QApplication exists yet, so use the native message box.
+        # Phase 5: silent exit left users thinking the app was broken. The message
+        # is still shown, but it must NOT block on the user.
+        #
+        # Fix flashing-dialog loop (2026-10-05): this used
+        # ctypes.windll.user32.MessageBoxW, which BLOCKS until the user clicks
+        # Aceptar. The process therefore never exited, so the supervisor never saw
+        # a crash, its fast-fail guard never tripped, and every restart popped a
+        # fresh dialog on top of the previous one -- an unstoppable stack of
+        # flashing windows, forever, each one holding a stale claim on the
+        # engine's port and config.
+        #
+        # Two changes:
+        #  1. MB_SERVICE_NOTIFICATION (0x00200000) makes the notice NON-MODAL, so
+        #     nothing waits on input and the process can exit immediately.
+        #  2. Exit with ALREADY_RUNNING_EXIT, which the supervisor treats as
+        #     "another live instance owns the app": it backs off and stops instead
+        #     of restarting a child that cannot possibly succeed.
         try:
             import ctypes
             ctypes.windll.user32.MessageBoxW(
                 None,
                 "Quant Alert Engine Pro is already running.\n\n"
-                "Check the taskbar / system tray — only one instance "
+                "Check the taskbar / system tray -- only one instance "
                 "is allowed (duplicate engines send duplicate Telegram alerts).",
-                "Already running", 0x40)
+                "Already running",
+                0x40 | 0x00200000)  # MB_ICONINFORMATION | MB_SERVICE_NOTIFICATION
         except Exception:
             pass
-        sys.exit(1)
+        sys.exit(ALREADY_RUNNING_EXIT)
     win = None
     _exit_code = 0
     try:

@@ -145,6 +145,16 @@ class TimeframeCadence:
         self._next_due[(symbol, timeframe)] = now + FAIL_RETRY_SECONDS
 
 
+# Exit code the UI uses when it refuses to start because another live instance
+# already owns data/engine.lock. It is deliberately NOT 1, which is the generic
+# crash code: the supervisor restarts on 1, so a refusal reported as a crash is
+# guaranteed to fail the same way and retry forever. Keep this value in sync
+# with ALREADY_RUNNING_EXIT in qae_supervisor.py (which cannot import this
+# module — it is a lightweight watchdog that must start even when the engine's
+# dependencies are broken, which is exactly when it is needed most).
+ALREADY_RUNNING_EXIT = 3
+
+
 class SingleInstanceLock:
     """Prevents two engine/UI instances from running against the same config."""
 

@@ -28,6 +28,15 @@ Fixed policy:
 A stop file (`data/supervisor.stop`) also ends the loop cleanly; `stop-qae.ps1`
 uses it in addition to force-killing.
 
+Third state added 2026-10-05 — exit code ALREADY_RUNNING_EXIT (3):
+  the child refused to start because another live instance owns
+  data/engine.lock. Not a crash, and no restart can fix it, so the supervisor
+  stops and lets the instance that already holds the lock keep running. This
+  exit code used to be 1, which fell into the crash branch and produced an
+  unstoppable pile of flashing "Already running" dialogs. The supervisor is
+  also single-instance now (`data/supervisor.lock`), because two supervisors
+  each spawning a UI is what put that dialog loop in motion.
+
 Config (env vars):
   QAE_PYTHON    interpreter to run the UI with (default: the one the old
                 supervisor already used, so nothing else changes)
@@ -51,8 +60,16 @@ LOG = os.path.join(LOGDIR, "qae_supervisor.log")
 CHILD_LOG = os.path.join(LOGDIR, "qae_stdout.log")
 CHILD_ERR = os.path.join(LOGDIR, "qae_stderr.log")
 STOP_FILE = os.path.join(HERE, "data", "supervisor.stop")
+# The supervisor's own single-instance marker. See _acquire_supervisor_lock.
+SUPERVISOR_LOCK = os.path.join(HERE, "data", "supervisor.lock")
 
 RESTART_DELAY_S = 3.0
+# Exit code quant_alert_ui.py uses when it refuses to start because another
+# live instance owns data/engine.lock. MUST stay in sync with
+# ALREADY_RUNNING_EXIT in quant_alert_engine.py. It is hardcoded rather than
+# imported on purpose: the supervisor must be able to start even when the
+# engine's dependencies are broken, which is precisely when recovery matters.
+ALREADY_RUNNING_EXIT = 3
 
 
 def log(msg: str):
@@ -65,7 +82,86 @@ def log(msg: str):
         pass
 
 
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                                 capture_output=True, text=True, timeout=10)
+            return str(pid) in out.stdout
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _acquire_supervisor_lock() -> bool:
+    """Make the supervisor itself single-instance.
+
+    Root cause of the 2026-10-05 flashing-window incident: two supervisors ran
+    at once (PIDs 21552 and 25496), each spawning its own UI. One UI won
+    data/engine.lock; the other blocked forever on a modal "Already running"
+    dialog. Two supervisors is the seed of that loop, so the supervisor must not
+    be startable twice. Same O_CREAT|O_EXCL + PID-liveness scheme as the engine's
+    SingleInstanceLock, which it cannot import.
+    """
+    for _ in range(5):
+        try:
+            fd = os.open(SUPERVISOR_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            pass
+        except OSError as e:
+            log(f"Could not create supervisor lock: {e}")
+            return False
+        try:
+            with open(SUPERVISOR_LOCK, "r") as f:
+                pid = int(f.read().strip() or 0)
+        except (ValueError, OSError):
+            pid = 0
+        if pid > 0 and _pid_alive(pid):
+            log(f"Another supervisor is already running (PID {pid}) — "
+                f"this one will exit so there is only ever one.")
+            return False
+        log(f"Removing stale supervisor lock from dead PID {pid}.")
+        try:
+            os.remove(SUPERVISOR_LOCK)
+        except OSError:
+            pass
+        time.sleep(0.05)
+    log("Could not acquire the supervisor lock after 5 retries.")
+    return False
+
+
+def _release_supervisor_lock():
+    try:
+        with open(SUPERVISOR_LOCK, "r") as f:
+            if int(f.read().strip() or 0) != os.getpid():
+                return  # someone else's lock; leave it alone
+    except (ValueError, OSError):
+        return
+    try:
+        os.remove(SUPERVISOR_LOCK)
+    except OSError:
+        pass
+
+
 def main() -> int:
+    try:
+        return _main()
+    finally:
+        _release_supervisor_lock()
+
+
+def _main() -> int:
     python = os.environ.get("QAE_PYTHON") or DEFAULT_PYTHON
     child = os.environ.get("QAE_CHILD") or os.path.join(HERE, "quant_alert_ui.py")
     max_fast = int(os.environ.get("QAE_MAX_FAST_FAILS", "5"))
@@ -77,6 +173,12 @@ def main() -> int:
     if not os.path.exists(child):
         log(f"FATAL: child script not found: {child}")
         return 2
+
+    # Only one supervisor may exist. A second one respawns the UI into a lock
+    # conflict it can never win, which is how the flashing dialogs started.
+    if not _acquire_supervisor_lock():
+        log("Supervisor not started — another supervisor already owns the app.")
+        return 0
 
     log(f"QAE supervisor started (child={os.path.basename(child)}) "
         f"clean exit stops the loop; restart only on crash "
@@ -125,6 +227,18 @@ def main() -> int:
             code = 1
 
         ran = time.time() - started
+
+        # -- another live instance owns data/engine.lock ----------------------
+        # This is NOT a crash and restarting cannot fix it: the child will lose
+        # the same race every time. Historically it exited 1, which landed in the
+        # crash branch below and produced the endless stack of flashing "Already
+        # running" dialogs. Stop the supervisor instead and let the instance that
+        # already owns the lock stay in charge.
+        if code == ALREADY_RUNNING_EXIT:
+            log("UI refused to start: another instance already holds "
+                "data/engine.lock — not restarting, the running instance owns "
+                "the app. (This is expected if you launched a second copy.)")
+            return 0
 
         # -- clean exit: the user closed the window. THIS is the fix. --
         if code == 0:

@@ -49,11 +49,16 @@ foreach ($p in $children) {
 }
 if ($children.Count -eq 0) { Write-Host "  no UI/engine process running" -ForegroundColor DarkGray }
 
-# 3) Clear a now-stale single-instance lock so the next launch is not refused.
-$lock = Join-Path $root 'data\engine.lock'
-if (-not $KeepLock -and (Test-Path $lock)) {
-    Remove-Item $lock -Force
-    Write-Host "  cleared stale data\engine.lock" -ForegroundColor DarkGray
+# 3) Clear now-stale single-instance locks so the next launch is not refused.
+# data\engine.lock guards the UI; data\supervisor.lock guards the supervisor.
+# Without clearing the latter, a force-killed supervisor leaves a lock whose PID
+# may be recycled by an unrelated process, and the next start is refused forever.
+foreach ($lockName in @('engine.lock', 'supervisor.lock')) {
+    $lock = Join-Path $root "data\$lockName"
+    if (-not $KeepLock -and (Test-Path $lock)) {
+        Remove-Item $lock -Force
+        Write-Host "  cleared stale data\$lockName" -ForegroundColor DarkGray
+    }
 }
 
 Start-Sleep -Milliseconds 400
