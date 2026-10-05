@@ -13,6 +13,7 @@ import os
 import sys
 import json
 import logging
+import math
 import time
 import threading
 import sqlite3
@@ -750,9 +751,9 @@ class AlertManager:
             with self._db_lock:
                 cur = self._conn.execute(
                     '''SELECT signal_name, COUNT(*) as n,
-                              SUM(CASE WHEN forward_return > 0 THEN 1 ELSE 0 END) as wins,
-                              AVG(forward_return) as avg_ret, SUM(forward_return) as tot
-                       FROM signal_outcomes WHERE resolved = 1
+                              SUM(CASE WHEN (CASE WHEN direction > 0 THEN forward_return WHEN direction < 0 THEN -forward_return END) > 0 THEN 1 ELSE 0 END) as wins,
+                              AVG((CASE WHEN direction > 0 THEN forward_return WHEN direction < 0 THEN -forward_return END)) as avg_ret, SUM((CASE WHEN direction > 0 THEN forward_return WHEN direction < 0 THEN -forward_return END)) as tot
+                       FROM signal_outcomes WHERE resolved = 1 AND direction != 0
                        GROUP BY signal_name ORDER BY n DESC''')
                 rows = cur.fetchall()
                 total = self._conn.execute(
@@ -879,8 +880,24 @@ class AlertManager:
         """Headless no-op; the UI subclass pushes snapshots to its queue."""
         return None
 
+# Signals that describe a REGIME, not a direction. They carry no bull/bear
+# intent, so returning 0 for them is correct — but 0 must NOT be silently
+# averaged into an expectancy gate (that is what inverted the gates: see
+# _directed_return / _DIR_NONE below).
+NON_DIRECTIONAL_SIGNALS = {
+    "volume dryup", "volume spike", "volume climax",
+    "bb squeeze (entry)", "atr expansion (vol surge)",
+}
+
+
 def get_signal_direction(signal_name: str, direction_hint: Optional[str] = None) -> int:
-    """Return +1 for bull/long, -1 for bear/short, 0 for neutral."""
+    """Return +1 for bull/long, -1 for bear/short, 0 for non-directional.
+
+    NOTE: 0 means "this signal has no direction", NOT "neutral/flat". Callers
+    computing expectancy MUST exclude 0 rows (see `_directed_return`). Before
+    this was explicit, 63% of all logged rows carried direction=0 and were
+    averaged in with the wrong sign.
+    """
     if direction_hint:
         d = str(direction_hint).lower()
         if "bull" in d or "long" in d or "up" in d:
@@ -888,6 +905,8 @@ def get_signal_direction(signal_name: str, direction_hint: Optional[str] = None)
         if "bear" in d or "short" in d or "down" in d:
             return -1
     name_lower = signal_name.lower()
+    if name_lower in NON_DIRECTIONAL_SIGNALS:
+        return 0
     if any(k in name_lower for k in ("bull", "oversold", "breakout up", "above", "flip up")):
         return 1
     if any(k in name_lower for k in ("bear", "overbought", "breakout down", "below", "flip down")):
@@ -898,6 +917,22 @@ def get_signal_direction(signal_name: str, direction_hint: Optional[str] = None)
 # ============================================================================
 # SIGNAL ANALYZER
 # ============================================================================
+# SQL fragment for direction-adjusted expectancy. A bearish signal (direction=-1)
+# that precedes a price DROP has forward_return < 0 but is a WIN, so the raw
+# average has the wrong sign for half the book. This flips by direction and
+# EXCLUDES direction=0 rows at the WHERE clause: a signal with no direction
+# cannot have expectancy, and averaging it in silently inverted BOTH gates
+# (audit 2026-10-05: outcome gate muted 7 good signals, missed 3 bad).
+_DIRECTED_RETURN_SQL = "(CASE WHEN direction > 0 THEN forward_return WHEN direction < 0 THEN -forward_return END)"
+
+# A negative MEAN is not evidence — with n in the dozens, mean<0 happens by
+# chance alone. Seven signals had negative expectancy but t>-1.65 (not
+# significantly negative) and were being muted on noise. Requiring
+# t < -1.65 (p<0.05, one-sided) means the gate only silences a signal once
+# its losses are demonstrably real, and lets the rest keep collecting data
+# instead of being starved of it (audit 2026-10-05).
+_DIRECTED_MIN_T = 1.65
+
 class SignalAnalyzer:
     _STATE_NAME_TO_CODE = {"normal": 0, "climax": 1, "spike": 2, "dryup": 3}
     _STATE_CODE_TO_NAME = {0: "normal", 1: "climax", 2: "spike", 3: "dryup"}
@@ -1669,29 +1704,48 @@ class SignalAnalyzer:
             cutoff = now - self._outcome_lookback_days * 86400
             with self.alert_mgr._db_lock:
                 rows = self.alert_mgr._conn.execute(
-                    """SELECT signal_name, AVG(forward_return) as exp, COUNT(*) as n
+                    f"""SELECT signal_name, AVG({_DIRECTED_RETURN_SQL}) as exp,
+                               COUNT(*) as n,
+                               SQRT(MAX(0.0, AVG({_DIRECTED_RETURN_SQL}*{_DIRECTED_RETURN_SQL})
+                                        - AVG({_DIRECTED_RETURN_SQL})*AVG({_DIRECTED_RETURN_SQL}))) as sd
                        FROM signal_outcomes
-                       WHERE resolved = 1 AND fired_ts >= ?
+                       WHERE resolved = 1 AND fired_ts >= ? AND direction != 0
                        GROUP BY signal_name""",
                     (cutoff,)).fetchall()
                 sym_rows = self.alert_mgr._conn.execute(
-                    """SELECT signal_name, symbol, AVG(forward_return) as exp, COUNT(*) as n
+                    f"""SELECT signal_name, symbol, AVG({_DIRECTED_RETURN_SQL}) as exp,
+                               COUNT(*) as n,
+                               SQRT(MAX(0.0, AVG({_DIRECTED_RETURN_SQL}*{_DIRECTED_RETURN_SQL})
+                                        - AVG({_DIRECTED_RETURN_SQL})*AVG({_DIRECTED_RETURN_SQL}))) as sd
                        FROM signal_outcomes
-                       WHERE resolved = 1 AND fired_ts >= ?
+                       WHERE resolved = 1 AND fired_ts >= ? AND direction != 0
                        GROUP BY signal_name, symbol""",
                     (cutoff,)).fetchall()
+            def _t(exp_v, n_v, sd_v):
+                """One-sided t-stat for mean < 0; None when not computable."""
+                if exp_v is None or n_v is None or sd_v is None or int(n_v) < 2 or float(sd_v) <= 0:
+                    return None
+                return float(exp_v) / float(sd_v) * math.sqrt(int(n_v))
+
             cache: Dict[str, Tuple[float, int]] = {}
             muted: set = set()
-            for sname, exp, n in rows:
+            # Significance floor: a signal is muted only when its mean is
+            # negative AND that mean is significantly below zero. Without the
+            # t-test, 7 signals with t between -0.22 and -0.95 were muted on
+            # sampling noise, which starved them of the data needed to recover.
+            for sname, exp, n, sd in rows:
                 if exp is None or n is None:
                     continue
-                cache[str(sname)] = (float(exp), int(n))
-                if float(exp) < 0 and int(n) >= self._outcome_min_n:
-                    muted.add(str(sname))          # pooled: applies to every symbol
-            for sname, sym, exp, n in sym_rows:
+                key = str(sname)
+                cache[key] = (float(exp), int(n))
+                t = _t(exp, n, sd)
+                if float(exp) < 0 and int(n) >= self._outcome_min_n and t is not None and t < -_DIRECTED_MIN_T:
+                    muted.add(key)                # pooled: applies to every symbol
+            for sname, sym, exp, n, sd in sym_rows:
                 if exp is None or n is None:
                     continue
-                if float(exp) < 0 and int(n) >= self._outcome_min_n:
+                t = _t(exp, n, sd)
+                if float(exp) < 0 and int(n) >= self._outcome_min_n and t is not None and t < -_DIRECTED_MIN_T:
                     muted.add((str(sname), str(sym)))   # per-symbol override
             with self._state_lock:
                 self._outcome_cache = cache
@@ -1727,18 +1781,28 @@ class SignalAnalyzer:
             off = self._time_utc_offset
             with self.alert_mgr._db_lock:
                 cur = self.alert_mgr._conn.execute(
-                    """SELECT CAST((((strftime('%H', datetime(fired_ts, 'unixepoch')) + ?) % 24) + 24) % 24 AS INTEGER) as hr,
-                              AVG(forward_return) as exp, COUNT(*) as n
-                       FROM signal_outcomes WHERE resolved=1 AND fired_ts >= ? GROUP BY hr""",
+                    f"""SELECT CAST((((strftime('%H', datetime(fired_ts, 'unixepoch')) + ?) % 24) + 24) % 24 AS INTEGER) as hr,
+                              AVG({D}) as exp, COUNT(*) as n,
+                              SQRT(MAX(0.0, AVG({D}*{D}) - AVG({D})*AVG({D}))) as sd
+                       FROM signal_outcomes
+                       WHERE resolved=1 AND fired_ts >= ? AND direction != 0 GROUP BY hr""",
                     (off, cutoff))
                 rows = cur.fetchall()
             cache: Dict[int, Tuple[float, int]] = {}
             muted: set = set()
-            for hr, exp, n in rows:
+            for hr, exp, n, sd in rows:
                 if hr is None or exp is None or n is None:
                     continue
                 cache[int(hr)] = (float(exp), int(n))
-                if float(exp) < 0 and int(n) >= self._time_min_n and int(hr) not in self._time_protected:
+                # Same significance floor as the outcome gate: a negative mean
+                # is not evidence. Muting an hour on noise would blind the
+                # engine during a genuinely bad session.
+                t = None
+                if sd is not None and float(sd) > 0 and int(n) >= 2:
+                    t = float(exp) / float(sd) * math.sqrt(int(n))
+                if (float(exp) < 0 and int(n) >= self._time_min_n
+                        and t is not None and t < -_DIRECTED_MIN_T
+                        and int(hr) not in self._time_protected):
                     muted.add(int(hr))
             with self._state_lock:
                 self._time_cache = cache
@@ -2056,7 +2120,7 @@ class SignalAnalyzer:
               bk: str, tf: str, conf: Tuple[int, int, int, int, bool],
               direction: Optional[str] = None,
               market_data: Optional[Dict[str, Any]] = None) -> bool:
-        """Central emit gate: regime filter + confluence + multi-TF consolidation + macro + outcome gating.
+        """Central emit gate: disabled list + regime filter + confluence + multi-TF consolidation + macro + outcome gating.
         Returns True if the alert was actually emitted."""
         bull_conf, bear_conf, regime, conf_req, reg_enabled = conf
         if direction == "bull":
