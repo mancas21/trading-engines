@@ -435,6 +435,40 @@ public class LiveExporter : Indicator
                 };
             }
 
+            // ── Volume context: last closed bar + 20-bar average ──
+            // Computed here rather than in the bridge because only the indicator
+            // can see historical candles; GetCandle(index) is the ATAS API for it.
+            double? prevVol = null;
+            double? avgVol20 = null;
+            double? volRatio = null;
+            int volLookback = 0;
+            try
+            {
+                const int Lookback = 20;
+                double sum = 0;
+                int n = 0;
+                // bar-1 is the last CLOSED bar; walk back further for the average.
+                for (int k = 1; k <= Lookback; k++)
+                {
+                    var pc = GetCandle(bar - k);
+                    if (pc == null)
+                        continue;
+                    var v = (double)pc.Volume;
+                    if (k == 1)
+                        prevVol = v;
+                    sum += v;
+                    n++;
+                }
+                volLookback = n;
+                if (n > 0)
+                {
+                    avgVol20 = sum / n;
+                    if (avgVol20.Value > 0)
+                        volRatio = (double)candle.Volume / avgVol20.Value;
+                }
+            }
+            catch { /* volume context is optional - never block the publish */ }
+
             // ── Serialize ──
             var data = new
             {
@@ -442,7 +476,24 @@ public class LiveExporter : Indicator
                 ticker = InstrumentInfo?.Instrument ?? "?",
                 bar_index = bar,
                 price = new { last = candle.Close, open = candle.Open, high = candle.High, low = candle.Low },
-                volume = new { total = candle.Volume, ask = candle.Ask, bid = candle.Bid },
+                volume = new
+                {
+                    total = candle.Volume,
+                    ask = candle.Ask,
+                    bid = candle.Bid,
+                    // Volume context (added 2026-10-06). The exporter previously
+                    // published only the FORMING bar's volume, so rules.json's
+                    // volume_climax component could never be scored: it needs a
+                    // ratio against recent bars, and a single bar has no baseline.
+                    // Read the last CLOSED bars via the same GetCandle(int) the
+                    // indicator already uses. Lookback is bounded and every
+                    // missing bar is skipped rather than treated as zero.
+                    prev_bar_volume = prevVol,
+                    avg_volume_20 = avgVol20,
+                    volume_ratio = volRatio,
+                    lookback_bars = volLookback,
+                    delta = (double)candle.Delta
+                },
                 delta = (double)candle.Delta,
                 time = candle.Time.ToString("HH:mm:ss"),
                 footprint = footprint,
