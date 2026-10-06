@@ -1,0 +1,229 @@
+{
+  "symbols": [
+    "SOL/USDT:USDT",
+    "XRP/USDT:USDT",
+    "SUI/USDT:USDT",
+    "HYPE/USDT:USDT",
+    "SPCX/USDT:USDT",
+    "NVDA/USDT:USDT",
+    "XAU/USDT:USDT"
+  ],
+  "timeframes": [
+    "5m",
+    "15m",
+    "30m",
+    "1h"
+  ],
+  "volume": {
+    "enabled": true,
+    "avg_len": 20,
+    "spike_mult": 2.0,
+    "climax_mult": 3.5,
+    "dryup_mult": 0.5,
+    "dryup_exit_mult": 0.8,
+    "state_persistence_bars": 2,
+    "baseline_ttl_seconds": 21600,
+    "obv_break_sigma": 0.75,
+    "obv_break_bars": 2,
+    "obv_len": 20
+  },
+  "cvd": {
+    "enabled": true,
+    "smooth_len": 5,
+    "div_lookback": 20,
+    "pivot_len": 5,
+    "min_gap": 3
+  },
+  "rsi": {
+    "enabled": true,
+    "length": 14,
+    "overbought": 70,
+    "oversold": 30,
+    "pivot_len": 5,
+    "div_lookback": 20,
+    "min_gap": 3
+  },
+  "macd": {
+    "enabled": true,
+    "fast": 12,
+    "slow": 26,
+    "signal": 9,
+    "pivot_len": 5,
+    "div_lookback": 20,
+    "histogram_flip": true,
+    "min_gap": 3
+  },
+  "stochastic": {
+    "enabled": true,
+    "k_len": 14,
+    "d_len": 3,
+    "smooth": 3,
+    "overbought": 80,
+    "oversold": 20
+  },
+  "volatility": {
+    "enabled": true,
+    "bb_len": 20,
+    "bb_mult": 2.0,
+    "bb_squeeze_pct": 20.0,
+    "bb_width_lookback": 100,
+    "atr_len": 14,
+    "atr_expansion_mult": 1.8
+  },
+  "general": {
+    "check_interval": 5,
+    "enable_notifications": true,
+    "enable_sound": true,
+    "max_workers": 10,
+    "log_level": "INFO",
+    "max_history_bars": 200,
+    "health_port": 8081,
+    "health_enabled": true,
+    "health_host": "127.0.0.1",
+    "outcome_forward_bars": 12,
+    "confluence_required": 2,
+    "regime_filter_enabled": true,
+    "regime_trend_len": 50,
+    "tf_consolidation_enabled": true,
+    "blackout_enabled": true,
+    "blackout_seconds": 300,
+    "signal_cooldown_seconds": 600,
+    "macro_regime_enabled": true,
+    "macro_regime_symbols": [
+      "BTC/USDT:USDT",
+      "ETH/USDT:USDT"
+    ],
+    "macro_regime_ema_band": 0.005,
+    "macro_regime_debounce_cycles": 3,
+    "macro_regime_min_hold_s": 300,
+    "outcome_gating_enabled": true,
+    "outcome_gating_lookback_days": 30,
+    "outcome_gating_min_n": 30,
+    "time_gating_enabled": true,
+    "time_gating_lookback_days": 14,
+    "time_gating_min_n": 20,
+    "time_gating_utc_offset": -5,
+    "time_gating_protected_hours_local": [
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ]
+  },
+  "exchange": {
+    "id": "binanceusdm",
+    "testnet": false,
+    "api_key": "",
+    "secret": "",
+    "rate_limit_buffer": 0.1
+  },
+  "telegram": {
+    "enabled": true,
+    "token": "8844332826:AAHdZrs4RhOCFLGjDOD3QI53kVbtA6KMz4A",
+    "chat_id": "6369690844",
+    "filter_symbol": null,
+    "filter_timeframe": null
+  },
+  "bridge": {
+    "enabled": true,
+    "url": "http://127.0.0.1:8000/quant-alert",
+    "filter_url": "http://127.0.0.1:8000/quant/filter",
+    "timeout_seconds": 2.0
+  },
+  "level2": {
+    "enabled": true,
+    "base_url": "http://127.0.0.1:8000",
+    "timeout_seconds": 1.5,
+    "min_score": 2.0,
+    "require_dom": true,
+    "dom_imbalance_min": 5.0,
+    "require_cvd": true,
+    "require_quant": true,
+    "quant_min_timeframes": 1,
+    "fail_open": true,
+    "cache_ttl_seconds": 4.0
+  },
+  "macro": {
+    "enabled": true,
+    "coingecko_key": "",
+    "cache_ttl_seconds": 60.0,
+    "predictive_weight": 0.3,
+    "max_concurrent_requests": 3,
+    "max_retries": 3,
+    "gate_signals": false,
+    "ath_bear_pct": -12.0,
+    "ath_bull_pct": 15.0,
+    "web_sources": [
+      {
+        "id": "coinstats",
+        "enabled": true,
+        "ttl_seconds": 120.0,
+        "timeout_seconds": 12.0,
+        "confidence": "high"
+      },
+      {
+        "id": "coinmarketcap",
+        "enabled": true,
+        "ttl_seconds": 120.0,
+        "timeout_seconds": 12.0,
+        "confidence": "high"
+      },
+      {
+        "id": "tradingkey_ta",
+        "enabled": true,
+        "ttl_seconds": 300.0,
+        "timeout_seconds": 12.0,
+        "confidence": "medium"
+      },
+      {
+        "id": "tradingkey_movers",
+        "enabled": false,
+        "ttl_seconds": 900.0,
+        "timeout_seconds": 12.0,
+        "confidence": "low",
+        "_disabled_reason": "2026-10-05: movers desk is US-equities only (0/7 crypto symbols), slug format changed. See web_macro_providers.py DEFAULT_WEB_SOURCES."
+      },
+      {
+        "id": "diariobitcoin",
+        "enabled": true,
+        "ttl_seconds": 900.0,
+        "timeout_seconds": 12.0,
+        "confidence": "medium"
+      },
+      {
+        "id": "coinpedia",
+        "enabled": true,
+        "ttl_seconds": 1800.0,
+        "timeout_seconds": 12.0,
+        "confidence": "low"
+      }
+    ]
+  },
+  "ml": {
+    "enabled": true,
+    "gate_signals": false,
+    "model_path": "data/ml/meta_model.json",
+    "min_prob": 0.55,
+    "fail_open": true,
+    "window": 200,
+    "log_features": true
+  },
+  "periodic_snapshot": {
+    "enabled": true,
+    "interval_seconds": 900,
+    "symbols": [
+      "SOL/USDT:USDT",
+      "XRP/USDT:USDT",
+      "SUI/USDT:USDT",
+      "HYPE/USDT:USDT",
+      "SPCX/USDT:USDT",
+      "NVDA/USDT:USDT",
+      "XAU/USDT:USDT"
+    ]
+  },
+  "database": "data/alerts.db"
+}
