@@ -687,6 +687,18 @@ _CVD_RACE_RESET_AFTER = int(os.getenv("CVD_RACE_RESET_AFTER", "3"))
 _cvd_state: dict[str, dict] = {}
 _CVD_LOCK = threading.Lock()
 _cvd_dirty = False
+# Why the current segment started, and when. A DLL redeploy or timeframe switch
+# resets the segment (bar_index goes backwards -> bars not comparable), which
+# silently un-evaluates rules.json rules 6/7 condition (a): they need 2+
+# consecutive CLOSED bars, and a fresh segment starts with zero. The log line
+# says so, but nothing a consumer reads reported it. /cvd now publishes
+# segment_started_ts + segment_reason, and /health flags a young segment.
+_cvd_segment_reason: str = ""
+_cvd_segment_ts: float = 0.0
+
+# A segment younger than this has too few closed bars for rules 6/7 condition
+# (a) to be satisfiable. Reported, not enforced.
+_CVD_WARMUP_BARS = 2
 
 
 def _cvd_new_state() -> dict:
@@ -819,6 +831,7 @@ def _cvd_process_live(data: dict) -> None:
             return
 
         def _reset(msg: str, b_index: int, count_segment: bool = True) -> None:
+            global _cvd_segment_reason, _cvd_segment_ts
             fresh = _cvd_new_state()
             fresh.update({
                 "segments": st["segments"] + (1 if count_segment else 0),
@@ -828,7 +841,13 @@ def _cvd_process_live(data: dict) -> None:
                 "updated_ts": now,
                 "_src_ts": src_ts,
             })
+            fresh["segment_started_ts"] = now
+            fresh["segment_reason"] = msg
             _cvd_state[ticker] = fresh
+            # Publish the reason so /cvd and /health can say WHY the rules
+            # cannot fire, instead of a consumer inferring it from zeros.
+            _cvd_segment_reason = msg
+            _cvd_segment_ts = now
             log.warning("CVD %s: %s", ticker, msg)
             _cvd_dirty = True
 
@@ -966,11 +985,21 @@ async def _cvd_tracker():
 def _cvd_public(sym: str, st: dict) -> dict:
     """Public view of a symbol's CVD state."""
     cur_usd = st.get("current_bar_delta", 0) * st.get("last_price", 0) if st.get("last_price") else 0
+    now = time.time()
     return {
         "symbol": sym,
         "cvd": round(st["cvd"], 4),
         "cvd_usd": round(st.get("cvd_usd", 0.0), 2),
         "bars": st["bars"],
+        # Rules 6/7 condition (a) needs 2+ consecutive closed bars. A segment
+        # younger than that CANNOT satisfy it, and a reset (DLL redeploy,
+        # timeframe switch, chart reload) is the usual cause. Publish both so
+        # "rules cannot fire" is distinguishable from "market is flat".
+        "warmup": bool(st["bars"] < _CVD_WARMUP_BARS),
+        "warmup_bars_needed": _CVD_WARMUP_BARS,
+        "segment_started_ts": round(st.get("segment_started_ts", 0.0), 1),
+        "segment_age_s": round(now - st.get("segment_started_ts", now), 1),
+        "segment_reason": st.get("segment_reason", ""),
         "high_cvd": round(st["high_cvd"], 4),
         "low_cvd": round(st["low_cvd"], 4),
         "high_cvd_usd": round(st.get("high_cvd_usd", 0.0), 2),
@@ -2478,7 +2507,29 @@ async def health():
         "live_symbols": {k: round(v, 1) for k, v in sorted(live.items())},
         "frozen_exporter_files": frozen,
         "live_max_age_s": _LIVE_MAX_AGE_SECONDS,
+        # Rules 6/7 condition (a) needs 2+ consecutive CLOSED bars. A segment
+        # reset (LiveExporter DLL redeploy, chart reload, timeframe switch) starts
+        # a new segment with 0 closed bars, which makes both hard directional
+        # rules un-evaluable until it warms up. Report it here so a consumer can
+        # tell "rules cannot fire yet" from "market is flat".
+        "cvd_warmup": _cvd_warmup_summary(),
     }
+
+
+def _cvd_warmup_summary() -> dict:
+    """Per-symbol CVD warmup state for the rules.json gate check."""
+    out = {}
+    with _CVD_LOCK:
+        for sym, st in _cvd_state.items():
+            bars = int(st.get("bars", 0) or 0)
+            started = float(st.get("segment_started_ts", 0.0) or 0.0)
+            out[sym] = {
+                "bars": bars,
+                "warmup": bars < _CVD_WARMUP_BARS,
+                "segment_age_s": round(time.time() - started, 1) if started else None,
+                "segment_reason": st.get("segment_reason", ""),
+            }
+    return out
 
 
 @app.get("/dom")
