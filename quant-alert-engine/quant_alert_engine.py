@@ -1239,7 +1239,12 @@ class SignalAnalyzer:
             fresh = sum(1 for a in ages if a < ttl)
             oldest = round(max(ages), 1) if ages else None
             # Web macro freshness across cached symbol contexts (info-only).
+            # Tracks not_covered separately: a crypto-web source having no entry
+            # for an equity/gold symbol (SPCX/NVDA/XAU) is expected, not a fault.
+            # Health now fails on ELIGIBLE coverage, so "degraded" means a source
+            # that should have answered didn't.
             web_fresh, web_total, web_oldest = 0, 0, None
+            web_not_covered, web_unavailable, web_eligible = 0, 0, 0
             try:
                 from web_macro_providers import is_fresh as _web_is_fresh
                 for _ts, _data in cache.values():
@@ -1248,6 +1253,13 @@ class SignalAnalyzer:
                         if not isinstance(_rec, dict):
                             continue
                         web_total += 1
+                        _st = _rec.get("status")
+                        if _st == "not_covered":
+                            web_not_covered += 1
+                        elif _st == "unavailable":
+                            web_unavailable += 1
+                        else:
+                            web_eligible += 1
                         try:
                             _rts = datetime.fromisoformat(str(_rec.get("retrieved_at", ""))).timestamp()
                         except (ValueError, TypeError):
@@ -1259,11 +1271,17 @@ class SignalAnalyzer:
                 web_oldest = round(web_oldest, 1) if web_oldest is not None else None
             except Exception:
                 pass
+            # Require at least half of the ELIGIBLE records to be fresh. With no
+            # eligible records at all (every symbol is out of scope for web macro)
+            # this passes rather than reporting a fault that does not exist.
+            web_coverage_ok = web_fresh >= (web_eligible * 0.5) if web_eligible else True
         except Exception:
             fresh, oldest = 0, None
             web_fresh, web_total, web_oldest = 0, 0, None
+            web_not_covered, web_unavailable, web_eligible = 0, 0, 0
+            web_coverage_ok = True
         alive = bool(self._extmacro_thread and self._extmacro_thread.is_alive())
-        ok = bool(alive and fresh)
+        ok = bool(alive and fresh and web_coverage_ok)
         return {
             "status": "healthy" if ok else "degraded",
             "metrics": {
@@ -1275,6 +1293,10 @@ class SignalAnalyzer:
                 "gate_signals": 1 if self._extmacro_gate else 0,
                 "web_fresh": web_fresh,
                 "web_total": web_total,
+                "web_eligible": web_eligible,
+                "web_not_covered": web_not_covered,
+                "web_unavailable": web_unavailable,
+                "web_coverage_ok": 1 if web_coverage_ok else 0,
                 "web_oldest_age_s": web_oldest,
             },
         }

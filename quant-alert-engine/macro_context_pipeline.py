@@ -9,12 +9,48 @@ Non-blocking: runs as a background async task; caches with TTL; fail-open.
 import asyncio
 import json
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
 
 import aiohttp
+
+
+def _session_connector() -> "aiohttp.TCPConnector":
+    """TCPConnector pinned to the pure-Python ThreadedResolver.
+
+    Fix 2026-10-05 (126 failed Polymarket fetches after restart). aiohttp picks
+    AsyncResolver (aiodns) whenever aiodns is importable, and on this box aiodns
+    fails inside the engine's background THREAD with "Timeout while contacting
+    DNS servers" -- while the very same host resolves and returns HTTP 200 both
+    from the main thread and from a standalone event loop. Only Polymarket was
+    hit because its hostname is the only one whose DNS lookup missed the OS
+    cache at the moment the burst of 7 staggered per-symbol fetches fired.
+
+    ThreadedResolver uses getaddrinfo in a worker thread, which is reliable
+    here and measured 4/4 successes where the default path failed. It is also
+    immune to the aiodns-version drift that makes the async path brittle.
+
+    Set env QAE_FORCE_THREADED_RESOLVER=0 to opt back into the aiohttp default.
+    """
+    if os.environ.get("QAE_FORCE_THREADED_RESOLVER", "1") == "0":
+        return aiohttp.TCPConnector()
+    try:
+        from aiohttp.resolver import ThreadedResolver
+        return aiohttp.TCPConnector(resolver=ThreadedResolver())
+    except Exception:  # pragma: no cover - older/newer aiohttp
+        return aiohttp.TCPConnector()
+
+
+def _new_session() -> "aiohttp.ClientSession":
+    """The one session shape this pipeline uses (raised header limits + resolver)."""
+    return aiohttp.ClientSession(
+        connector=_session_connector(),
+        max_line_size=65536,
+        max_field_size=65536,
+    )
 
 from web_macro_providers import (
     CMC_GLOBAL_TTL_SECONDS,
@@ -48,7 +84,13 @@ class MacroConfig:
     coingecko_base: str = "https://api.coingecko.com/api/v3"
     defillama_base: str = "https://api.llama.fi"
     polymarket_gamma_base: str = "https://gamma-api.polymarket.com"
-    polymarket_fallback_base: str = "https://data-api.polymarket.com"
+    # Secondary search endpoint. The OLD value, "https://data-api.polymarket.com"
+    # with path /search/markets, is DEAD: it answers HTTP 404 "404 page not found"
+    # on every request. It was being retried 3x per cycle and then logged at
+    # ERROR, burying real failures in noise (~34 such errors in one restart
+    # window). The gamma /events endpoint below is the verified live equivalent
+    # and returns the same {"markets": [...]} shape inside each event.
+    polymarket_fallback_base: str = "https://gamma-api.polymarket.com"
     clob_base: str = "https://clob.polymarket.com"
     max_retries: int = 3
     max_concurrent_requests: int = 3
@@ -276,19 +318,47 @@ class MacroContextPipeline:
             session, f"{self.cfg.polymarket_gamma_base}/public-search",
             params={"q": query},
         )
-        if not result["ok"]:
-            logger.info("Gamma primary search failed, trying fallback: %s", result["error"])
-            result = await self._get_json(
-                session, f"{self.cfg.polymarket_fallback_base}/search/markets",
-                params={"q": query, "limit": str(limit)},
+        events: List[Dict[str, Any]] = []
+        if result["ok"]:
+            # Primary returns {"events": [...], "pagination": {...}}.
+            events = result["data"].get("events", []) or []
+        else:
+            logger.info(
+                "Gamma primary search failed, trying /events fallback: %s",
+                result["error"],
             )
-        if not result["ok"]:
-            return [{"error": result["error"]}]
+            # Fallback is now the SAME host: /events returns a BARE LIST of
+            # events (not {"events": ...}). The old data-api /search/markets
+            # endpoint is 404 and was the sole source of the retry storm.
+            fb = await self._get_json(
+                session, f"{self.cfg.polymarket_fallback_base}/events",
+                params={
+                    "limit": str(limit),
+                    "closed": "false",
+                    "active": "true",
+                    "order": "volume24hr",
+                    "ascending": "false",
+                },
+            )
+            if not fb["ok"]:
+                return [{"error": fb["error"]}]
+            data = fb["data"]
+            events = data if isinstance(data, list) else (data.get("events") or [])
 
-        events = result["data"].get("events", [])
         sentiment_data: List[Dict[str, Any]] = []
         for event in events:
-            for m in event.get("markets", []):
+            if not isinstance(event, dict):
+                continue
+            # Keep only events that actually match the query. The /events
+            # fallback is volume-sorted rather than searched, so without this
+            # filter a Bitcoin query can return unrelated sports markets.
+            hay = " ".join(
+                str(event.get(k) or "")
+                for k in ("title", "slug", "description")
+            ).lower()
+            if query and query.lower() not in hay:
+                continue
+            for m in event.get("markets", []) or []:
                 outcome_prices = m.get("outcomePrices") or m.get("prices")
                 outcomes = m.get("outcomes")
                 condition_id = m.get("conditionId") or m.get("condition_id")
@@ -422,7 +492,7 @@ class MacroContextPipeline:
                 "macro_prediction_sentiment": results[2],
             }
         if session is None:
-            async with aiohttp.ClientSession(max_line_size=65536, max_field_size=65536) as s:
+            async with _new_session() as s:
                 return await _do_gather(s)
         return await _do_gather(session)
 
@@ -550,7 +620,7 @@ class MacroContextPipeline:
             try:
                 # Raised header limits: some editorial pages (Coinpedia) send
                 # very large response headers that trip aiohttp's defaults.
-                async with aiohttp.ClientSession(max_line_size=65536, max_field_size=65536) as session:
+                async with _new_session() as session:
                     coin_ids = [
                         self.cfg.tracked_coins.get(s, s.lower().replace("/", "-"))
                         for s in symbols

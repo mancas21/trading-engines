@@ -51,7 +51,20 @@ DEFAULT_WEB_SOURCES: List[Dict[str, Any]] = [
     {"id": "coinstats", "enabled": True, "ttl_seconds": 120.0, "timeout_seconds": 12.0, "confidence": "high"},
     {"id": "coinmarketcap", "enabled": True, "ttl_seconds": 120.0, "timeout_seconds": 12.0, "confidence": "high"},
     {"id": "tradingkey_ta", "enabled": True, "ttl_seconds": 300.0, "timeout_seconds": 12.0, "confidence": "medium"},
-    {"id": "tradingkey_movers", "enabled": True, "ttl_seconds": 900.0, "timeout_seconds": 12.0, "confidence": "low"},
+    # TradingKey Movers is DISABLED by default (2026-10-05).
+    # It is structurally dead for this engine, not transiently broken:
+    #   * /technical-analysis/<slug> works, but the movers desk
+    #     (https://www.tradingkey.com/news/market-movers) now publishes
+    #     ONLY US equities — 20/20 slugs are tickers like mrna/vlo/cbrs,
+    #     0/20 crypto, and the per-symbol URL shape the parser needs
+    #     (/news/market-movers/<n>-market-movers-<sym>-usd-<date>) no longer
+    #     exists (current slugs are /news/market-movers/<n>-market-movers-<ticker>-<date>).
+    #   * Measured 0/7 symbols fresh. It is confidence:"low" and feeds no
+    #     alert field, so every cycle was a guaranteed-useless fetch plus a
+    #     "no movers article for symbol" record that counted against the
+    #     freshness metric.
+    # Re-enable only if TradingKey restores crypto movers coverage.
+    {"id": "tradingkey_movers", "enabled": False, "ttl_seconds": 900.0, "timeout_seconds": 12.0, "confidence": "low"},
     {"id": "diariobitcoin", "enabled": True, "ttl_seconds": 900.0, "timeout_seconds": 12.0, "confidence": "medium"},
     {"id": "coinpedia", "enabled": True, "ttl_seconds": 1800.0, "timeout_seconds": 12.0, "confidence": "low"},
 ]
@@ -643,24 +656,47 @@ def summarize_web_macro(web: Optional[Dict[str, Any]]) -> str:
 def web_freshness(web: Optional[Dict[str, Any]], now: Optional[float] = None) -> Dict[str, Any]:
     now = time.time() if now is None else now
     total, fresh, oldest = 0, 0, None
+    # not_covered is a DELIBERATE outcome (the source does not cover this asset),
+    # not a failure. Counting it against freshness made the health check report
+    # "degraded" for symbols the engine never expected web macro for -- 3 of the
+    # 7 tracked symbols (SPCX/NVDA/XAU) are equities/gold and correctly have no
+    # crypto-web coverage. Report it separately so "broken" stays meaningful.
+    not_covered, unavailable = 0, 0
     for r in (web or {}).values():
         if not isinstance(r, dict):
             continue
         total += 1
+        status = r.get("status")
+        if status == "not_covered":
+            not_covered += 1
+        elif status == "unavailable":
+            unavailable += 1
         try:
             ts = datetime.fromisoformat(str(r.get("retrieved_at", ""))).timestamp()
         except (ValueError, TypeError):
             continue
         age = now - ts
         oldest = age if oldest is None or age > oldest else oldest
-        if r.get("status") == "fresh":
+        if status == "fresh":
             try:
                 ttl = float(r.get("ttl_seconds", 300.0))
             except (TypeError, ValueError):
                 ttl = 300.0
             if age < ttl:
                 fresh += 1
-    return {"total": total, "fresh": fresh, "oldest_age_s": round(oldest, 1) if oldest is not None else None}
+    # "eligible" = records this source could actually have covered.
+    eligible = total - not_covered
+    return {
+        "total": total,
+        "fresh": fresh,
+        "eligible": eligible,
+        "not_covered": not_covered,
+        "unavailable": unavailable,
+        # Fraction of ELIGIBLE records that are fresh. None when nothing is
+        # eligible, so a caller cannot read 0/0 as "everything is broken".
+        "coverage_pct": round(100.0 * fresh / eligible, 1) if eligible else None,
+        "oldest_age_s": round(oldest, 1) if oldest is not None else None,
+    }
 
 
 # --------------------------------------------------------------------------- #
