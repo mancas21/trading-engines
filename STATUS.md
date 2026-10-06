@@ -5,6 +5,106 @@ SQLite corpus (`quant-alert-engine/data/alerts.db`) unless stated otherwise.
 
 ---
 
+## 2026-10-06 (later) — DEEP AUDIT + CUT: every signal family disabled, every call path verified losing
+
+The first audit established the pool has no edge. This pass found **two independent
+losing subsystems** and cut both. Nothing in this engine currently generates a
+trade recommendation.
+
+### Finding 1 — the signal engine has no positive cell anywhere
+
+Re-run with the corrected t-statistic on the full corpus (2,808 rows / 28.0 days,
+1,016 directed). Per-family, direction-adjusted, net of a 0.11% round trip:
+
+| family | n | dir-adj mean | t | net of cost | verdict |
+|---|---|---|---|---|---|
+| CVD Bearish Flip | 209 | +0.000370 | +0.61 | −0.000730 | CUT |
+| Stoch Bearish Cross | 142 | −0.000742 | −1.81 | −0.001842 | CUT |
+| OBV Bearish Break | 97 | −0.000351 | −0.96 | −0.001451 | CUT |
+| CVD Bullish Flip | 94 | −0.000303 | −0.87 | −0.001403 | CUT |
+| RSI Crossed Below 50 | 94 | −0.000355 | −0.94 | −0.001455 | CUT |
+| RSI Crossed Above 50 | 56 | −0.000607 | −0.76 | −0.001707 | CUT |
+| Stoch Bullish Cross | 56 | −0.000338 | −0.52 | −0.001438 | CUT |
+| BB Breakout Down | 55 | +0.000434 | +0.82 | −0.000666 | CUT |
+| MACD Bearish Cross | 32 | +0.000639 | +0.81 | −0.000461 | CUT |
+| MACD Bullish Cross | 23 | −0.001261 | **−2.04** | −0.002361 | CUT (proven loser) |
+
+**Zero families pass `t > +1.65 AND net > 0`.** The strongest positive is
+CVD Bearish Flip at t=+0.61 — noise. A 40-cell sweep over
+family x symbol x timeframe x direction at n≥8 also returned **zero** cells with
+edge. Direction split: long n=337 t=−1.55, short n=694 t=+0.73 — neither side
+works, so this is not an inverted-leg bug.
+
+**Action taken:** `cvd`, `rsi`, `macd`, `stochastic`, `volatility`, `volume` all
+set to `enabled: false` in `quant-alert-engine/config.json`, each carrying a
+`_disabled_reason`. Backup at `config.json.pre-edgecut-<ts>`.
+
+### Finding 2 — the rules/orderflow call path is a proven loser, and the engine agrees
+
+`/calls/stats` on the bridge (its own audit surface, not my computation):
+
+```
+n_traded                24          winrate              37.5%
+expectancy_r_gross      -0.2236     expectancy_r_net     -0.4196
+profit_factor            0.423      cost_bps             8.0
+bootstrap_ci95_net      [-0.8044, -0.0216]   <- excludes zero
+confidence              low
+```
+
+Every slice loses except one n=3 slice:
+
+| slice | n | expectancy net | PF net |
+|---|---|---|---|
+| validated | 20 | −0.343 | 0.518 |
+| exchange_verified | 21 | **−0.5003** | 0.348 |
+| legacy | 4 | −0.8028 | 0.002 |
+| contradicted | 3 | +0.1453 | 1.327 |
+
+By symbol: SPCX +0.556 and HYPE +0.252 (n=2 and n=5) are the only positives;
+XRP −0.773 (n=6), SOL −0.757, SUI −0.546. Both directions lose (long −0.401,
+short −0.451), so there is no side to keep.
+
+**The bootstrap CI excludes zero** — this is a statistically resolved loser, not an
+unproven one.
+
+**Action taken:** none needed on the running system — the orderflow monitor is
+**not currently running** (no matching process), so these 24 calls are historical.
+`plan_gate.py` already enforces the right creation-time invariants
+(breakeven win rate ≤0.55, cost_r ≤0.25). It was left in place. If that monitor
+is ever restarted, it must not be treated as validated.
+
+### What is NOT cut, and why
+
+- **The outcome/time gates stay on.** They correctly mute Stoch Bearish Cross
+  (t=−1.81). But with the pool negative there is nothing left to unmute, so the
+  gate cannot make the engine profitable — a low alert count is not evidence the
+  gate is "working well".
+- **rules.json Rule 6/7 evaluation stays.** It is the only part of this codebase
+  that produced a defensible verdict during live reads (it correctly refused the
+  17:45 setup that resolved bearish). It produces a *reading*, not a trade.
+- **ML stays `gate_signals: false`.** AUC 0.552 vs 0.510 permuted baseline.
+
+### Honest state
+
+The engine as it stands **cannot produce a trade recommendation with evidence
+behind it**. What remains working is data plumbing: live-only freshness gating,
+the live-only source discipline, exporter atomic publish, supervisor/lock
+behaviour, and the rules-based *reader*. Re-enable a family only when
+`audit_edge.py` shows `t > +1.65 AND net > 0` for it.
+
+### Errors caught during this audit (both mine)
+
+1. I wrote the t-statistic as `sd/(sd/sqrt(n))`, which **equals `sqrt(n)`** — so
+   every cell printed a large positive t regardless of its mean. It surfaced
+   because n=209 gave t=+14.46, and sqrt(209)=14.46 exactly.
+2. I read `_calls_log.jsonl` directly and concluded **all 44 calls were stuck
+   `open`** because `outcome_r` is null on `open` records. The live endpoint shows
+   43 already resolved; resolution happens via the `ev: resolved` event and is
+   applied in `_calls_replay()`, not on the `open` record. Reading the log without
+   replaying it understated the engine's own record.
+
+---
+
 ## 2026-10-06 — QUANT AUDIT: no tradeable edge found. Do not trade this.
 
 **Verdict: the engine has no demonstrated edge, and the sample cannot yet prove
