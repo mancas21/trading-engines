@@ -839,9 +839,17 @@ class AlertManager:
                 msg += f" | {' '.join(md_parts)}"
         logger.info(msg, extra={"event_type": "alert_fired", "symbol": symbol, "timeframe": timeframe, "signal_name": signal_name, "signal_type": signal_type, "price": price, "color": color, "signal_id": signal_id, "market_data": market_data or {}})
 
-        # Outcome tagging: store this signal for forward-return resolution
+        # Outcome tagging: store this signal for forward-return resolution.
+        #
+        # forward_bars is now PER-TIMEFRAME (2026-10-06). A single global
+        # horizon made expectancy incomparable across timeframes: 12 bars on 1m
+        # is 12 minutes, on 1h is 12 hours, so a 1m cell and a 1h cell measured
+        # over wildly different periods and were pooled into one expectancy
+        # number. Every row in the 2026-09/10 corpus had forward_bars=12, which
+        # made the whole expectancy audit unsound. Read from
+        # general.outcome_forward_bars_by_tf, falling back to the legacy scalar.
         self.tag_signal(signal_name, symbol, price, timeframe, bar_key, signal_type,
-                        self.config.get('general.outcome_forward_bars', 12),
+                        self._forward_bars_for(timeframe),
                         features=(market_data or {}).get("features"),
                         direction=direction)
 
@@ -1147,6 +1155,38 @@ class SignalAnalyzer:
         return float(v)
 
     # ── External macro context (v2.7) ──
+    def _forward_bars_for(self, timeframe: str) -> int:
+        """Forward-return horizon in bars, resolved per timeframe.
+
+        Defaults are chosen so each horizon spans a comparable WALL-CLOCK window
+        rather than a comparable bar count, because expectancy across different
+        horizons is not comparable. 12 bars at 1m = 12 min, so the longer
+        timeframes scale up: 5m->12 (1h), 15m->8 (2h), 30m->4 (2h), 1h->2 (2h).
+
+        Config override: general.outcome_forward_bars_by_tf = {"5m": 24, ...}
+        Legacy general.outcome_forward_bars still applies as the fallback for any
+        timeframe absent from the map.
+        """
+        by_tf = self.config.get("general.outcome_forward_bars_by_tf", None)
+        legacy = int(self.config.get("general.outcome_forward_bars", 12) or 12)
+        if isinstance(by_tf, dict) and by_tf:
+            tf = str(timeframe or "").strip()
+            for k, v in by_tf.items():
+                if str(k).strip().lower() == tf.lower():
+                    try:
+                        return max(1, int(v))
+                    except (TypeError, ValueError):
+                        break
+        # Built-in wall-clock-aligned defaults; never below 1.
+        try:
+            tf = str(timeframe or "").strip().lower()
+        except Exception:
+            tf = ""
+        default_by_tf = {"1m": 12, "3m": 12, "5m": 12, "15m": 8, "30m": 4, "1h": 2}
+        if tf in default_by_tf:
+            return default_by_tf[tf]
+        return legacy
+
     def _run_macro_loop(self, symbols: List[str]):
         """Background thread entry: own asyncio loop driving the pipeline's
         refresh loop directly. NOTE: we must run _background_loop itself —
