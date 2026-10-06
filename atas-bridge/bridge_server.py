@@ -2227,13 +2227,89 @@ def _newest_live_indicator_path() -> str | None:
     return _LIVE_INDICATORS_FILE if os.path.exists(_LIVE_INDICATORS_FILE) else None
 
 
+def _attach_dom_context(data: dict) -> dict:
+    """Merge the bridge-computed DOM context into an ATAS exporter payload.
+
+    Rules 6 and 7 both gate on `imbalance_pct_ema`, not the instantaneous
+    `imbalance_pct`: a single top-15 snapshot is dominated by sampling noise, so
+    the raw value cannot decide a directional call. The bridge ALREADY computes
+    that EMA (and the wall-persistence counters the rules also require) for its
+    own /dom feed -- but /indicators returns the exporter payload verbatim, so
+    every consumer of the ATAS leg saw `imbalance_pct_ema = None` and both hard
+    rules were permanently unevaluable on the one symbol that actually has order
+    flow. That made the rules look enforced while being inert.
+
+    This copies the already-computed context onto the payload. No new smoothing
+    happens here: the values come from the same dom_state/dom_persist the /dom
+    endpoint serves, so /dom and /indicators can never disagree.
+
+    Never overwrites a real field the exporter might start sending itself.
+    """
+    try:
+        ticker = str(data.get("ticker") or "").strip()
+        if not ticker:
+            return data
+        key = ticker.lower()
+        dom = data.get("dom")
+        if not isinstance(dom, dict):
+            dom = {}
+            data["dom"] = dom
+
+        # dom_lock is an asyncio.Lock guarding plain dicts. Take the snapshot
+        # WITHOUT awaiting it: run_until_complete() would raise inside this
+        # already-running loop, and acquiring the lock here is not worth an await
+        # on the exporter's hot path. Dict item assignment is atomic under the
+        # GIL, so a consistent-enough read is fine for enrichment.
+        # NB: `dom_persist` is a LOCAL inside _dom_feeds(), not a module global.
+        # Referencing it here raised NameError, which the try/except swallowed,
+        # so the enrichment silently did nothing. Everything needed is already
+        # projected into dom_state by _dom_feeds().
+        snap = dict(dom_state.get(key) or {})
+        if not snap:
+            return data
+
+        # EMA: the rules' actual gate value.
+        ema = snap.get("imbalance_pct_ema")
+        if ema is not None and dom.get("imbalance_pct_ema") is None:
+            dom["imbalance_pct_ema"] = round(float(ema), 1)
+
+        # Persistence: rules require the reading to hold 3+ polls.
+        if dom.get("imbalance_pct_ema_n") is None:
+            n = snap.get("imbalance_ema_samples")
+            dom["imbalance_pct_ema_n"] = int(n) if n else 0
+        for side in ("bid", "ask"):
+            for suffix, src_key in (
+                ("wall_price", f"{side}_wall_price"),
+                ("wall_vol", f"{side}_wall_vol"),
+                ("wall_persistent", f"{side}_wall_persistent"),
+            ):
+                if dom.get(src_key) is None and snap.get(src_key) is not None:
+                    dom[src_key] = snap[src_key]
+
+        # Rule 9 context: identical direction on BOTH highly correlated members is
+        # ONE bet, not two confirmations. Surfaced so consumers cannot double-count.
+        corr = data.get("correlation") if isinstance(data.get("correlation"), dict) else {}
+        if not corr:
+            corr = {"note": "SUI-SOL correlate 0.811 (15m) / 0.679 (1h) per rules.json "
+                            "rule 9 — treat same-direction SUI+SOL as ONE bet"}
+            data["correlation"] = corr
+    except Exception as e:  # noqa: BLE001 - enrichment must never break the feed
+        log.debug("dom context attach skipped: %s", str(e)[:80])
+    return data
+
+
 @app.get("/indicators")
 async def live_indicators():
-    """Return latest values from ATAS LiveExporter indicator."""
+    """Return latest values from ATAS LiveExporter indicator.
+
+    Enriched with the bridge-computed `imbalance_pct_ema` so rules.json rules 6
+    and 7 can actually be evaluated on this leg (see _attach_dom_context).
+    """
     try:
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, _read_live_data_sync)
         if data:
+            data = _attach_dom_context(data)
             # P2: Append tick history
             ticker = data.get("ticker", "?").upper()
             price = data.get("price", {}).get("last")
