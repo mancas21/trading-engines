@@ -34,7 +34,14 @@ process.env.TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || (await readEnv())
 const TG_TOKEN = process.env.TELEGRAM_TOKEN;
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID;
 const LX_API = 'http://127.0.0.1:8000';
-const ANALYSIS_INTERVAL_MS = 15 * 60 * 1000; // 15 min periodic (anti-spam)
+// 2026-10-07: la periodicidad ya NO se fija aqui. El informe de 15 min esta
+// desactivado; si se quiere reactivar, se arranca con BOT_PERIODIC_MINUTES=N.
+// Ver startScheduler().
+//
+// Va a nivel de modulo a proposito: se usa dentro de startScheduler() para armar
+// el setInterval y tambien en el log de arranque, que esta FUERA de esa funcion.
+// Declarado dentro, el segundo uso daba ReferenceError al arrancar.
+const PERIODIC_ENABLED = Number(process.env.BOT_PERIODIC_MINUTES || 0) > 0;
 const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000; // 15 min heartbeat
 
 if (!TG_TOKEN) {
@@ -596,11 +603,14 @@ async function startTwoWay() {
 // ─── Periodic analysis + heartbeat ──────────────────────────────
 // Freshness guard: /indicators carries a `timestamp` (ms). If it is older
 // than STALE_MS (ATAS/LiveExporter closed or frozen), treat the data as
-// stale and DO NOT emit a report — otherwise the bot re-sends the same
-// frozen analysis every 15 min.
+// stale and DO NOT emit a report — a frozen snapshot must never be served as
+// live. Este guard se sigue usando en los comandos bajo demanda (/a, /long,
+// /short) aunque el informe automatico este desactivado.
 const STALE_MS = 5 * 60 * 1000; // 5 min max age for a live snapshot
 const INDICATOR_OK_KEYS = ['price', 'volume', 'delta', 'dom', 'tape', 'footprint'];
-let lastStaleWarned = 0;
+// (lastStaleWarned eliminado: solo servia para throttlear el aviso a Telegram
+//  que accompanyaba al informe periodico. Sin ese informe, no hay aviso que
+//  limitar.)
 
 function indicatorsFresh(ind) {
   if (!ind || typeof ind !== 'object') return false;
@@ -664,12 +674,11 @@ function startScheduler() {
       const ind = await lxRequest('/indicators').catch(() => null);
       if (!indicatorsFresh(ind)) {
         log('[BOT] Periodic analysis skipped (stale/no_data indicators)');
-        // Warn at most once every 30 min instead of spamming every 15.
-        const now = Date.now();
-        if (now - lastStaleWarned > 30 * 60 * 1000) {
-          lastStaleWarned = now;
-          try { await tgSend('⚠️ Bot: LiveExporter/ATAS sin datos frescos — análisis periódico en pausa hasta que ATAS esté abierto.'); } catch (_) {}
-        }
+        // 2026-10-07: este aviso a Telegram existia SOLO para explicar por que no
+        // llegaba el informe de 15 min. Sin ese informe, el aviso no tiene
+        // sentido: si ATAS esta cerrado no hay nada que avisar, porque tampoco
+        // hay análisis que esperar. Si ATAS se cierra y eso es un problema, lo
+        // dira el grabador de veredictos, que es quien depende de el.
         return;
       }
       const digest = await periodicStateDigest();
@@ -699,7 +708,30 @@ function startScheduler() {
       try { await tgSend(`⚠️ Bot: análisis periódico falló (${e.message})`); } catch (_) {}
     }
   };
-  setInterval(tick, ANALYSIS_INTERVAL_MS);
+  // 2026-10-07 — INFORME PERIODICO DE 15 MIN: DESACTIVADO POR PETICION EXPLICITA.
+  // "hay que eliminar el informe 15m, no quiero recibir ese informe".
+  //
+  // Antes llevaba un gate de "state unchanged", pero el digest incluye precio y
+  // por eso cambiaba casi siempre: en 15 min el precio SIEMPRE se mueve, asi que
+  // el gate no filtraba nada. El informe llegaba igual, con score y sesgo
+  // repetidos.
+  //
+  // La funcion `tick` y `runAnalysis` NO se borran: siguen siendo el motor de
+  // calculo y se usan bajo demanda. Lo que se elimina es elenvío automático.
+  // Para tener un análisis cuando quieras, pidelo — o reactivalo poniendo
+  // ANALYSIS_INTERVAL_MS > 0.
+  //
+  // Nota: el gate de frescura y la validacion de reglas 6/7 que hay dentro de
+  // runAnalysis siguen siendo los que usan los otros caminos (comandos /a, /long,
+  // /short del chat). No se pierde esa logica.
+  if (PERIODIC_ENABLED) {
+    const mins = Number(process.env.BOT_PERIODIC_MINUTES);
+    log(`[BOT] Periodic analysis ENABLED every ${mins} min`);
+    setInterval(tick, mins * 60 * 1000);
+  } else {
+    log('[BOT] Periodic analysis DISABLED (BOT_PERIODIC_MINUTES=0).');
+  }
+
   setInterval(async () => {
     // 2026-10-07: el heartbeat solo decia "OK". No es informacion — es ruido con
     // forma de confirmacion, y cada 15 min hacia que un fallo real se escondiera
@@ -747,7 +779,11 @@ async function main() {
 
   // Start periodic scheduler (background) BEFORE the infinite polling loop
   startScheduler();
-  log('[BOT] Scheduler armed (periodic analysis every 15min, heartbeat 15min)');
+  // 2026-10-07: este mensaje deia "periodic analysis every 15min" aunque el
+  // informe periodico lleva DESACTIVADO. Un log que afirma lo contrario de lo que
+  // hace es peor que no tener log: es exactamente lo que hizo que este bug pasara
+  // inadvertido. Ahora dice la verdad y se puede comprobar de un vistazo.
+  log(`[BOT] Scheduler armed (periodic: ${PERIODIC_ENABLED ? 'ON ' + process.env.BOT_PERIODIC_MINUTES + 'min' : 'OFF'}, heartbeat local ${HEARTBEAT_INTERVAL_MS/60000}min, chat commands ON)`);
 
   await startTwoWay(); // infinite loop — polls getUpdates
   log('[BOT] All systems LIVE. Ctrl+C to stop.');
