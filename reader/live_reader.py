@@ -20,7 +20,7 @@ LAS 4 FUENTES
 
 Las reglas 6/7 (Fase 3) solo usan ATAS, porque son reglas de order flow. Las
 otras tres fuentes ACONTEXTUALIZAN y no pueden cambiar el veredicto — pero sí
-pueden競 disqualificarlo si el símbolo no es el que pediste.
+pueden descalificarlo si el símbolo no es el que pediste.
 
 Uso:
   python live_reader.py --text

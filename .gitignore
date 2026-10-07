@@ -59,3 +59,10 @@ reader/reader.db-shm
 atas-bridge/atas_target.json
 # FASE 4: estado de notificacion (por simbolo, ultimo veredicto enviado)
 reader/notify_state.json
+# supervisor del reader: logs + status de runtime
+reader/supervisor.log
+reader/supervisor_stdout.log
+reader/supervisor_stderr.log
+reader/supervisor_launch.log
+reader/supervisor_status.json
+reader/__pycache__/
