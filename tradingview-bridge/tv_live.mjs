@@ -93,4 +93,13 @@ async function main() {
   console.log(`last 24 bars: high ${hi} low ${lo} range ${(hi-lo).toFixed(6)} (${((hi-lo)/px*100).toFixed(3)}%)`);
   console.log(`position in range: ${(((px-lo)/(hi-lo))*100).toFixed(1)}% (0=low,100=high)`);
 }
-main().catch(e => { console.error('FAIL', e.message); process.exit(1); });
+main()
+  .catch(e => { console.error('FAIL', e.message); process.exit(1); })
+  .finally(() => {
+    // The CDP websocket keeps the event loop alive, so the process hangs after
+    // printing. That forced every caller to wrap this in a timeout and kill it.
+    // Close the connection and exit explicitly. NOTE: a bare close() is not
+    // enough if other sockets linger, hence the hard exit.
+    try { client && client.close && client.close(); } catch {}
+    process.exit(0);
+  });
