@@ -57,3 +57,5 @@ reader/reader.db-wal
 reader/reader.db-shm
 # objetivo del símbolo ATAS (config local, con reason/ timestamps propios)
 atas-bridge/atas_target.json
+# FASE 4: estado de notificacion (por simbolo, ultimo veredicto enviado)
+reader/notify_state.json
