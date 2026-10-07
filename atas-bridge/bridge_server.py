@@ -2513,7 +2513,42 @@ async def health():
         # rules un-evaluable until it warms up. Report it here so a consumer can
         # tell "rules cannot fire yet" from "market is flat".
         "cvd_warmup": _cvd_warmup_summary(),
+        # ATAS carries real L2 for ONE symbol (a hard platform limit). Which
+        # symbol is therefore an architecture decision, not an accident -- the
+        # chart that happened to be open. Publish the declared target and whether
+        # the live chart matches, so "I'm reading the wrong asset" is visible in
+        # health instead of inferred from a frozen file.
+        "atas_target": _atas_target_status(),
     }
+
+
+def _atas_target_status() -> dict:
+    """Declared ATAS target symbol vs the symbol actually charted.
+
+    Reads atas_target.json written by atas-bridge/atas_target.py. Never raises:
+    an unreadable or missing target must not break /health.
+    """
+    out = {"target": None, "reason": None, "set_at": None,
+           "chart": None, "match": None}
+    try:
+        import json as _j
+        tpath = os.path.join(os.path.dirname(__file__), "atas_target.json")
+        if os.path.exists(tpath):
+            with open(tpath, "r", encoding="utf-8") as f:
+                d = _j.load(f)
+            out["target"] = d.get("symbol")
+            out["reason"] = d.get("reason")
+            out["set_at"] = d.get("set_at")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)[:80]
+    try:
+        live = _live_indicator_symbols()
+        out["chart"] = sorted(live.keys())[0] if live else None
+        out["match"] = (out["target"] == out["chart"]
+                        if out["target"] and out["chart"] else None)
+    except Exception:
+        pass
+    return out
 
 
 def _cvd_warmup_summary() -> dict:

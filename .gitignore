@@ -50,3 +50,10 @@ Thumbs.db
 .idea/
 *.tmp
 *.bak
+
+# Rediseño: registro de evidencia (crece cada 30s; no versionar)
+reader/reader.db
+reader/reader.db-wal
+reader/reader.db-shm
+# objetivo del símbolo ATAS (config local, con reason/ timestamps propios)
+atas-bridge/atas_target.json
