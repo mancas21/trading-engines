@@ -53,14 +53,28 @@ async function main() {
     return e;
   }
   function rsi(arr, p) {
+    // 2026-10-07: esta funcion TENIA EL MISMO BUG que monitor.mjs. Sumaba solo
+    // los ultimos `p` cambios sin suavizado, asi que NO era el RSI14 estandar:
+    // daba 22.09 / 7.31 donde Wilder sobre la misma serie da 28.78 / 15.16.
+    // RSI6 7.31 se lee como "sobreventa extrema" cuando el valor real es 15.16.
+    // He estado llamando "real" a este numero y era el que estaba mal.
+    //
+    // Ahora: semilla media simple + suavizado de Wilder sobre toda la serie, que
+    // es lo que usan TradingView y cualquier plataforma. Requiere p+1 barras
+    // minimo y converge; con 300 barras el resultado es estable.
     if (arr.length < p + 1) return null;
     let g = 0, l = 0;
-    for (let i = arr.length - p; i < arr.length; i++) {
+    for (let i = 1; i <= p; i++) {
       const d = arr[i] - arr[i - 1];
       if (d > 0) g += d; else l -= d;
     }
-    g /= p; l /= p;
-    return l === 0 ? 100 : 100 - 100 / (1 + g / l);
+    let ag = g / p, al = l / p;
+    for (let i = p + 1; i < arr.length; i++) {
+      const d = arr[i] - arr[i - 1];
+      ag = (ag * (p - 1) + (d > 0 ? d : 0)) / p;
+      al = (al * (p - 1) + (d < 0 ? -d : 0)) / p;
+    }
+    return al === 0 ? 100 : 100 - 100 / (1 + ag / al);
   }
   function atr(b, p = 14) {
     if (b.length < p + 1) return null;

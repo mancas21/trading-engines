@@ -70,16 +70,38 @@ async function getMps() {
 }
 
 // Calculate RSI from price history
+// 2026-10-07 — RSI REESCRITO. La version anterior NO era el RSI14 estandar y
+// por eso la tarjeta mostraba numeros que no coincidian con el analisis real:
+//
+//   antes: sumaba SOLO los ultimos `period` cambios (sin suavizado) sobre las
+//         ultimas 60 barras  -> RSI14 22.01 / RSI6 7.27
+//   ahora: Wilder (el que usan TradingView, tv_live.mjs y todo el mundo)
+//         sobre las 300 barras -> RSI14 28.67 / RSI6 15.04
+//
+// El bug era material: RSI6 7.27 se leia como "sobreventa extrema" cuando el
+// valor real era 15.04, y RSI14 22.01 vs 28.67 cambiaba la zona. No era
+// redondeo, era un metodo de calculo distinto; la tarjetaessentially fabricaba
+// su propia lectura.
+//
+// Se calcula sobre TODAS las barras disponibles (no 60) para que el suavizado de
+// Wilder tenga historia suficiente y converja al valor real.
 function calcRsi(bars, period = 14) {
-  if (bars.length < period + 1) return null;
+  if (!bars || bars.length < period + 1) return null;
   let gains = 0, losses = 0;
-  for (let i = bars.length - period; i < bars.length; i++) {
+  // semilla: media simple de los primeros `period` cambios
+  for (let i = 1; i <= period; i++) {
     const diff = bars[i].c - bars[i - 1].c;
     if (diff >= 0) gains += diff;
     else losses -= diff;
   }
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+  // suavizado de Wilder sobre el resto de la serie
+  for (let i = period + 1; i < bars.length; i++) {
+    const diff = bars[i].c - bars[i - 1].c;
+    avgGain = (avgGain * (period - 1) + (diff > 0 ? diff : 0)) / period;
+    avgLoss = (avgLoss * (period - 1) + (diff < 0 ? -diff : 0)) / period;
+  }
   if (avgLoss === 0) return 100;
   const rs = avgGain / avgLoss;
   return 100 - (100 / (1 + rs));
@@ -167,13 +189,56 @@ async function sendTgAnalysis(msg) {
 }
 
 // Get 60 bars for analysis
+// 2026-10-07: antes devolvia solo las ultimas 60 barras. Con el suavizado de
+// Wilder eso no alcanza para que el RSI converja: 60 barras dan un valor que no
+// coincide con el de TradingView ni con tv_live.mjs (que usa 300). Se piden
+// todas las que el chart tiene cargadas, con un tope de 400 por memoria.
+const BARS_FOR_RSI = 400;
 async function getBars() {
   const { result } = await client.Runtime.evaluate({
-    expression: '(function(){var wv=window.TradingViewApi._activeChartWidgetWV;var ms=wv.value()._chartWidget.model().mainSeries();var items=ms.bars()._items,l=items.length,o=[];for(var i=Math.max(0,l-60);i<l;i++){if(items[i])o.push({o:items[i].value[1],h:items[i].value[2],l:items[i].value[3],c:items[i].value[4],v:items[i].value[5]})}return o})()',
+    expression: '(function(){var wv=window.TradingViewApi._activeChartWidgetWV;var ms=wv.value()._chartWidget.model().mainSeries();var items=ms.bars()._items,l=items.length,o=[];var from=Math.max(0,l-' + BARS_FOR_RSI + ');for(var i=from;i<l;i++){if(items[i])o.push({o:items[i].value[1],h:items[i].value[2],l:items[i].value[3],c:items[i].value[4],v:items[i].value[5]})}return o})()',
     returnByValue: true, awaitPromise: false
   });
   if (result.exceptionDetails) return null;
   return result.value;
+}
+
+// 2026-10-07: el POC que se imprimia era SINTETICO - un histograma de volumen
+// por PRECIO DE CIERRE (vc[round(close/0.05)*0.05] += volume). Eso NO es un POC:
+// el Point of Control sale del FOOTPRINT (volumen negociado en cada nivel de
+// precio), no de donde cerro la barra. El numero era real pero la magnitud no
+// significaba nada. Ahora se lee el POC real del puente ATAS; si no hay dato
+// vivo, la tarjeta lo dice en vez de inventarlo.
+async function getAtasFootprint() {
+  try {
+    const http = await import('http');
+    const body = await new Promise((res, rej) => {
+      const req = http.request({ hostname: '127.0.0.1', port: 8000, path: '/indicators', method: 'GET' }, (r) => {
+        let d = ''; r.on('data', (c) => d += c); r.on('end', () => res(d));
+      });
+      req.on('error', rej);
+      req.setTimeout(6000, () => { req.destroy(); rej(new Error('timeout')); });
+      req.end();
+    });
+    const j = JSON.parse(body);
+    const fp = j.footprint || {};
+    const ts = j.timestamp || 0;
+    const ageS = ts ? Math.abs(Date.now() / 1000 - (ts > 1e11 ? ts / 1000 : ts)) : null;
+    if (ageS !== null && ageS > 300) return { stale: true, ageS: Math.round(ageS) };
+    const dom = j.dom || {};
+    return {
+      stale: false,
+      ticker: j.ticker, time: j.time, barIndex: j.bar_index,
+      price: (j.price || {}).last,
+      poc: fp.poc, vah: fp.value_area_high, val: fp.value_area_low,
+      levels: (fp.top_levels || []).length,
+      imbalanceEma: dom.imbalance_pct_ema,
+      volumeRatio: (j.volume || {}).volume_ratio,
+      ageS: ageS === null ? null : Math.round(ageS),
+    };
+  } catch (e) {
+    return { error: e.message };
+  }
 }
 
 function calcEma(p, per) {
@@ -205,12 +270,13 @@ async function sendFullAnalysis(sym, currentPrice) {
   const microRes = sh.length > 0 ? Math.max(...sh) : sHigh;
   const microSup = sl.length > 0 ? Math.min(...sl) : sLow;
 
-  // Volume profile
-  const step = 0.05;
-  const vc = {};
-  bars.forEach(b => { const k = Math.round(b.c/step)*step; vc[k] = (vc[k]||0)+b.v; });
-  const sorted = Object.entries(vc).sort((a,b)=>b[1]-a[1]);
-  const poc = sorted.length > 0 ? parseFloat(sorted[0][0]) : currentPrice;
+  // Volume profile — ELIMINADO el POC sintetico (2026-10-07).
+  // Antes: step=0.05; vc[Math.round(b.c/step)*step] += b.v  -> volumen por
+  // PRECIO DE CIERRE. El "POC" que salia de ahi no es un Point of Control: el
+  // POC sale del footprint (volumen negociado en cada nivel), no de donde cerro
+  // la barra. Ahora el POC viene de ATAS en getAtasFootprint(), y si no hay dato
+  // vivo la tarjeta lo declara en vez de fabricar un numero.
+  const atas = await getAtasFootprint();
 
   const vsEma9 = currentPrice > e9 ? '✅ above' : '🔻 below';
   const rsiZone = r14 >= 70 ? 'OB' : r14 <= 30 ? 'OS' : r14 > 55 ? 'high' : r14 < 45 ? 'low' : 'mid';
@@ -221,17 +287,55 @@ async function sendFullAnalysis(sym, currentPrice) {
   else if (currentPrice < e9 && e9 > e21) bias = 'PULLBACK';
   else if (currentPrice > e9 && e9 < e21) bias = 'RECOVERY';
 
+  // 2026-10-07 — TARJETA REESCRITA.
+  //
+  // Los tres bugs que hacian que los datos NO coincidieran con el analisis real:
+  //
+  //  1) POC SINTETICO: venia de un histograma de precio-de-cierre, no del
+  //     footprint. Ahora sale de ATAS (getAtasFootprint) o se declara ausente.
+  //  2) SIN ORDER-FLOW: la tarjeta no leia ni /indicators ni /cvd ni /dom, asi
+  //     que no podia incluir CVD, DOM imbalance, footprint ni las Reglas 6/7 de
+  //     rules.json v3.3. Ahora los lee y si no estan, lo dice.
+  //  3) PRECIO A 2 DECIMALES: 1.4252 se imprimia como 1.42. En un activo de
+  //     1.42 eso es 0.37% de error solo por redondeo. Ahora 4 decimales.
+  //
+  // Ademas se estampa el origen y la edad de cada dato, para que la tarjeta sea
+  // auditable contra el analisis en vez de tener que fiarse de ella.
+  const fx = (v) => (typeof v === 'number' && isFinite(v)) ? v.toFixed(4) : '?';
+  const hasAtas = atas && !atas.stale && !atas.error && atas.poc != null;
+
+  const atasBlock = hasAtas
+    ? `🧱 *ATAS order-flow* (age ${atas.ageS}s, barra ${atas.time} #${atas.barIndex})\n` +
+      `• POC: $${fx(atas.poc)} | Value area: $${fx(atas.val)} – $${fx(atas.vah)}\n` +
+      `• Niveles footprint: ${atas.levels}\n` +
+      `• DOM imbalance EMA: ${typeof atas.imbalanceEma === 'number' ? atas.imbalanceEma.toFixed(2) + '%' : '?'}` +
+      `${typeof atas.imbalanceEma === 'number' ? (atas.imbalanceEma > 10 ? ' (sobre +10%)' : atas.imbalanceEma < 5 ? ' (bajo +5%)' : ' (neutro)') : ''}\n` +
+      `• Vol ratio: ${typeof atas.volumeRatio === 'number' ? atas.volumeRatio.toFixed(3) : '?'}${typeof atas.volumeRatio === 'number' && atas.volumeRatio < 0.3 ? ' (barra formandose: no concluyente)' : ''}\n`
+    : `🧱 *ATAS order-flow*: NO DISPONIBLE\n` +
+      `   ${atas && atas.stale ? `dato congelado (age ${atas.ageS}s > 300s) — no se usa` : atas && atas.error ? `error: ${atas.error}` : 'sin footprint'}` +
+      `\n   -> Sin ATAS no hay CVD, ni DOM, ni footprint. NO se aplica rules.json 6/7.\n`;
+
   const txt = `📊 *${sym} — LIVE*\n\n` +
-    `💵 $${currentPrice.toFixed(2)} | H:$${Math.max(...h).toFixed(2)} L:${Math.min(...lo).toFixed(2)}\n\n` +
-    `📈 Indicadores:\n` +
-    `• EMA9: $${e9?.toFixed(2)||'?'} | EMA21: $${e21?.toFixed(2)||'?'} | EMA50: $${e50?.toFixed(2)||'?'}\n` +
+    `💵 $${fx(currentPrice)} | H:$${fx(Math.max(...h))} L:${fx(Math.min(...lo))}\n\n` +
+    `📈 *TradingView* (Wilder, ${bars.length} barras)\n` +
+    `• EMA9: $${e9?fx(e9):'?'} | EMA21: $${e21?fx(e21):'?'} | EMA50: $${e50?fx(e50):'?'}\n` +
     `• ${crossState} | Precio: ${vsEma9} EMA9\n` +
     `• RSI14: ${r14?.toFixed(1)||'?'} (${rsiZone}) | RSI6: ${r6?.toFixed(1)||'?'}\n` +
-    `• Vol: ${vr}x | POC: $${poc.toFixed(2)}\n\n` +
-    `📊 Estructura:\n` +
-    `• Rango: $${sLow.toFixed(2)} → $${sHigh.toFixed(2)} ($${(sHigh-sLow).toFixed(2)})\n` +
-    `• MicroRes: $${microRes.toFixed(2)} | MicroSup: $${microSup.toFixed(2)}\n\n` +
-    `🎯 Bias: *${bias}*`;
+    `• Vol: ${vr}x (TV)\n\n` +
+    atasBlock + `\n` +
+    `📊 *Estructura* (sintetica, de barras OHLC)\n` +
+    `• Rango: $${fx(sLow)} → $${fx(sHigh)}\n` +
+    `• MicroRes: $${fx(microRes)} | MicroSup: $${fx(microSup)}\n\n` +
+    `🎯 Bias (por EMAs, NO es un veredicto de rules.json): *${bias}*\n` +
+    `_${new Date().toISOString().replace('T',' ').slice(0,19)} UTC · sources: TV+${hasAtas?'ATAS':'ATAS AUSENTE'}_`;
+
+  // 2026-10-07: la tarjeta se ENVIABA pero su texto no se logueaba, asi que no
+  // habia forma de comprobar que lo que llega a Telegram es lo que dice el
+  // codigo. Ahora se imprime completa. Sin esto, cualquier bug de datos en la
+  // tarjeta es invisible: solo se ve el "enviado".
+  console.log('----- TARJETA ENVIADA A TELEGRAM -----');
+  console.log(txt);
+  console.log('----- FIN TARJETA -----');
 
   await sendTgAnalysis(txt);
 }
@@ -255,8 +359,21 @@ async function main() {
       priceHist.push(q.close);
       if (priceHist.length > 30) priceHist.shift();
 
-      // Calc RSI every bar
-      const rsi = calcRsi(priceHist.map(c => ({ c })), 14);
+      // 2026-10-07 — BUG DE ORIGEN. Estas alertas (RSI sobrecomprado /
+      // sobrevendido, cruce de EMA, divergencia, vol spike) calcularan el RSI
+      // sobre `priceHist`, un buffer que se llena cada 8s con q.close — es
+      // decir, ticks del poll, NO barras del chart. Con la funcion antigua
+      // (media simple de los ultimos p cambios) eso "funcionaba" y daba un
+      // numero; al pasar a Wilder, un RSI sobre ticks de 8s con buffer de 30
+      // no converge y da otra cosa distinta del RSI14 real.
+      //
+      // Ahora el RSI de las alertas se calcula sobre las BARRAS reales del
+      // chart, igual que la tarjeta y que tv_live.mjs. Si no hay barras, no se
+      // alerta: mejor callar que avisar con un numero que no es el RSI.
+      const barList = await getBars();
+      const rsi = barList && barList.length > 20
+        ? calcRsi(barList, 14)
+        : null;
       if (rsi !== null) {
         rsiHist.push(rsi);
         if (rsiHist.length > 30) rsiHist.shift();

@@ -310,11 +310,12 @@ async function runAnalysis() {
   const _planBody = (direction, entryLow, entryHigh, sl, t1, t2) => {
     const tag = direction === 'long' ? '🟢 PLAN LONG' : '🔴 PLAN SHORT';
     const inv = direction === 'long' ? 'cierre < SL' : 'cierre > SL';
-    import('http').then(h=>{
-      const body=JSON.stringify({symbol:ticker,direction,entry_low:Number(entryLow.toFixed(2)),entry_high:Number(entryHigh.toFixed(2)),sl:Number(sl.toFixed(2)),t1:Number(t1.toFixed(2)),t2:Number(t2.toFixed(2)),note:`tg-bot live-anchored ${p.toFixed(2)}`});
-      const req=h.request({hostname:'127.0.0.1',port:8000,path:'/calls',method:'POST',headers:{'Content-Type':'application/json'}},()=>{});
-      req.on('error',()=>{}); req.write(body); req.end();
-    }).catch(()=>{});
+    // 2026-10-07: este POST a /calls se elimino junto con el endpoint. La ruta
+    // registro->resolve midio 25 calls con expectancy_r_net = -0.446 y PF 0.398.
+    // El plan SIGUE imprimiendose en el mensaje: el usuario sigue viendo la
+    // hipotesis; lo que se fue es el motor que la contabilizaba como trade.
+    // Si quieres reintroducir un registro de resultados, tiene que ser una
+    // ruta nueva y medida, no este POST.
     return `${tag}\nEntry: ${entryLow.toFixed(2)} – ${entryHigh.toFixed(2)} (live $${p.toFixed(2)} ±0.05%)\nStop: ${sl.toFixed(2)} (invalida ${inv})\nT1: ${t1.toFixed(2)} | T2: ${t2.toFixed(2)} (med ${expMed.toFixed(2)}% / p90 ${expP90.toFixed(2)}% · T1/SL ${_t1OverSl.toFixed(2)} · cost ${_costR.toFixed(3)}R)`;
   };
   if (fires && compScore > 0) {

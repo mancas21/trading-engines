@@ -8,7 +8,19 @@ if (-not $tvPath) {
     exit 1
 }
 Write-Host "Found TradingView at: $tvPath" -ForegroundColor Green
-$projectDir = "C:\Users\Lenovo\claudeverstradingview"
+# 2026-10-07: apuntaba a la copia vieja C:\Users\Lenovo\claudeverstradingview.
+# Esta es la copia DUPLICADA de tradingview-bridge/scripts/start-tv-bot.ps1 (los dos
+# ficheros existen y son distintos). Se corrige la ruta aqui tambien; si solo se
+# arreglara uno, el otro volveria a arrancar el codigo viejo.
+$projectDir = $PSScriptRoot
+if (-not (Test-Path (Join-Path $projectDir 'telegram-bot.mjs'))) {
+    $projectDir = Split-Path $PSScriptRoot -Parent
+}
+if (-not (Test-Path (Join-Path $projectDir 'telegram-bot.mjs'))) {
+    Write-Host "Error: telegram-bot.mjs no encontrado cerca de $PSScriptRoot" -ForegroundColor Red
+    exit 1
+}
+Write-Host "Project dir: $projectDir" -ForegroundColor Green
 
 Write-Host "=== Killing existing TV instances ===" -ForegroundColor Yellow
 Get-Process -Name "TradingView" -ErrorAction SilentlyContinue | Stop-Process -Force

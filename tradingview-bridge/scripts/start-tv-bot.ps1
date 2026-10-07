@@ -8,7 +8,18 @@ if (-not $tvPath) {
     exit 1
 }
 Write-Host "Found TradingView at: $tvPath" -ForegroundColor Green
-$projectDir = "C:\Users\Lenovo\claudeverstradingview"
+# 2026-10-07: apuntaba a la copia vieja C:\Users\Lenovo\claudeverstradingview.
+# Ahora se resuelve desde la ubicacion de este propio script, asi que el .bat y
+# el .mjs siempre se ejecutan en el mismo repositorio y no pueden divergir.
+$projectDir = $PSScriptRoot
+if (-not (Test-Path (Join-Path $projectDir 'telegram-bot.mjs'))) {
+    $projectDir = Split-Path $PSScriptRoot -Parent
+}
+if (-not (Test-Path (Join-Path $projectDir 'telegram-bot.mjs'))) {
+    Write-Host "Error: telegram-bot.mjs no encontrado cerca de $PSScriptRoot" -ForegroundColor Red
+    exit 1
+}
+Write-Host "Project dir: $projectDir" -ForegroundColor Green
 
 Write-Host "=== Killing existing TV instances ===" -ForegroundColor Yellow
 Get-Process -Name "TradingView" -ErrorAction SilentlyContinue | Stop-Process -Force
