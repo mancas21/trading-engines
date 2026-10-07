@@ -22,7 +22,7 @@ un bucle de reinicios no es recuperación, es un fallo que hay que mirar.
 Uso:
   python reader_supervisor.py --once        # un ciclo
   python reader_supervisor.py --loop         # supervise para siempre
-  python reader_supervisor.py --status      # estado y ultimo error
+  python reader_supervisor.py --status      # estado, pausa, reintentos
 """
 from __future__ import annotations
 
@@ -55,9 +55,15 @@ NOTIFY_EVERY_S = 60.0
 # Codigo que el notificador usa para decir "ya hay otro servicio".
 ALREADY_RUNNING_EXIT = 3
 
-# Techo de fallos rapidos antes de rendirse.
+# Techo de fallos rapidos antes de PAUSAR (ya no de rendirse).
 MAX_FAST_FAILS = 5
 FAST_FAIL_SECONDS = 120.0
+# Politica de pausa: espera creciente hasta este tope, y como mucho este numero
+# de intentos. Agotados, el supervisor .bat sale y el servicio queda parado y
+# visible, nunca en bucle.
+RETRY_BACKOFF_S = 60.0
+RETRY_BACKOFF_MAX_S = 300.0
+MAX_RETRY_ATTEMPTS = 20
 
 
 def log(msg: str) -> None:
@@ -137,6 +143,8 @@ def do_loop(interval: float, dry_run: bool = False) -> int:
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     fails = 0
+    attempts = 0
+    paused_was = False
     while True:
         t0 = time.time()
         try:
@@ -146,6 +154,7 @@ def do_loop(interval: float, dry_run: bool = False) -> int:
         ran = time.time() - t0
         if ok:
             fails = 0
+            paused_was = bool(attempts)
         else:
             fails = fails + 1 if ran < FAST_FAIL_SECONDS else 0
         st = {}
@@ -156,9 +165,64 @@ def do_loop(interval: float, dry_run: bool = False) -> int:
         st["consecutive_failures"] = fails
         write_status(st)
         if fails >= MAX_FAST_FAILS:
-            log(f"DANDO POR RENDIDO tras {fails} ciclos con fallo. "
-                f"ultimo: {tail[:90]} — esto no es recuperacion, es un fallo.")
-            return 1
+            # OPCION A (2026-10-07): PAUSAR y reintentar, en vez de morir.
+            #
+            # Por que cambio: el PUENTE se reinicia solo cada ~20-40 min
+            # (bridge_supervisor.log: "Bridge exited (code -1), restarting in
+            # 3s"). Con el comportamiento de rendirse, cada uno de esos
+            # reinicios mataba el grabador, y nadie lo relanzaba: el servicio
+            # quedaba muerto hasta que alguien lo arrancaba a mano. Medido: tres
+            # muertes por rendicion en una sesion.
+            #
+            # Por que NO es el lazo ciego del incidente "Already running":
+            # aqui NO se relanza ningun hijo. Solo se reintenta la LECTURA, con
+            # espera creciente, tope de intentos, y una linea de log cada vez.
+            # Un reinicio automatico de proceso es lo que provoco aquella pila
+            # de dialogos; un reintento de lectura HTTP no puede hacer eso.
+            #
+            # Si tras el tope sigue fallando, se devuelve 1: el supervisor
+            # .bat entonces sale y queda PARADO y visible, no en bucle.
+            attempts += 1
+            backoff = min(RETRY_BACKOFF_MAX_S, RETRY_BACKOFF_S * attempts)
+            log(f"PAUSA: {fails} fallos seguidos -> reintento en {backoff:.0f}s "
+                f"(intento {attempts}/{MAX_RETRY_ATTEMPTS}). ultimo: {tail[:70]}")
+            st = {}
+            try:
+                st = json.loads(STATUS.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            st["paused"] = True
+            st["paused_at"] = datetime.now().isoformat()
+            st["retry_attempt"] = attempts
+            st["retry_backoff_s"] = backoff
+            write_status(st)
+            if attempts >= MAX_RETRY_ATTEMPTS:
+                log(f"AGOTADOS {attempts} reintentos. El servicio queda PARADO "
+                    f"(no en bucle). Revisa la causa antes de relanzar.")
+                st["paused"] = False
+                st["gave_up"] = True
+                write_status(st)
+                return 1
+            time.sleep(backoff)
+            continue
+
+        if paused_was:
+            log(f"RECUPERADO tras {attempts} pausa(s): la lectura vuelve a "
+                f"funcionar.ULTIMO: {tail[:70]}")
+            attempts = 0
+            st = {}
+            try:
+                st = json.loads(STATUS.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            st.pop("paused", None)
+            st.pop("retry_attempt", None)
+            st.pop("retry_backoff_s", None)
+            st["gave_up"] = False
+            st["recovered_at"] = datetime.now().isoformat()
+            write_status(st)
+        paused_was = False
+
         try:
             time.sleep(max(0.0, interval - ran))
         except KeyboardInterrupt:
