@@ -135,6 +135,8 @@ TRADE_SUMMARY_WINDOW = 10
 BINANCE_DEPTH_URL = "wss://fstream.binance.com/ws/{symbol}@depth20@100ms"
 BINANCE_TRADE_URL = "wss://fstream.binance.com/ws/{symbol}@trade"
 BINANCE_DEPTH_REST_URL = "https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=20"
+# Consecutive reconnect attempts per symbol, for the jittered backoff above.
+_ws_retry: dict[str, int] = {}
 
 
 async def _dom_feeds():
@@ -204,8 +206,24 @@ async def _dom_feeds():
                 dom_persist[sym]["ask_wall_hits"] = 0
                 dom_persist[sym]["ask_wall_price"] = 0
                 
-                async with websockets.connect(depth_url, ping_interval=20, ping_timeout=10) as d_ws, \
-                           websockets.connect(trade_url, ping_interval=20, close_timeout=5) as t_ws:
+                # Ping params were killing our OWN sockets (2026-10-07).
+                # ping_interval=20 / ping_timeout=10 means: if a pong does not
+                # come back within 10s, close the socket. Under load (19 sockets
+                # total, all reconnecting at once after a network blip) the event
+                # loop cannot service pings that fast, so every socket decided it
+                # was dead and the feeds reconnected in a loop -- which starved
+                # the HTTP server until it stopped accepting connections while the
+                # process stayed alive. Now: one combined socket per symbol (see
+                # _SYMBOL_STREAMS), generous pings, and a bounded reconnect.
+                async with websockets.connect(depth_url, ping_interval=20,
+                                              ping_timeout=60,
+                                              close_timeout=5,
+                                              max_queue=1024) as d_ws, \
+                           websockets.connect(trade_url, ping_interval=20,
+                                              ping_timeout=60,
+                                              close_timeout=5,
+                                              max_queue=1024) as t_ws:
+                    _ws_retry[sym] = 0
                     log.info("DOM+Trade feed connected for %s", sym)
 
                     async def _process_depth():
@@ -371,7 +389,13 @@ async def _dom_feeds():
                     _wd.STATE.record_ws_reconnect(sym)
                 except Exception:
                     pass
-                await asyncio.sleep(5)
+                # Jittered, escalating backoff. A fixed 5s made all 9 symbols
+                # reconnect on the SAME tick, which is what turned one network
+                # blip into a self-sustaining reconnect storm.
+                _rsym = _ws_retry.get(sym, 0) + 1
+                _ws_retry[sym] = _rsym
+                await asyncio.sleep(min(2 ** min(_rsym, 5), 60) * (0.7 + random.random() * 0.6))
+                continue
 
     tasks = [asyncio.create_task(_run_symbol_feed(sym)) for sym in symbols]
     await asyncio.gather(*tasks)
