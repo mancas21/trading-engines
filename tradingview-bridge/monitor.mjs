@@ -11,11 +11,47 @@ const TG_CHAT = process.env.TELEGRAM_CHAT_ID;
 const INTERVAL = Number(process.argv[2]) || 8;
 
 // Thresholds for SPCXUSDT.P
-const LEVELS = {
-  resistance: 160.00,
-  support: 152.00,
-  majorSupport: 148.00
-};
+// 2026-10-07 — ESTOS NIVELES ESTABAN HARDCODEADOS A 160/152/148, QUE SON
+// NIVELES DE BTC. El sistema se reinicio contra XRPUSDT a ~$1.42, asi que el
+// precio SIEMPRE estaba "por debajo del soporte" y estas alertas se disparaban
+// sin parar: 10 BREAKDOWN + 12 "PERDIÓ SOPORTE" en pocos minutos. Ademas
+// `lowestDuringTrend - 0.01` es un umbral absoluto de 1 centimo, que en BTC es
+// ruido pero en XRP es el 0.7% del precio.
+//
+// Ahora los niveles se DERIVAN del propio activo: micro-resistencia/soporte de
+// los ultimos 20 swings, y los histeres se expresan en PORCENTAJE, no en
+// unidades absolutas. Si no hay datos para derivarlos, no se alerta — un nivel
+// inventado es peor que silencio.
+const PRICE_LEVEL_TOL = 0.004;      // 0.4% de histéresis
+const BREAKDOWN_TOL = 0.002;         // 0.2% bajo el soporte
+const CONTINUATION_PCT = 0.004;      // nuevo mínimo = -0.4%
+const SWING_LOOKBACK = 20;
+
+// LEVELS se rellena en cada ciclo con niveles DERIVADOS del propio activo.
+// Antes era una constante y por eso daba "$152.00" en un activo de $1.42.
+// `valid` false = no hay datos suficientes: el bloque de alertas se salta entero.
+let LEVELS = { resistance: 0, support: 0, majorSupport: 0, valid: false };
+
+// Deriva micro-resistencia / soporte de los últimos SWING_LOOKBACK swings, y un
+// "soporte mayor" algo más abajo. Si no encuentra ningún swing, marca
+// valid:false en vez de inventar un número.
+function deriveLevels(bars) {
+  if (!bars || bars.length < 30) return { resistance: 0, support: 0, majorSupport: 0, valid: false };
+  const last = bars.slice(-SWING_LOOKBACK);
+  const hi = [], lo = [];
+  for (let i = 1; i < last.length - 1; i++) {
+    if (last[i].h > last[i - 1].h && last[i].h > last[i + 1].h) hi.push(last[i].h);
+    if (last[i].l < last[i - 1].l && last[i].l < last[i + 1].l) lo.push(last[i].l);
+  }
+  if (!hi.length || !lo.length) return { resistance: 0, support: 0, majorSupport: 0, valid: false };
+  const resistance = Math.max(...hi);
+  const support = Math.min(...lo);
+  const majorSupport = support * 0.985;   // 1.5% más abajo = soporte mayor
+  if (!(resistance > support) || support <= 0) {
+    return { resistance: 0, support: 0, majorSupport: 0, valid: false };
+  }
+  return { resistance, support, majorSupport, valid: true };
+}
 
 // === Periodic analysis Telegram delivery ===
 const ANALYSIS_INTERVAL_MS = 5 * 60 * 1000; // 5 min entre análisis completos
@@ -26,6 +62,14 @@ let triggeredRes = false, triggeredSup = false, triggeredMajor = false;
 let lastTgTime = 0;
 let priceHist = [], rsiHist = [];
 let sentRsOverbought = false, sentRsOversold = false;
+// 2026-10-07: faltaba declarar. El gate anti-repeticion del VOL SPIKE lo usa y,
+// sin esta linea, cada ciclo lanzaba ReferenceError. Se resetea junto con los
+// otros flags cuando el volumen vuelve a su media.
+let sentVolSpike = false;
+// 2026-10-07: serie de CIERRES DE BARRA para detectDivergence. Antes se usaba
+// priceHist, que se llenaba con q.close cada 8s (ticks del poll) y por tanto no
+// era la misma escala que el RSI, ya calculado sobre barras.
+let barHist = [];
 let sentBearDiv = false, sentBullDiv = false;
 let sentEmaCross = null;
 // === Rebound/breakdown confirmation tracking ===
@@ -345,7 +389,8 @@ async function main() {
   try { await connect(); } catch (e) { console.error('CDP fail:', e.message); process.exit(1); }
   console.log('[MONITOR] Connected. Interval: ' + INTERVAL + 's\n');
 
-  let volSum = 0, volCount = 0;
+  // 2026-10-07: volSum/volCount ya no se usan. El "volumen x promedio" sale ahora
+  // de las barras reales del chart (volMult), no de un buffer de ticks.
   let sym = '';
 
   while (true) {
@@ -355,7 +400,9 @@ async function main() {
       const mps = await getMps();
       sym = q.sym;
 
-      // Store price history for RSI calc
+      // priceHist ya no se usa: la divergencia compara ahora barHist (cierres de
+      // barra), la misma serie que el RSI. Se mantiene el push solo por
+      // compatibilidad? No — se elimina.
       priceHist.push(q.close);
       if (priceHist.length > 30) priceHist.shift();
 
@@ -377,20 +424,49 @@ async function main() {
       if (rsi !== null) {
         rsiHist.push(rsi);
         if (rsiHist.length > 30) rsiHist.shift();
+        // Misma serie que usa el RSI, para que la comparacion de divergencia sea
+        // entre escalas comparables. Solo se anade cuando la BARRA cambia, no en
+        // cada poll de 8s: si no, la serie se llenaria de repeticiones.
+        const lastBarClose = barList[barList.length - 1].c;
+        if (!barHist.length || barHist[barHist.length - 1] !== lastBarClose) {
+          barHist.push(lastBarClose);
+          if (barHist.length > 30) barHist.shift();
+        }
       }
+
+      // 2026-10-07: el "volumen x promedio" se calcula sobre las BARRAS reales.
+      // Antes usaba volSum/volCount, un buffer que se llenaba con q.vol cada 8s;
+      // como q.vol es el volumen ACUMULADO de la barra en curso (empieza en 0),
+      // el ratio se disparaba: medido "VOL SPIKE: 266.8x promedio", imposible.
+      let volMult = null;
+      if (barList && barList.length > 20) {
+        const bv = barList.map(b => b.v).filter(x => typeof x === 'number' && x > 0);
+        if (bv.length > 5) {
+          const vAvg = bv.slice(0, -1).reduce((a, b) => a + b, 0) / (bv.length - 1);
+          if (vAvg > 0) volMult = q.vol / vAvg;
+        }
+      }
+
+      // 2026-10-07: los niveles se derivan del propio activo en cada ciclo.
+      // Si pasan de un simbolo a otro, los niveles deBreakdown/Rebound/Continuation
+      // se recalculan; si dejan de valer (nivel roto de verdad, no por bug de
+      // unidades), el bloque de alertas se salta entero y no inventa nada.
+      LEVELS = deriveLevels(barList);
 
       if (lastPrice && lastPrice !== q.close) {
         const change = q.close - lastPrice;
-        const volAvg = volCount > 0 ? volSum / volCount : 0;
         const dir = change >= 0 ? '\uD83D\uDFE2' : '\uD83D\uDD34';
         const chgStr = (change >= 0 ? '+' : '') + change.toFixed(2);
         const pct = change / (q.close - change) * 100;
         const pctStr = (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
 
         // Print to console
-        let line = '[' + new Date().toLocaleTimeString() + '] ' + sym + ' ' + dir + ' $' + q.close.toFixed(2) + ' | ' + chgStr + ' (' + pctStr + ') | Vol ' + (q.vol / 1000).toFixed(1) + 'k';
+        let line = '[' + new Date().toLocaleTimeString() + '] ' + sym + ' ' + dir + ' $' + q.close.toFixed(4) + ' | ' + chgStr + ' (' + pctStr + ') | Vol ' + (q.vol / 1000).toFixed(1) + 'k';
         if (rsi !== null) line += ' | RSI: ' + rsi.toFixed(1);
-        if (volAvg > 0 && q.vol > volAvg * 2.5) line += ' \u26A1VOL';
+        // El marcador VOL usa el promedio de BARRAS. El volAvg de ticks se elimino
+        // aqui: daba ratios de 266x porque promediaba el volumen acumulado de la
+        // barra en curso, que empieza en cero.
+        if (volMult !== null && volMult > 2.5) line += ' \u26A1VOL';
         console.log(line);
 
         // --- SIGNAL DETECTION ---
@@ -399,7 +475,7 @@ async function main() {
         if (mps && mps['EMA Cross'] && mps['EMA Cross'] !== '\u2014') {
           const cross = mps['EMA Cross'];
           if (cross !== sentEmaCross && sentEmaCross !== null) {
-            const msg = '\u26A0\uFE0F ' + sym + ' EMA CROSS: ' + cross + ' en $' + q.close.toFixed(2);
+            const msg = '\u26A0\uFE0F ' + sym + ' EMA CROSS: ' + cross + ' en $' + q.close.toFixed(4);
             console.log('  >> ' + msg);
             sendTg(msg);
           }
@@ -408,7 +484,7 @@ async function main() {
 
         // 2. RSI Overbought (>70)
         if (rsi !== null && rsi > 70 && !sentRsOverbought) {
-          const msg = '\uD83D\uDD34 ' + sym + ' RSI SOBRECOMPRADO: ' + rsi.toFixed(1) + ' en $' + q.close.toFixed(2);
+          const msg = '\uD83D\uDD34 ' + sym + ' RSI SOBRECOMPRADO: ' + rsi.toFixed(1) + ' en $' + q.close.toFixed(4);
           console.log('  >> ' + msg);
           sendTg(msg);
           sentRsOverbought = true;
@@ -417,7 +493,7 @@ async function main() {
 
         // 3. RSI Oversold (<30)
         if (rsi !== null && rsi < 30 && !sentRsOversold) {
-          const msg = '\uD83D\uDFE2 ' + sym + ' RSI SOBREVENDIDO: ' + rsi.toFixed(1) + ' en $' + q.close.toFixed(2);
+          const msg = '\uD83D\uDFE2 ' + sym + ' RSI SOBREVENDIDO: ' + rsi.toFixed(1) + ' en $' + q.close.toFixed(4);
           console.log('  >> ' + msg);
           sendTg(msg);
           sentRsOversold = true;
@@ -425,31 +501,64 @@ async function main() {
         }
 
         // Reset RSI alerts when back to neutral
-        if (rsi !== null && rsi > 30 && rsi < 70) {
+        // 2026-10-07 — ANTI-SPAM por HISTÉRESIS. El reset era "rsi entre 30 y 70
+        // => limpiar flags". Con el RSI pegado al umbral eso producia un ciclo:
+        //   rsi=30.0 -> alerta (flag on)
+        //   rsi=29.9 -> sigue bajo 30, el flag se limpio arriba y vuelve a avisar
+        //   rsi=30.1 -> reset, flags a false
+        //   rsi=29.9 -> alerta otra vez
+        // Medido: 2 alertas "RSI SOBREVENDIDO" en minutos, con 29.9 y 30.0.
+        //
+        // Ahora el reset exige salir de la zona con HOLGURA (35/65), así que un
+        // RSI oscilando en 29-31 avisa UNA vez y se calla hasta que de verdad
+        // vuelva a zona neutral.
+        if (rsi !== null && rsi > 35 && rsi < 65) {
           sentRsOverbought = false;
           sentRsOversold = false;
         }
 
-        // 4. Volume Spike (from MPS or direct)
-        if (volAvg > 0 && q.vol > volAvg * 3) {
-          const mult = (q.vol / volAvg).toFixed(1);
-          const msg = '\u26A1 ' + sym + ' VOL SPIKE: ' + mult + 'x promedio en $' + q.close.toFixed(2) + ' (' + (q.vol / 1000).toFixed(0) + 'k)';
+        // === 4. Volume Spike (from MPS or direct) ===
+        // 2026-10-07 — BUG: el "promedio" salia de volSum/volCount, un buffer que
+        // se llenaba con q.vol CADA 8s. Pero q.vol es el volumen ACUMULADO DE LA
+        // BARRA en curso, no el volumen de un tick: dentro de la misma barra se
+        // lee cada vez mas grande. El promedio, en cambio, arrastraba la lectura
+        // diminuta del inicio de la barra, asi que el ratio se disparaba:
+        //   "VOL SPIKE: 266.8x promedio" — imposible, medido.
+        // Al cambiar de barra el volumen cae a cero y el ratio se invierte, asi
+        // que el alerta era ruido en ambos sentidos.
+        //
+        // Ahora el promedio sale de las BARRAS REALES del chart (las mismas que
+        // usa el RSI), que es lo que "volumen x promedio" significa de verdad.
+        // Si no hay barras, no hay alerta de volumen.
+        if (volMult !== null && volMult > 3 && !sentVolSpike) {
+          const mult = volMult.toFixed(1);
+          sentVolSpike = true;
+          const msg = '\u26A1 ' + sym + ' VOL SPIKE: ' + mult + 'x promedio en $' + q.close.toFixed(4) + ' (' + (q.vol / 1000).toFixed(0) + 'k)';
           console.log('  >> ' + msg);
           sendTg(msg);
         }
+        // Reset del gate: si el volumen vuelve a su media, se rearma la alerta.
+        if (volMult !== null && volMult < 1.5) sentVolSpike = false;
 
         // 5. Divergence detection
-        if (rsiHist.length >= 10 && priceHist.length >= 10) {
-          const divergence = detectDivergence(priceHist, rsiHist);
+        // 2026-10-07: dos problemas. (a) `rsi.toFixed(1)` sin comprobar rsi != null
+        // — si no hay barras, el RSI es null y esto es un TypeError en cada ciclo.
+        // (b) detectDivergence comparaba priceHist (TICKS cada 8s) contra rsiHist
+        // (ahora calculado sobre BARRAS): dos escalas distintas, la divergencia
+        // detectada no significa nada. Ahora se comparan las MISMAS series que
+        // usa el RSI, y la serie de precio se llena con el cierre de la barra, no
+        // con el del poll.
+        if (rsi !== null && rsiHist.length >= 10 && barHist.length >= 10) {
+          const divergence = detectDivergence(barHist, rsiHist);
           if (divergence === 'bearish' && !sentBearDiv) {
-            const msg = '\u26D4 ' + sym + ' DIVERGENCIA BAJISTA: precio alto > RSI bajo en $' + q.close.toFixed(2) + ' (RSI: ' + rsi.toFixed(1) + ')';
+            const msg = '\u26D4 ' + sym + ' DIVERGENCIA BAJISTA: precio alto > RSI bajo en $' + q.close.toFixed(4) + ' (RSI: ' + rsi.toFixed(1) + ')';
             console.log('  >> ' + msg);
             sendTg(msg);
             sentBearDiv = true;
             sentBullDiv = false;
           }
           if (divergence === 'bullish' && !sentBullDiv) {
-            const msg = '\uD83D\uDFE2 ' + sym + ' DIVERGENCIA ALCISTA: precio bajo < RSI alto en $' + q.close.toFixed(2) + ' (RSI: ' + rsi.toFixed(1) + ')';
+            const msg = '\uD83D\uDFE2 ' + sym + ' DIVERGENCIA ALCISTA: precio bajo < RSI alto en $' + q.close.toFixed(4) + ' (RSI: ' + rsi.toFixed(1) + ')';
             console.log('  >> ' + msg);
             sendTg(msg);
             sentBullDiv = true;
@@ -458,32 +567,37 @@ async function main() {
         }
 
         // 6. Level alerts (resistance/support breakout)
-        if (!triggeredRes && q.close >= LEVELS.resistance) {
+        // GATE: sin niveles derivados validos NO se alerta. Antes, con LEVELS fijo
+        // en 152 y el precio en 1.42, "q.close <= LEVELS.support" era SIEMPRE
+        // cierto y disparaba en bucle.
+        if (LEVELS.valid && !triggeredRes && q.close >= LEVELS.resistance) {
           triggeredRes = true;
-          const msg = '\uD83D\uDE80 ' + sym + ' ROMPI\u00D3 RESISTENCIA $' + LEVELS.resistance + ' en $' + q.close.toFixed(2) + ' — nuevos m\u00E1ximos';
+          const msg = '\uD83D\uDE80 ' + sym + ' ROMPI\u00D3 RESISTENCIA $' + LEVELS.resistance.toFixed(4) + ' en $' + q.close.toFixed(4) + ' — nuevos m\u00E1ximos';
           console.log('  >> ' + msg);
           sendTg(msg);
         }
-        if (!triggeredSup && q.close <= LEVELS.support) {
+        if (LEVELS.valid && !triggeredSup && q.close <= LEVELS.support) {
           triggeredSup = true;
-          const msg = '\uD83D\uDCA5 ' + sym + ' PERDI\u00D3 SOPORTE $' + LEVELS.support + ' en $' + q.close.toFixed(2) + ' — presi\u00F3n bajista';
+          const msg = '\uD83D\uDCA5 ' + sym + ' PERDI\u00D3 SOPORTE $' + LEVELS.support.toFixed(4) + ' en $' + q.close.toFixed(4) + ' — presi\u00F3n bajista';
           console.log('  >> ' + msg);
           sendTg(msg);
         }
-        if (!triggeredMajor && q.close <= LEVELS.majorSupport) {
+        if (LEVELS.valid && !triggeredMajor && q.close <= LEVELS.majorSupport) {
           triggeredMajor = true;
-          const msg = '\uD83D\uDED1 ' + sym + ' PERDI\u00D3 SOPORTE MAYOR $' + LEVELS.majorSupport + ' — tendencia bajista confirmada';
+          const msg = '\uD83D\uDED1 ' + sym + ' PERDI\u00D3 SOPORTE MAYOR $' + LEVELS.majorSupport.toFixed(4) + ' — tendencia bajista confirmada';
           console.log('  >> ' + msg);
           sendTg(msg);
         }
 
         // === 7. Rebound / Breakdown confirmation ===
         const nowMs = Date.now();
-        if (!testingSupport && q.close <= LEVELS.support * 1.005) {
-          // Price entered support zone (within 0.5% above support)
+        if (LEVELS.valid && !testingSupport && q.close <= LEVELS.support * (1 + PRICE_LEVEL_TOL)) {
+          // Entró en zona de soporte (dentro de 0.4% POR ENCIMA del soporte).
+          // El 0.5% era un número fijo; en un activo de 1.42 es un 0.35% real, y
+          // la tolerancia ahora viene de una constante con nombre.
           testingSupport = true;
           supportTestPrice = q.close;
-          console.log('  >> Probando soporte $' + LEVELS.support.toFixed(2) + ' en $' + q.close.toFixed(2));
+          console.log('  >> Probando soporte $' + LEVELS.support.toFixed(4) + ' en $' + q.close.toFixed(4));
         }
         if (testingSupport) {
           // Track the lowest price during test
@@ -492,15 +606,15 @@ async function main() {
           if (q.close >= supportTestPrice * 1.004 && q.close > supportTestPrice && nowMs - lastBounceAlert > 120000) {
             testingSupport = false;
             lastBounceAlert = nowMs;
-            const msg = '\uD83D\uDFE2 REBOTE CONFIRMADO en $' + q.close.toFixed(2) + ' (probó $' + supportTestPrice.toFixed(2) + ') — soporte $' + LEVELS.support.toFixed(2) + ' sostiene';
+            const msg = '\uD83D\uDFE2 REBOTE CONFIRMADO en $' + q.close.toFixed(4) + ' (probó $' + supportTestPrice.toFixed(4) + ') — soporte $' + LEVELS.support.toFixed(4) + ' sostiene';
             console.log('  >> ' + msg);
             sendTg(msg);
           }
           // Check for breakdown: price broke 0.2% below support
-          if (q.close < LEVELS.support * 0.998 && nowMs - lastBreakdownAlert > 120000) {
+          if (q.close < LEVELS.support * (1 - BREAKDOWN_TOL) && nowMs - lastBreakdownAlert > 120000) {
             testingSupport = false;
             lastBreakdownAlert = nowMs;
-            const msg = '\uD83D\uDCA5 BREAKDOWN CONFIRMADO en $' + q.close.toFixed(2) + ' — soporte $' + LEVELS.support.toFixed(2) + ' PERDIDO';
+            const msg = '\uD83D\uDCA5 BREAKDOWN CONFIRMADO en $' + q.close.toFixed(4) + ' — soporte $' + LEVELS.support.toFixed(4) + ' PERDIDO';
             console.log('  >> ' + msg);
             sendTg(msg);
           }
@@ -510,19 +624,24 @@ async function main() {
         const nowMs2 = Date.now();
         if (trendState === 'BEARISH') {
           if (q.close < lowestDuringTrend) lowestDuringTrend = q.close;
-          if (q.close > LEVELS.support * 1.02 && nowMs2 - sentReversalAlert > 180000) {
+          if (LEVELS.valid && q.close > LEVELS.support * 1.02 && nowMs2 - sentReversalAlert > 180000) {
             trendState = 'NEUTRAL';
             sentReversalAlert = nowMs2;
-            const msg = '\uD83D\uDFE2 POSIBLE REVERSIÓN ALCISTA en $' + q.close.toFixed(2) + ' — rompió resistencia de soporte';
+            const msg = '\uD83D\uDFE2 POSIBLE REVERSI\u00D3N ALCISTA en $' + q.close.toFixed(4) + ' — rompi\u00F3 resistencia de soporte';
             console.log('  >> ' + msg);
             sendTg(msg);
           }
         } else {
-          if (q.close < LEVELS.support && q.close < lowestDuringTrend - 0.01) {
+          // 2026-10-07: el umbral era `lowestDuringTrend - 0.01`, un ABSOLUTO de
+          // un centimo. En BTC es ruido; en XRP (precio 1.42) es el 0.7% — el
+          // precio lo cruza en un tick normal y la alerta salta sin motivo. Ahora
+          // es un porcentaje del propio mínimo, igual para cualquier activo.
+          if (LEVELS.valid && q.close < LEVELS.support &&
+              q.close < lowestDuringTrend * (1 - CONTINUATION_PCT)) {
             trendState = 'BEARISH';
             lowestDuringTrend = q.close;
             sentContinuationAlert = nowMs2;
-            const msg = '\uD83D\uDD34 CONTINUACIÓN BAJISTA en $' + q.close.toFixed(2) + ' — nuevo mínimo debajo de soporte';
+            const msg = '\uD83D\uDD34 CONTINUACI\u00D3N BAJISTA en $' + q.close.toFixed(4) + ' — nuevo mínimo debajo de soporte';
             console.log('  >> ' + msg);
             sendTg(msg);
           }
@@ -530,7 +649,7 @@ async function main() {
         if (q.close < lowestDuringTrend) lowestDuringTrend = q.close;
 
       } else if (!lastPrice) {
-        console.log('[' + new Date().toLocaleTimeString() + '] ' + sym + ' $' + q.close.toFixed(2) + ' | watching...');
+        console.log('[' + new Date().toLocaleTimeString() + '] ' + sym + ' $' + q.close.toFixed(4) + ' | watching...');
       }
 
       // === Periodic full analysis to Telegram ===
@@ -542,8 +661,7 @@ async function main() {
       }
 
       lastPrice = q.close;
-      volSum += q.vol;
-      volCount++;
+      // (volSum/volCount eliminados: daban un "promedio" de ticks, no de barras)
 
     } catch (e) {
       console.log('[MONITOR] ' + e.message);

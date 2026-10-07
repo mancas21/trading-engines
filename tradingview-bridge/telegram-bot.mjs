@@ -161,7 +161,14 @@ async function runAnalysis() {
   const low = ind.price?.low ?? 'N/A';
   const vol = ind.volume?.total ?? 'N/A';
   const delta = ind.delta ?? 'N/A';
+  // 2026-10-07: hay DOS cifras de DOM imbalance y el informe imprimia solo una.
+  //   domImb     = imbalance_pct     -> INSTANTANEO, oscila violentlyamente
+  //   emaImbRaw  = imbalance_pct_ema  -> la media, que es la que usan las reglas 6/7
+  // Medido en un mismo informe: "DOM Imbalance: 22.931%" y, dos lineas mas abajo,
+  // "DOM neutral -2.4% avg45s". Dos cifras opuestas sin explicar cual manda. Ahora
+  // se imprimen las dos, etiquetadas, y se dice cual gobierna el scorecard.
   const domImb = ind.dom?.imbalance_pct ?? 'N/A';
+  const domImbEma = ind.dom?.imbalance_pct_ema ?? null;
   const bidAsk = ind.dom?.bid_ask_ratio ?? 'N/A';
   const poc = ind.footprint?.poc ?? 'N/A';
   const vah = ind.footprint?.value_area_high ?? 'N/A';
@@ -344,7 +351,7 @@ Volumen: ${vol}
 
 ━━━ ORDER FLOW ━━━
 Delta: ${delta}
-DOM Imbalance: ${domImb}%
+DOM Imbalance: ${domImb}%${domImbEma !== null ? ` (EMA ${domImbEma}% ← ESTE gobierna rules.json 6/7)` : ' (sin EMA: no se puede evaluar 6/7)'}
 Bid/Ask Ratio: ${bidAsk}
 POC: ${poc} | VAH: ${vah} | VAL: ${val}
 
@@ -676,6 +683,14 @@ function startScheduler() {
         log('[BOT] Periodic analysis skipped (runAnalysis stale)');
         return;
       }
+      // 2026-10-07: el informe se ENVIA sin loguear su texto. Con dos
+      // instalaciones de este bot corriendo (repo + copia vieja) no habia forma
+      // de saber cual te llega ni si sus numeros coinciden con /indicators. Es el
+      // mismo fallo de proceso que bushes en monitor.mjs: si no logueas lo que
+      // mandas, cualquier bug de datos es invisible.
+      log('[BOT] ----- INFORME PERIODICO ENVIADO -----');
+      log(report);
+      log('[BOT] ----- FIN INFORME -----');
       await tgSendLong(report);
       log('[BOT] Periodic analysis sent');
     } catch (e) {
@@ -686,7 +701,21 @@ function startScheduler() {
   };
   setInterval(tick, ANALYSIS_INTERVAL_MS);
   setInterval(async () => {
-    try { await tgSend('❤️ Heartbeat OK'); } catch (e) { log('[BOT] Heartbeat fail:', e.message); }
+    // 2026-10-07: el heartbeat solo decia "OK". No es informacion — es ruido con
+    // forma de confirmacion, y cada 15 min hacia que un fallo real se escondiera
+    // entre "OK" y "OK". Ahora se registra en el log local; a Telegram solo llega
+    // si el bot esta REALMENTE degradado (falla el envio o el analisis).
+    try {
+      const probe = await runAnalysis();
+      if (probe == null) {
+        log('[BOT] Heartbeat: /indicators stale o sin datos (ATAS cerrado?)');
+      } else {
+        log('[BOT] Heartbeat OK (analisis disponible)');
+      }
+    } catch (e) {
+      log('[BOT] Heartbeat degraded:', e.message);
+      try { await tgSend('⚠️ Bot: heartbeat degradado — ' + e.message); } catch (_) {}
+    }
   }, HEARTBEAT_INTERVAL_MS);
 }
 
