@@ -146,6 +146,24 @@ async def _dom_feeds():
     # P6: DOM persistence tracking — require wall to persist across consecutive reads
     dom_persist: dict[str, dict] = {}
     DOM_PERSIST_REQUIRED = 3
+    # 2026-10-07 — BUG DE RAIZ ARREGLADO. `_DOM_IMB_EMA_TAU_S` se USABA en la
+    # linea del calculo de la EMA del imbalance pero NO ESTABA DEFINIDO en ningun
+    # sitio. Cada tick del DOM lanzaba NameError, el bloque entero moria dentro de
+    # un `except Exception` ancho, y por eso:
+    #   - `dp["imb_ema_n"]` se quedaba en 1 para siempre (la linea que lo
+    #     incrementaba nunca llegaba a ejecutarse)
+    #   - `imbalance_pct_ema` publicaba el valor instantaneo, no una media
+    #   - las reglas 6 y 7 se evaluaban contra un EMA de UNA sola muestra
+    #
+    # Como el veredicto solo IMPRIMIA ese contador y no lo usaba para decidir, el
+    # defecto era invisible: el gate se evaluaba en silencio con 1 muestra cuando
+    # las reglas exigen 3.
+    #
+    # Constante de vida media de la EMA. 20s: suficiente para promediar el ruido
+    # de un snapshot top-15 (el comentario P7 de arriba mide ese ruido en 1.44x
+    # del spread completo entre simbolos) sin delaying la lectura mas de lo que
+    # un operador puede perceber en el DOM.
+    _DOM_IMB_EMA_TAU_S = 20.0
     for sym in symbols:
         dom_persist[sym] = {
             "bid_wall_hits": 0, "bid_wall_price": 0,
@@ -2900,13 +2918,18 @@ async def health_detailed():
             cvd_snap = dict(_cvd_state)
         async with dom_lock:
             dom_snap = dict(dom_state)
-        with _CALLS_LOCK:
-            open_n = len(_calls)
+        # 2026-10-07: aqui habia `with _CALLS_LOCK: open_n = len(_calls)`. Ese
+        # lock y ese dict se fueron con el subsistema /calls, asi que la linea
+        # levantaba NameError y el endpoint entero devolvia {"status":"error"} en
+        # CADA llamada — tragado por el `except Exception` de abajo. Un endpoint de
+        # diagnostico que siempre falla es peor que uno que no existe: invita a
+        # confiar en el sin comprobar.
+        # calls_open se queda en 0 y el resto de las metricas se siguen leyendo.
         return _wd.collect(
             live_file=_newest_live_indicator_path() or _LIVE_INDICATORS_FILE,
             dom_state=dom_snap,
             cvd_state=cvd_snap,
-            calls_open=open_n,
+            calls_open=0,
             tick_history_path=_TICK_HISTORY_PATH,
         )
     except ImportError as e:

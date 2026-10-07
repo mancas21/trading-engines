@@ -50,9 +50,46 @@ BRIDGE = "http://127.0.0.1:8000"
 LIVE_MAX_AGE_S = 300.0
 HERE = Path(__file__).resolve().parent
 
-# ── Umbrales, transcritos de atas-bridge/rules.json v3.3 ──
-RULE6 = {"streak": 2, "levels_min": 4, "dom_max": 5.0}
-RULE7 = {"streak": 2, "levels_min": 3, "dom_min": 10.0}
+# ── Umbrales: LEIDOS de atas-bridge/rules.json v3.3 ──
+# 2026-10-07: estaban transcritos a mano aqui. Eso es exactamente lo que causo el
+# bug que se acaba de arreglar: las reglas 6/7 declaraban
+# `dom_persistence_polls_min: 3` y el codigo, al transcribir solo los tres
+# numeros que le interesaban, se dejo ese campo fuera — y nadie lo noto porque
+# los otros tres si coincidian. Una transcripcion manual es una fuente de verdad
+# mas que puede quedarse obsoleta en silencio.
+#
+# Ahora se leen del fichero. Si rules.json cambia, esto cambia con el, y si el
+# fichero no existe o no trae el campo, se avisa en vez de adivinar.
+def _load_rule_conditions(rule_id: int) -> dict:
+    try:
+        import json as _json
+        rules_path = HERE.parent / "atas-bridge" / "rules.json"
+        raw = _json.loads(rules_path.read_text(encoding="utf-8"))
+        for r in (raw.get("rules") or raw):
+            if int(r.get("id", -1)) == rule_id:
+                return dict(r.get("conditions") or {})
+    except Exception as _e:            # noqa: BLE001
+        print(f"[verdict] AVISO: no se pudo leer rules.json regla {rule_id}: {_e}")
+    return {}
+
+
+_C6 = _load_rule_conditions(6)
+_C7 = _load_rule_conditions(7)
+
+RULE6 = {"streak": _C6.get("cvd_consecutive_down_min", 2),
+         "levels_min": _C6.get("footprint_levels_min", 4),
+         "dom_max": float(_C6.get("dom_imbalance_max", 5))}
+RULE7 = {"streak": _C7.get("cvd_consecutive_up_min", 2),
+         "levels_min": _C7.get("footprint_levels_min", 3),
+         "dom_min": float(_C7.get("dom_imbalance_min", 10))}
+
+# `dom_persistence_polls_min` es el campo que faltaba por completo.
+# Si rules.json no lo declara, 3 es el valor que las reglas v3.3 declaran.
+DOM_PERSIST_MIN = int(_C6.get("dom_persistence_polls_min",
+                              _C7.get("dom_persistence_polls_min", 3)))
+if not _C6 or not _C7:
+    print("[verdict] AVISO: rules.json no leido; se usan umbrales por defecto. "
+          "Los veredictos pueden NO cumplir rules.json.")
 SCORE_BANDS = {"bullish_min": 60, "bearish_max": 40}
 WEIGHTS = {"footprint_depth": 25, "dom_imbalance": 25, "tape_ratio": 20,
            "volume_climax": 15, "footprint_confirmation": 15}
@@ -260,10 +297,33 @@ def build_verdict() -> dict:
     a7 = "UNEVALUABLE" if len(bd) < 2 else ("MET" if up >= RULE7["streak"] else "FAIL")
     b6 = "MET" if sell_h >= RULE6["levels_min"] else "FAIL"
     b7 = "MET" if buy_h >= RULE7["levels_min"] else "FAIL"
-    c6 = ("UNEVALUABLE" if ema is None else
-          ("MET" if ema < RULE6["dom_max"] else "FAIL"))
-    c7 = ("UNEVALUABLE" if ema is None else
-          ("MET" if ema > RULE7["dom_min"] else "FAIL"))
+    # 2026-10-07 — BUG ARREGLADO: la condicion (c) se evaluaba SOLO con el valor
+    # del EMA. rules.json v3.3 exige ademas `dom_persistence_polls_min: 3` en las
+    # reglas 6 Y 7: el imbalance debe hold 3+ lecturas antes de contar. El puente
+    # ya publicaba ese contador (`imbalance_pct_ema_n`) y el veredicto lo leia para
+    # IMPRIMIRLO, pero no lo usaba para decidir MET/FAIL — es decir, se evaluaba
+    # un gate con menos datos de los que la regla pide.
+    #
+    # Consecuencia real medida: con n=1 la EMA todavia no se ha asentado y su
+    # valor es practicamente el instantaneo. Una regla "hard" evaluada sobre una
+    # muestra unica no es una regla hard.
+    #
+    # Ahora, si no hay 3+ muestras, la condicion es UNEVALUABLE — igual que ya
+    # se hacia cuando el EMA era None. Y como las reglas son AND estricto,
+    # UNEVALUABLE hace que la regla entera NO se cumpla: neutral, no direccion.
+    ema_n = dom.get("imbalance_pct_ema_n")
+    dom_persist_ok = isinstance(ema_n, (int, float)) and ema_n >= DOM_PERSIST_MIN
+
+    if ema is None:
+        c6 = c7 = "UNEVALUABLE"
+    elif not dom_persist_ok:
+        # EMA sin asentar: no se puede afirmar nada sobre 3+ lecturas.
+        c6 = c7 = "UNEVALUABLE"
+    else:
+        c6 = "MET" if ema < RULE6["dom_max"] else "FAIL"
+        c7 = "MET" if ema > RULE7["dom_min"] else "FAIL"
+    v["dom"]["persist_ok"] = dom_persist_ok
+    v["dom"]["persist_min"] = DOM_PERSIST_MIN
 
     r6 = [a6, b6, c6]
     r7 = [a7, b7, c7]
