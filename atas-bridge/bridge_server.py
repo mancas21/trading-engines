@@ -1047,6 +1047,18 @@ def _cvd_public(sym: str, st: dict) -> dict:
         "low_cvd_usd": round(st.get("low_cvd_usd", 0.0), 2),
         "prev_cvd": round(st["prev_cvd"], 4),
         "prev_cvd_usd": round(st.get("prev_cvd_usd", 0.0), 2),
+        # 2026-10-07 — ESTOS DOS CAMPOS NO SE PUBLICABAN. El estado interno los
+        # mantiene (lineas 978-979, "extremes before the last closed bar"), pero
+        # el dict de respuesta de /cvd los omitia, asi que el consumidor recibia
+        # None.
+        #
+        # Consecuencia: la REGLA 2 (CVD extremes = exhaustion) era INAPLICABLE
+        # siempre — su guarda `prev_high is not None` nunca pasaba. Una regla hard
+        # que no se puede evaluar no protege: parece que no hay extremo cuando
+        # igual si lo hay. Verificado en vivo antes del arreglo: applicable=False
+        # con prev_high_cvd=None.
+        "prev_high_cvd": round(st.get("prev_high_cvd", 0.0), 4),
+        "prev_low_cvd": round(st.get("prev_low_cvd", 0.0), 4),
         "last_delta": round(st["last_delta"], 4),
         "last_delta_usd": round(st.get("last_delta_usd", 0.0), 2),
         "current_bar_delta": round(st["current_bar_delta"], 4),

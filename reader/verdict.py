@@ -87,6 +87,12 @@ RULE7 = {"streak": _C7.get("cvd_consecutive_up_min", 2),
 # Si rules.json no lo declara, 3 es el valor que las reglas v3.3 declaran.
 DOM_PERSIST_MIN = int(_C6.get("dom_persistence_polls_min",
                               _C7.get("dom_persistence_polls_min", 3)))
+
+# Regla 2 (CVD extremes = exhaustion). Mismo motivo: sus dos campos estaban
+# escritos a mano dentro de rule2_exhaustion().
+_C2 = _load_rule_conditions(2)
+RULE2 = {"spike_multiple": float(_C2.get("spike_multiple", 2.0)),
+         "min_prior_bars": int(_C2.get("min_prior_bars", 3))}
 if not _C6 or not _C7:
     print("[verdict] AVISO: rules.json no leido; se usan umbrales por defecto. "
           "Los veredictos pueden NO cumplir rules.json.")
@@ -113,12 +119,43 @@ def rule2_exhaustion(cvd: float | None, high: float | None, low: float | None,
     if cvd is None:
         return {"applicable": False, "reason": "sin CVD"}
     out = {"applicable": False}
-    if prev_high is not None and high is not None and abs(high) > 2 * abs(prev_high) > 0:
+
+    # 2026-10-07 — TRES DEFECTOS ARREGLADOS aqui:
+    #
+    # (1) `spike_multiple` (2.0) y `min_prior_bars` (3) estan en rules.json y
+    #     estaban escritos a mano. Mismo fallo que la condicion (c) de 6/7.
+    # (2) `abs(high) > 2*abs(prev_high) > 0` es una COMPARACION ENCADENADA de
+    #     Python, no lo que parece. Se evalua como
+    #     (abs(high) > 2*abs(prev_high)) AND (2*abs(prev_high) > 0).
+    #     Con prev_high == 0 —el estado inicial, y el valor por defecto en el
+    #     puente— la segunda mitad es 0 > 0 = False, asi que la regla nunca se
+    #     activaba en el primer tramo. No era "siempre aplicable" como sospeche al
+    #     principio: era "nunca aplicable", por una razon distinta.
+    # (3) `high`/`low` son extremos ACUMULADOS de la sesion, no el maximo de una
+    #     barra. La regla habla de "un salto >2x el max previo", es decir, de un
+    #     maximo de una barra comparado con el maximo previo. Comparar el acumulado
+    #     de la sesion contra el acumulado anterior compara dos ventanas
+    #     distintas y no dice nada sobre el salto de UNA barra.
+    #
+    # Ahora: si no hay referencia previa utilizable, no se inventa — se declara no
+    # aplicable con el motivo. Un extremo sin comparacion previa no se puede
+    # clasificar como agotamiento.
+    if prev_high is None or prev_low is None:
+        return {"applicable": False,
+                "reason": "sin referencia previa (prev_high/prev_low no disponibles)"}
+    if not (abs(prev_high) > 0 or abs(prev_low) > 0):
+        return {"applicable": False,
+                "reason": "referencia previa en cero: aun no hay historial comparable"}
+
+    mult = RULE2.get("spike_multiple", 2.0)
+    if abs(high or 0) > mult * abs(prev_high) > 0:
         out = {"applicable": True, "side": "up",
-               "note": "salto de CVD >2x el máximo previo: AGOTAMIENTO, no continuación"}
-    elif prev_low is not None and low is not None and abs(low) > 2 * abs(prev_low) > 0:
+               "note": (f"CVD en {abs(high or 0):.0f} supera {mult}x el maximo "
+                        f"previo {abs(prev_high):.0f}: AGOTAMIENTO, no continuacion")}
+    elif abs(low or 0) > mult * abs(prev_low) > 0:
         out = {"applicable": True, "side": "down",
-               "note": "caída de CVD >2x el mínimo previo: AGOTAMIENTO, no continuación"}
+               "note": (f"CVD en {abs(low or 0):.0f} supera {mult}x el minimo "
+                        f"previo {abs(prev_low):.0f}: AGOTAMIENTO, no continuacion")}
     return out
 
 
@@ -285,10 +322,29 @@ def build_verdict() -> dict:
                 "gaps": cvd_state.get("gaps"), "missing_bars": cvd_state.get("missing_bars")}
 
     # ── Regla 2 ──
-    v["rule2"] = rule2_exhaustion(cvd_state.get("cvd"), cvd_state.get("high_cvd"),
-                                  cvd_state.get("low_cvd"),
-                                  cvd_state.get("prev_high_cvd"),
-                                  cvd_state.get("prev_low_cvd"))
+    # 2026-10-07: se evaluaba contra `high_cvd`/`low_cvd`, que son los extremos
+    # ACUMULADOS de la sesion. La regla habla de "un salto >2x el maximo previo
+    # en una barra", asi que lo que corresponde son los deltas POR BARRA
+    # (`bar_deltas`), no la serie acumulada. Con los acumulados se comparaba la
+    # ventana completa contra la ventana anterior: no dice nada sobre el salto de
+    # una barra, y puede marcarse por un extremo de hace 100 barras.
+    #
+    # min_prior_bars = 3 barras de historico antes de poder afirmar un extremo.
+    _need = RULE2["min_prior_bars"]
+    if len(bd) >= _need:
+        _prior = bd[:-1]
+        _cur = bd[-1]
+        _prior_hi = max(_prior)
+        _prior_lo = min(_prior)
+        v["rule2"] = rule2_exhaustion(
+            _cur,
+            max(_prior_hi, _cur) if _cur > 0 else 0.0,
+            min(_prior_lo, _cur) if _cur < 0 else 0.0,
+            _prior_hi, _prior_lo)
+    else:
+        v["rule2"] = {"applicable": False,
+                      "reason": (f"solo {len(bd)} barra(s) cerrada(s); la regla 2 "
+                                 f"exige {RULE2['min_prior_bars']} de historico")}
     # ── Regla 8: CVD roto por un hueco no es una serie limpia ──
     v["cvd_clean"] = (cvd_state.get("continuity") == "clean"
                       and not (cvd_state.get("missing_bars") or 0))
