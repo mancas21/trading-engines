@@ -5,7 +5,52 @@ SQLite corpus (`quant-alert-engine/data/alerts.db`) unless stated otherwise.
 
 ---
 
-## 2026-10-06 (later) — DEEP AUDIT + CUT: every signal family disabled, every call path verified losing
+## 2026-10-06 (Fase 6) — REDISEÑO COMPLETADO: el motor es ahora un LECTOR
+
+Las seis fases de `PLAN_REDESIGN.md` están ejecutadas. Resumen del estado final.
+
+### Lo que existe ahora (`reader/`)
+
+| Fichero | Rol |
+|---|---|
+| `verdict.py` | Motor de veredictos. Reglas 6/7/2/4 como salida principal; el scorecard ordena, no predice. |
+| `live_reader.py` | Las 4 fuentes en un punto de entrada. Una fuente ausente **se declara**, nunca se imputa. |
+| `verdict_recorder.py` | Graba cada veredicto en SQLite, resuelve el retorno futuro con fill en el OPEN de la barra siguiente. |
+| `verdict_notify.py` | Telegram **solo al cambiar de sesgo**. 12 lecturas simuladas → 6 mensajes, los 6 reales. |
+| `reader_supervisor.py` | Servicio con política de reinicio de 3 estados. |
+| `atas-bridge/atas_target.py` | Qué símbolo tiene el L2 real (cobertura = 1, elegirlo ES el diseño). |
+
+### La limitación real, medida
+
+`reader_supervisor.py --status` durante una sesión con ATAS cerrado:
+
+```
+recorder_rc   1
+recorder_tail SKIP: ATAS no disponible: TimeoutError: timed out
+```
+
+**El grabador no inventa dato: no graba y lo dice.** ATAS y TradingView son
+aplicaciones de escritorio de Windows; si el servidor se apaga, no hay análisis.
+Para tener evidencia hace falta ATAS abierto. No es un bug del código.
+
+### Ruta perdedora eliminada (Fase 6)
+
+Borrado: `orderflow_calls.py`, `orderflow_calls_report.py`, `plan_gate.py`,
+`monitor_supervisor.bat`, `orderflow-calls.ps1`,
+`quant_engine/orderflow_backtester.py`. El último-commit del rediseño conserva
+`signal_engine.py` porque `bridge_server.py` lo usa para el comando de chat
+`/analizar` — que es a demanda, no automático.
+
+### Estado
+
+- `outcome_gating` muta 1 señal (Stoch Bearish Cross, t=−1.81) y el pool sigue
+  negativo: **eso no se puede arreglar con gates**.
+- Las 6 familias de señal y el ML están en `enabled: false` con su evidencia en
+  `config.json.pre-edgecut-*`.
+- Objetivo de evidencia: **5.000 veredictos** (~4–5 meses) antes de volver a
+  preguntar por edge. El contador más reciente estaba en ~120.
+
+---
 
 The first audit established the pool has no edge. This pass found **two independent
 losing subsystems** and cut both. Nothing in this engine currently generates a

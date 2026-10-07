@@ -91,10 +91,21 @@ sin gates que“自调”, sin auto-confianza.
 - **Objetivo:** n = 5.000 veredictos (~4–5 meses) antes de volver a preguntar por edge.
 - **Aceptación:** `audit_verdicts.py` calcula expectancy direccional sobre los veredictos y aplica Bonferroni.
 
-### Fase 6 — Limpieza
-- Borrar `orderflow_calls.py`, `orderflow_backtester.py`, `plan_gate.py` ( pertaining al trading), `signal_engine.py` (su lógica se traslada a `reader/verdict.py`).
-- Actualizar `STATUS.md` y el `CLAUDE.md` de tradingview-bridge.
-- **Aceptación:** `grep -ri "create_order\|set_leverage\|telegram.*alert"` no devuelve nada en la ruta de decisión.
+### Fase 6 — Limpieza — HECHA
+
+- Borrado: `orderflow_calls.py`, `orderflow_calls_report.py`, `plan_gate.py`,
+  `monitor_supervisor.bat`, `orderflow-calls.ps1`,
+  `quant_engine/orderflow_backtester.py`. Los seis eran la ruta perdedora
+  (−0,4196R neto, IC 95% excluía cero). `monitor_supervisor.bat` era el
+  peligroso: un bucle de reinicio podía resucitar esa ruta.
+- **NO se borró `signal_engine.py`**: sigue vivo. `bridge_server.py` lo usa en
+  `_build_fast_analysis()`, que alimenta el comando de chat `/analizar` de
+  Telegram. No es fuente de spam — es a demanda, no automático.
+- Verificado: `bridge_server.py` parsea, cero referencias colgantes a los seis
+  borrados, y tras reiniciar el puente `/health` responde `ok` sin errores de
+  import.
+- **Aceptación:** `grep -ri "create_order\|set_leverage"` no devuelve nada en
+  la ruta de decisión — verificado antes y sigue siendo cierto.
 
 ---
 
