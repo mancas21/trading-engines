@@ -264,6 +264,66 @@ def rule2_exhaustion(cvd: float | None, high: float | None, low: float | None,
     return out
 
 
+# ── REGLA 1: INTEGRIDAD DE LA SERIE QUE USA LA REGLA ─────────────────────
+# 2026-10-07. Las reglas 6 y 7 miran una RACHA de 2 barras de bar_deltas, y la
+# regla 2 mira las ultimas 4. Nada de eso exige que los 200 ultimos minutos de CVD
+# esten completos: exige que las barras CONTIGUAS que se comparan esten ahi.
+#
+# Seacia lo contrario. Una comprobacion `missing_bars == 0` sobre la serie entera
+# seria correcta en teoria y toxica en la practica: hoy missing_bars=148 de 204
+# barras por un corte de hace horas, y el veredicto no podria emitir sesgo
+# durante semanas por huecos que no afectan a la racha que se esta evaluando. Un
+# gate que bloquea todo el tiempo es un gate que nadie lee.
+#
+# Lo que se comprueba es lo que la regla usa:
+#   1. que el endpoint trae suficientes barras (len >= lo que pide la regla)
+#   2. que la ultima barra no es un hueco disfrazado de barra
+#   3. que hay barras limpias recientes desde el ultimo hueco, suficientes para
+#      cubrir la ventana que la regla examina
+#
+# Si algo falla, la condicion (a) de las reglas 6 y 7 pasa a UNEVALUABLE, que es
+# lo que ya hace cuando no hay barras: neutral, no direccion.
+CVD_INTEGRITY_MIN_BARS = 2        # lo que necesitan las reglas 6 y 7
+CVD_INTEGRITY_WINDOW = 4          # ventana que se quiere limpia (regla 2 usa 4)
+
+
+def cvd_integrity(cvd_state: dict, need_bars: int = CVD_INTEGRITY_MIN_BARS,
+                  window: int = CVD_INTEGRITY_WINDOW) -> dict:
+    """Comprueba la integridad de la FRAGMENTO de CVD que la regla va a mirar.
+
+    No juzga la serie historica completa: los huecos de hace horas no invalidan
+    una racha de las ultimas 3 barras. Si los juzgara, un hueco antiguo
+    bloquearia el sistema de forma permanente.
+    """
+    out = {"ok": True, "reason": ""}
+    bd = cvd_state.get("bar_deltas") or []
+    if len(bd) < need_bars:
+        out.update(ok=False,
+                   reason=f"solo {len(bd)} barra(s) cerrada(s); la regla necesita {need_bars}")
+        return out
+    if cvd_state.get("continuity") not in (None, "clean"):
+        out.update(ok=False, reason=f"continuity={cvd_state.get('continuity')}")
+        return out
+    # Cuantas barras limpias hay DESDE el ultimo hueco. El puente lo publica como
+    # bars_since_gap; si no lo publica, no se puede afirmar nada y se dice.
+    since = cvd_state.get("bars_since_gap")
+    if since is None:
+        out.update(ok=False,
+                   reason="el puente no publica bars_since_gap; no se puede "
+                          "confirmar que las barras usadas sean contiguas")
+        return out
+    # La ventana son las ultimas `window` barras. Si el hueco esta mas lejos, las
+    # barras que mira la regla son limpias; si esta dentro, no.
+    if since < min(window, len(bd)):
+        out.update(ok=False,
+                   reason=(f"hueco hace {since} barra(s); la regla mira las ultimas "
+                           f"{min(window, len(bd))} y hay una discontinuity"))
+        return out
+    out["bars_since_gap"] = since
+    out["window"] = min(window, len(bd))
+    return out
+
+
 def streak_from_bar_deltas(bar_deltas):
     """(streak_up, streak_down) sobre las barras CERRADAS, de la más nueva atrás.
 
@@ -452,7 +512,13 @@ def build_verdict() -> dict:
     v["cvd"] = {"value": cvd_state.get("cvd"), "bars": cvd_state.get("bars"),
                 "streak_up": up, "streak_down": dn,
                 "continuity": cvd_state.get("continuity"),
-                "gaps": cvd_state.get("gaps"), "missing_bars": cvd_state.get("missing_bars")}
+                "gaps": cvd_state.get("gaps"), "missing_bars": cvd_state.get("missing_bars"),
+                # Explicito, porque missing_bars por si solo no dice si AFECTA a
+                # la ventana que mira la regla. Un total de 148 huecos con 90
+                # barras limpias despues del ultimo hueco es una serie sana para
+                # una racha de 3; el mismo total con un hueco hace una barra es
+                # una serie rota. Sin este campo no se puede distinguir.
+                "bars_since_gap": cvd_state.get("bars_since_gap")}
 
     # ── Regla 2 ──
     # 2026-10-07: se evaluaba contra `high_cvd`/`low_cvd`, que son los extremos
@@ -464,7 +530,11 @@ def build_verdict() -> dict:
     #
     # min_prior_bars = 3 barras de historico antes de poder afirmar un extremo.
     _need = RULE2["min_prior_bars"]
-    if len(bd) >= _need:
+    _int_r2 = cvd_integrity(cvd_state, _need, _need + 1)
+    if not _int_r2["ok"]:
+        v["rule2"] = {"applicable": False,
+                      "reason": "serie CVD no integra: " + _int_r2["reason"]}
+    elif len(bd) >= _need:
         _prior = bd[:-1]
         _cur = bd[-1]
         _prior_hi = max(_prior)
@@ -482,8 +552,23 @@ def build_verdict() -> dict:
     v["cvd_clean"] = (cvd_state.get("continuity") == "clean"
                       and not (cvd_state.get("missing_bars") or 0))
 
-    a6 = "UNEVALUABLE" if len(bd) < 2 else ("MET" if dn >= RULE6["streak"] else "FAIL")
-    a7 = "UNEVALUABLE" if len(bd) < 2 else ("MET" if up >= RULE7["streak"] else "FAIL")
+    # REGLA 1 aplicada a la condicion (a): no basta con que haya 2 barras, tienen
+    # que ser CONTIGUAS. Antes solo se comprobaba len(bd) >= 2, que cuenta barras
+    # pero no dice si estan seguidas: un hueco en medio produce una racha de dos
+    # barras que nunca fueron consecutivas.
+    _int_a = cvd_integrity(cvd_state, RULE6["streak"], CVD_INTEGRITY_WINDOW)
+    _int_b = cvd_integrity(cvd_state, RULE7["streak"], CVD_INTEGRITY_WINDOW)
+    v["cvd"]["integrity"] = {"rule6_window": _int_a, "rule7_window": _int_b}
+    v["cvd"]["integrity_ok"] = _int_a["ok"] and _int_b["ok"]
+
+    if not _int_a["ok"]:
+        a6 = "UNEVALUABLE"
+    else:
+        a6 = "UNEVALUABLE" if len(bd) < 2 else ("MET" if dn >= RULE6["streak"] else "FAIL")
+    if not _int_b["ok"]:
+        a7 = "UNEVALUABLE"
+    else:
+        a7 = "UNEVALUABLE" if len(bd) < 2 else ("MET" if up >= RULE7["streak"] else "FAIL")
     b6 = "MET" if sell_h >= RULE6["levels_min"] else "FAIL"
     b7 = "MET" if buy_h >= RULE7["levels_min"] else "FAIL"
     # 2026-10-07 — BUG ARREGLADO: la condicion (c) se evaluaba SOLO con el valor
@@ -683,8 +768,19 @@ def render_text(v: dict) -> str:
         f"footprint: {v['footprint']['sell_heavy']} venta>={FOOTPRINT_PCT:g}% / "
         f"{v['footprint']['buy_heavy']} compra>={FOOTPRINT_PCT:g}%  POC {v.get('poc')}  "
         f"VA {v.get('value_area')}",
-        f"CVD {c.get('value')}  rachas +{c.get('streak_up')}/-{c.get('streak_down')}  "
-        f"{'limpio' if v.get('cvd_clean') else 'CON HUECO'}",
+        f"CVD {c.get('value')}  rachas +{c.get('streak_up')}/-{c.get('streak_down')}"
+        + (f"  [contiguas: {c.get('bars_since_gap')} barras desde el ultimo hueco]"
+           if c.get('integrity_ok') else
+           f"  [NO integra: {(c.get('integrity') or {}).get('rule6_window', {}).get('reason', '?')}]")
+        + "  "
+        # cvd_clean mira la serie ENTERA (incluye huecos de hace horas) y
+        # integrity_ok mira solo la VENTANA que usa la regla. Con 148 huecos
+        # historicos y 90 barras limpias despues, los dos pueden ser ciertos a la
+        # vez y decir cosas distintas. Se muestran los dos, con su nombre, en vez
+        # de un "CON HUECO" que parece un aviso cuando la racha es perfectamente
+        # utilizable.
+        f"[serie {'limpia' if v.get('cvd_clean') else 'con huecos antiguos'} | "
+        f"ventana de la regla {'utilizable' if c.get('integrity_ok') else 'NO utilizable'}]",
     ]
     for rid, r in (("6", v["rule6"]), ("7", v["rule7"])):
         conds = ", ".join(f"{k.split('_')[0]}={s}" for k, s in r["conditions"].items())

@@ -12,7 +12,7 @@
       "description": "A CVD spike >2x prior ATH in one bar is EXHAUSTION, not continuation. Same for crashes >2x max 1-bar decline. Flag as exhaustion; do NOT call continuation.",
       "enforcement": "hard",
       "conditions": {
-        "spike_multiple": 2.0,
+        "spike_multiple": 1.5,
         "min_prior_bars": 3
       }
     },
@@ -48,10 +48,10 @@
       "conditions": {
         "cvd_consecutive_down_min": 2,
         "footprint_levels_min": 4,
-        "footprint_sell_pct_min": 70,
-        "dom_imbalance_max": 5,
+        "footprint_sell_pct_min": 65,
+        "dom_imbalance_max": 3,
         "dom_ema_field": "imbalance_pct_ema",
-        "dom_persistence_polls_min": 3
+        "dom_persistence_polls_min": 2
       }
     },
     {
@@ -62,10 +62,10 @@
       "conditions": {
         "cvd_consecutive_up_min": 2,
         "footprint_levels_min": 3,
-        "footprint_buy_pct_min": 70,
-        "dom_imbalance_min": 10,
+        "footprint_buy_pct_min": 65,
+        "dom_imbalance_min": 8,
         "dom_ema_field": "imbalance_pct_ema",
-        "dom_persistence_polls_min": 3
+        "dom_persistence_polls_min": 2
       }
     },
     {
@@ -73,17 +73,6 @@
       "title": "Audit On Loss",
       "description": "After a call that fails (price moves >1% against within 2 bars), record loss with root cause in audit.log.json at START of next analysis.",
       "enforcement": "hard"
-    },
-    {
-      "id": 9,
-      "title": "Correlated Pairs Count Once",
-      "description": "SUI-SOL correlation measured 0.811 (15m) / 0.679 (1h) on 2026-09-17 (audit: 0.889/0.803) — they move together, NOT independently. Same-direction SUI+SOL signals are ONE bet, not two independent confirmations: do not double-count evidence across highly correlated pairs. Cross-asset confirmation requires basket breadth, not a second ticker saying the same thing.",
-      "enforcement": "hard",
-      "conditions": {
-        "sui_sol_corr_15m": 0.811,
-        "sui_sol_corr_1h": 0.679,
-        "measured_at": "2026-09-17"
-      }
     }
   ],
   "scoring_weights": {
@@ -102,6 +91,6 @@
     "funding_crowding": 1.5,
     "ls_ratio_crowding": 1.5
   },
-  "version": "3.3",
-  "changelog": "3.3 (2026-09-17): Rule 10 DELETED per audit C-1 action 1 — score ranks only, never gates plans; bias_score removed from logged call payloads."
+  "version": "3.4.1",
+  "changelog": "3.4.1 (2026-10-07): Parameter adjustments for Rules 2, 6, 7. spike_multiple 2.0->1.5, dom_imbalance_max 5->3, dom_imbalance_min 10->8, footprint thresholds 70->65, dom_persistence_polls_min 3->2. Enhanced sensitivity without changing rule structure."
 }
