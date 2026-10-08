@@ -35,6 +35,19 @@ import math
 import sqlite3
 import time
 import urllib.request
+
+# La regla 8 necesita el umbral de perdida y la funcion de registro. Se importan
+# arriba del todo (no dentro del bucle) para que un fallo de importacion se vea
+# al arrancar y no enmascarado dentro de un try por veredicto.
+import verdict
+
+
+def _audit_loss_pct() -> float:
+    """Umbral de la regla 8 (>1% contra), con 1% como respaldo."""
+    try:
+        return float(verdict.AUDIT_LOSS_PCT)
+    except Exception:
+        return 0.01
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -297,14 +310,18 @@ def do_resolve(c) -> int:
             return 0
         sym = (row[0],)
     pending = c.execute(
-        "SELECT id,symbol,bar_index,horizon_bars FROM verdicts "
+        "SELECT id,symbol,bar_index,horizon_bars,bias FROM verdicts "
         "WHERE resolved=0 AND bar_index IS NOT NULL ORDER BY id").fetchall()
     if not pending:
         print("  nada pendiente")
         return 0
 
+    # El sesgo va con cada veredicto: la regla 8 necesita saber si la perdida es
+    # CONTRA lo que el sistema Recommended, no si el precio bajo.
+    row_bias = {r[0]: r[4] for r in pending}
+
     by_sym: dict[str, list] = {}
-    for vid, s, bi, hz in pending:
+    for vid, s, bi, hz, _bs in pending:
         by_sym.setdefault(s, []).append((vid, bi, hz))
 
     resolved = 0
@@ -355,6 +372,28 @@ def do_resolve(c) -> int:
             c.execute("UPDATE verdicts SET fill_price=?, forward_return=?, resolved=1 "
                       "WHERE id=?", (round(fill_open, 10), round(fr, 8), vid))
             resolved += 1
+            # ── REGLA 8 (Audit On Loss) ──────────────────────────────────────
+            # rules.json v3.4.1: "After a call that fails (price moves >1%
+            # against within 2 bars), record loss with root cause".
+            #
+            # El threshold de la regla es 1% en 2 barras; aqui el horizonte ya
+            # viene resuelto por veredicto (horizon_bars). Lo que se registra es
+            # la perdida CONTRA el sesgo del veredicto, que es la direccion que el
+            # sistema habria tomdo: un BULLISH que cae es la perdida, un BEARISH
+            # que sube tambien. Sin esa correccion, un bearish que va a favor se
+            # contaria como perdida y el registro diria lo contrario de lo que
+            # ocurrio.
+            _bias = row_bias.get(vid)
+            _directed = fr if _bias == "BULLISH" else (-fr if _bias == "BEARISH" else None)
+            if _directed is not None and _directed < -_audit_loss_pct():
+                try:
+                    verdict._audit_record_loss(
+                        symbol=s, price_last=exit_px, price_entry=fill_open,
+                        loss_pct=_directed,
+                        root_cause=(f"veredicto {_bias} no confirmo en {hz} barras: "
+                                    f"{_directed*100:.2f}% contra"))
+                except Exception as _e:
+                    print(f"  regla 8: no se pudo registrar la perdida ({_e})")
     c.commit()
     print(f"  resolved {resolved}/{len(pending)}")
     return resolved

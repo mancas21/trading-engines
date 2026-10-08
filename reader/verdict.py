@@ -69,7 +69,17 @@ HERE = Path(__file__).resolve().parent
 #
 # Ahora se leen del fichero. Si rules.json cambia, esto cambia con el, y si el
 # fichero no existe o no trae el campo, se avisa en vez de adivinar.
-# ADICIONAL: tambien leemos el campo "enforcement" para respetar reglas hard vs soft.
+#
+# 2026-10-07 — ESTA FUNCION DEVUELVE UN DICT PLANO, con las conditions
+# mezcladas con el enforcement bajo una clave "_enforcement". Antes devolvia
+# {"conditions": {...}, "enforcement": ...} y cada consumidor tenia que acordarse
+# de descender un nivel. La regla 2 se olvido (bug: leia spike_multiple del
+# nivel equivocado y caia al default 2.0 en silencio), y cualquier consumidor
+# nuevo tiene el mismo error a la vista.
+#
+# Con el dict plano no existe el error: o hay la clave o no la hay.
+# `_enforcement` lleva el prefijo para que no choque con ningun nombre de campo
+# de las condiciones.
 def _load_rule_conditions(rule_id: int) -> dict:
     try:
         import json as _json
@@ -77,51 +87,98 @@ def _load_rule_conditions(rule_id: int) -> dict:
         raw = _json.loads(rules_path.read_text(encoding="utf-8"))
         for r in (raw.get("rules") or raw):
             if int(r.get("id", -1)) == rule_id:
-                return {
-                    "conditions": dict(r.get("conditions") or {}),
-                    "enforcement": r.get("enforcement", "hard")
-                }
+                out = dict(r.get("conditions") or {})
+                out["_enforcement"] = r.get("enforcement", "hard")
+                out["_title"] = r.get("title", "")
+                out["_present"] = True          # la regla EXISTE en el JSON
+                return out
+        print(f"[verdict] AVISO: la regla {rule_id} NO existe en rules.json "
+              f"(version {raw.get('version')}). Se usan umbrales por defecto.")
     except Exception as _e:            # noqa: BLE001
         print(f"[verdict] AVISO: no se pudo leer rules.json regla {rule_id}: {_e}")
-    return {"conditions": {}, "enforcement": "hard"}
+    # Sin fichero o sin esa regla: se marca _present=False para que el consumidor
+    # pueda distinguir "la regla dice que no" de "no hay regla que consultar".
+    return {"_enforcement": "hard", "_title": "", "_present": False}
 
 
-_C6 = _load_rule_conditions(6)
-_C7 = _load_rule_conditions(7)
-
-_R6 = _C6.get("conditions", {})
-_R7 = _C7.get("conditions", {})
+# Las condiciones son PLANAS: _R6["dom_imbalance_max"], sin descender niveles.
+_R6 = _load_rule_conditions(6)
+_R7 = _load_rule_conditions(7)
+_R2 = _load_rule_conditions(2)
 
 RULE6 = {"streak": _R6.get("cvd_consecutive_down_min", 2),
          "levels_min": _R6.get("footprint_levels_min", 4),
          "dom_max": float(_R6.get("dom_imbalance_max", 5)),
-         "enforcement": _C6.get("enforcement", "hard")}
+         "enforcement": _R6.get("_enforcement", "hard")}
 
 RULE7 = {"streak": _R7.get("cvd_consecutive_up_min", 2),
          "levels_min": _R7.get("footprint_levels_min", 3),
          "dom_min": float(_R7.get("dom_imbalance_min", 10)),
-         "enforcement": _C7.get("enforcement", "hard")}
+         "enforcement": _R7.get("_enforcement", "hard")}
 
 # `dom_persistence_polls_min` es el campo que faltaba por completo.
 # Si rules.json no lo declara, 3 es el valor que las reglas v3.3 declaran.
 DOM_PERSIST_MIN = int(_R6.get("dom_persistence_polls_min",
                               _R7.get("dom_persistence_polls_min", 3)))
 
-# Regla 2 (CVD extremes = exhaustion). Mismo motivo: sus dos campos estaban
-# escritos a mano dentro de rule2_exhaustion().
+# ── COBERTURA DE REGLAS ────────────────────────────────────────────────────
+# Que reglas declara rules.json y cuales implementa REALMENTE este modulo.
 #
-# 2026-10-07 — BUG ARREGLADO. Leia `_C2.get("spike_multiple", 2.0)`, pero
-# _C2 es el dict ANIDADO {"conditions": {...}, "enforcement": ...}. Buscaba
-# "spike_multiple" en el nivel equivocado, no lo encontraba y caia al default
-# 2.0. Con rules.json en v3.4.1 declarando spike_multiple=1.5, la regla 2
-# seguia usando 2.0: es decir, exigia un salto un 33% mayor del que la regla
-# declara. Mismo efecto que si el JSON no existiera, pero en silencio.
-_C2 = _load_rule_conditions(2)
-_R2 = _C2.get("conditions", {})
+# El JSON declara 8 (v3.4.1). Este modulo implementa 2, 6 y 7 como puertas
+# direccionales, 3 y 4 como limites de salida, y 8 como registro de perdidas (que se
+# dispara desde verdict_recorder al resolver un veredicto, no aqui). La 5 es una
+# regla de CONDUCTA — "no anclar en patrones pasados" — que un programa no puede
+# comprobar; lo que si hace el sistema es no persistir el analisis anterior como
+# entrada, y eso ya ocurre porque cada veredicto se evalua solo con la lectura
+# actual.
+#
+# La 1 no tiene codigo propio porque es la condicion (a) de las reglas 6 y 7.
+_IMPLEMENTED = {
+    1: "condicion (a) de las reglas 6 y 7: exige 2+ barras consecutivas",
+    2: "rule2_exhaustion() sobre los deltas por barra",
+    3: "solo puede emitir 'unvalidated' (lineas probability)",
+    4: "scorecard() + SCORE_BANDS",
+    6: "3 condiciones AND, umbrales de rules.json",
+    7: "3 condiciones AND, umbrales de rules.json",
+    8: "_audit_record_loss(), llamada desde verdict_recorder al resolver",
+}
+_NOT_IMPLEMENTED = {
+    5: "regla de conducta: no comprobable por codigo",
+}
+
+
+def _rule_coverage() -> list:
+    """Lee rules.json y declara, por regla, si este modulo la implementa."""
+    out = []
+    try:
+        import json as _json
+        raw = _json.loads((HERE.parent / "atas-bridge" / "rules.json")
+                          .read_text(encoding="utf-8"))
+        rules = raw.get("rules") or []
+    except Exception as _e:            # noqa: BLE001
+        return [{"id": None, "error": f"no se pudo leer rules.json: {_e}"}]
+    for r in rules:
+        rid = int(r.get("id", -1))
+        if rid in _IMPLEMENTED:
+            impl, why = True, _IMPLEMENTED[rid]
+        elif rid in _NOT_IMPLEMENTED:
+            impl, why = False, _NOT_IMPLEMENTED[rid]
+        else:
+            impl, why = False, "sin implementacion en este modulo"
+        out.append({"id": rid, "title": r.get("title", ""),
+                    "enforcement": r.get("enforcement", "hard"),
+                    "implemented": impl, "how": why})
+    return out
+
+
+# Regla 2 (CVD extremes = exhaustion). Sus dos campos estaban escritos a mano
+# dentro de rule2_exhaustion(); despues se leyeron del JSON, pero del nivel
+# equivocado del dict anidado y caian al default en silencio. Ver 9d0e90f.
+# _R2 se cargo arriba, junto a _R6/_R7, ahora que el dict es plano.
 RULE2 = {"spike_multiple": float(_R2.get("spike_multiple", 2.0)),
          "min_prior_bars": int(_R2.get("min_prior_bars", 3))}
-if not _R2:
-    print("[verdict] AVISO: regla 2 sin conditions en rules.json; "
+if not _R2.get("_present"):
+    print("[verdict] AVISO: la regla 2 no esta en rules.json; "
           "spike_multiple usara el default 2.0.")
 # 2026-10-07 — Umbrales del footprint, LEIDOS de rules.json. Los dos son
 # `footprint_sell_pct_min` / `footprint_buy_pct_min`; las reglas 6 y 7 los
@@ -333,6 +390,11 @@ def build_verdict() -> dict:
         v["bias"] = "UNAVAILABLE"
         v["reason"] = f"ATAS no disponible: {ind.get('_error', 'payload nulo')}"
         v["probability"] = "unvalidated"
+        # La cobertura se declara tambien en los retornos tempranos: si falta,
+        # un fallo de ATAS oculta que reglas existen y cuales estan activas.
+        v["rule_coverage"] = _rule_coverage()
+        v["rules_not_implemented"] = [r["id"] for r in v["rule_coverage"]
+                                      if not r["implemented"]]
         return v
 
     ts = ind.get("timestamp")
@@ -348,6 +410,9 @@ def build_verdict() -> dict:
         v["reason"] = (f"dato NO vivo (edad {v['src_age_s']}s > {LIVE_MAX_AGE_S:.0f}s); "
                        f"no se emite veredicto sobre datos congelados")
         v["probability"] = "unvalidated"
+        v["rule_coverage"] = _rule_coverage()
+        v["rules_not_implemented"] = [r["id"] for r in v["rule_coverage"]
+                                      if not r["implemented"]]
         return v
 
     price = ind.get("price") or {}
@@ -505,38 +570,20 @@ def build_verdict() -> dict:
                 f"las reglas dicen {bias} pero el scorecard solo da {total}/100")
     v["unevaluable"] = unev
     v["probability"] = "unvalidated"
-    # Regla 5: annotate that no pattern anchoring was used
-    v["rule5_annotate"] = v.get("rule5", {}).get("note", "Rule 5 not configured")
-
-    # Nueva Regla 9: Timeframe Consensus
-    v["rule9_annotate"] = "Consenso multi-TF: " + v.get("rule9", {}).get("note", "no configurada")
-
-    # Nueva Regla 10: Liquidity Minimum
-    v["rule10_annotate"] = "Liquidez mínima: " + v.get("rule10", {}).get("note", "no configurada")
-
-    # Nueva Regla 11: Session Period Filter
-    v["rule11_annotate"] = "Filtro sesión: " + v.get("rule11", {}).get("note", "no configurado")
-
-    # Nueva Regla 12: News Event Avoidance
-    v["rule12_annotate"] = "Evitación news: " + v.get("rule12", {}).get("note", "no configurado")
-
-    # Nueva Regla 13: Position Sizing Hard Limit
-    v["rule13_annotate"] = "Limit tamaño posición: " + v.get("rule13", {}).get("note", "no configurado")
-
-    # Nueva Regla 14: Correlation Limit per Portfolio
-    v["rule14_annotate"] = "Limit correlación cartera: " + v.get("rule14", {}).get("note", "no configurado")
-
-    # Nueva Regla 15: Weekend / Holiday Gap Risk
-    v["rule15_annotate"] = "Riesgo fin de semana: " + v.get("rule15", {}).get("note", "no configurado")
-
-    # Nueva Regla 16: Confirmation Timeout
-    v["rule16_annotate"] = "Timeout confirmación: " + v.get("rule16", {}).get("note", "no configurado")
-
-    # Nueva Regla 17: Float Share Check
-    v["rule17_annotate"] = "Check flottante: " + v.get("rule17", {}).get("note", "no configurado")
-
-    # Nueva Regla 18: CVD Regime State
-    v["rule18_annotate"] = "Regimen CVD: " + v.get("rule18", {}).get("note", "no configurado")
+    # ── COBERTURA DE REGLAS, generada desde rules.json ────────────────────────
+    # 2026-10-07. Antes havia 11 lineas de la forma
+    #     v["ruleN_annotate"] = "..." + v.get("ruleN", {}).get("note", "no configurado")
+    # para las reglas 5 y 9-18. Esas reglas NO EXISTEN en rules.json v3.4.1 (8
+    # reglas), y v["ruleN"] nunca se creaba, asi que las once imprimian
+    # literalmente "no configurado". Un veredicto con diez lineas de "no
+    # configurado" parece un motor con diez reglas mas de las que tiene, y es
+    # justo lo que hace que alguien asuma que estan activas.
+    #
+    # Ahora se lee rules.json y se declara, por regla, si este modulo la
+    # implementa o no. Un sitio unico, imposible de desincronizar del JSON.
+    v["rule_coverage"] = _rule_coverage()
+    v["rules_not_implemented"] = [r["id"] for r in v["rule_coverage"]
+                                  if not r["implemented"]]
 
     v["reason"] = _reason(v)
     return v
@@ -574,9 +621,26 @@ def _reason(v) -> str:
 # with root cause in audit.log.json at START of next analysis.
 # This function is called from the caller (bridge/bot) when a trade signal fails.
 import os as _os
-_audit_log_path = _os.path.join(
-    _os.path.dirname(_os.path.abspath(__file__)), "atas-bridge", "audit.log.json"
-)
+# 2026-10-07 — RUTA CORREGIDA. Apuntaba a atas-bridge/audit.log.json, que es el
+# fichero de 19.848 bytes del subsistema /calls ya BORRADO (call_id, entry,
+# outcome_r, mfe_r, mae_r). Escribir ahi mezclaria el registro de perdidas del
+# grabador con los restos de un sistema que no existe. Ahora va a su propio
+# fichero dentro de reader/, que es quien lo produce.
+#
+# Tambien se corrigio `import os as _os` + `os.path.exists(...)`: funcionaba por
+# el `import os` de la cabecera del modulo, pero leerlo era pedir un NameError
+# si alguien quita ese import.
+_audit_log_path = _os.path.join(HERE, "audit_losses.jsonl")
+
+# Umbral de la regla 8: "price moves >1% against within 2 bars". Se lee de
+# rules.json si la regla lo declara; si no, 1% es el valor que la regla v3.x dice.
+AUDIT_LOSS_PCT = 0.01
+try:
+    _r8 = _load_rule_conditions(8)
+    if _r8.get("_present"):
+        AUDIT_LOSS_PCT = float(_r8.get("loss_pct", AUDIT_LOSS_PCT))
+except Exception:
+    pass
 
 def _audit_record_loss(symbol: str, price_last: float, price_entry: float,
                        loss_pct: float, root_cause: str) -> None:
@@ -592,20 +656,11 @@ def _audit_record_loss(symbol: str, price_last: float, price_entry: float,
         "root_cause": root_cause,
     }
     try:
-        entries = []
-        if os.path.exists(_audit_log_path):
-            with open(_audit_log_path, "r", encoding="utf-8") as af:
-                for line in af:
-                    line = line.strip()
-                    if line:
-                        try:
-                            entries.append(_json.loads(line))
-                        except Exception:
-                            pass
-        entries.append(log_entry)
-        with open(_audit_log_path, "w", encoding="utf-8") as bf:
-            for entry in entries:
-                bf.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+        # JSONL: se ANADE una linea, no se reescribe el fichero entero. La version
+        # anterior lo reescribia completo en cada perdida: O(n) por escritura y
+        # cualquier fallo a mitad dejaba el registro truncado.
+        with open(_audit_log_path, "a", encoding="utf-8") as bf:
+            bf.write(_json.dumps(log_entry, ensure_ascii=False) + "\n")
     except Exception:
         pass
 

@@ -55,6 +55,9 @@ Thumbs.db
 reader/reader.db
 reader/reader.db-wal
 reader/reader.db-shm
+# Regla 8: registro de perdidas del grabador (runtime; crece con cada veredicto
+# resuelto que va mas de 1% en contra). No se versiona.
+reader/audit_losses.jsonl
 # objetivo del símbolo ATAS (config local, con reason/ timestamps propios)
 atas-bridge/atas_target.json
 # FASE 4: estado de notificacion (por simbolo, ultimo veredicto enviado)
