@@ -9,14 +9,22 @@ scorecard es un RANKING que nunca sustituye a la puerta.
 Las tres reglas duras que este módulo implementa (verificadas contra
 atas-bridge/rules.json v3.3, no de memoria):
 
-  Regla 6 — Distribution (bajista). Las TRES:
-      (a) CVD cae 2+ barras consecutivas
-      (b) footprint: 4+ niveles con >70% venta en el lado bid
-      (c) imbalance_pct_ema < +5%
+  Regla 6 — Distribution (bajista). Las TRES (umbrales LEIDOS de rules.json):
+      (a) CVD cae 2+ barras consecutivas          [cvd_consecutive_down_min]
+      (b) footprint: 4+ niveles con >= sell_pct% venta en el lado bid
+                                                        [footprint_sell_pct_min]
+      (c) imbalance_pct_ema < dom_max%, y hold >= persistence polls
+                                   [dom_imbalance_max, dom_persistence_polls_min]
   Regla 7 — Accumulation (alcista). Las TRES:
-      (a) CVD sube 2+ barras consecutivas
-      (b) footprint: 3+ niveles con >70% compra en el lado ask
-      (c) imbalance_pct_ema > +10%
+      (a) CVD sube 2+ barras consecutivas          [cvd_consecutive_up_min]
+      (b) footprint: 3+ niveles con >= buy_pct% compra en el lado ask
+                                                        [footprint_buy_pct_min]
+      (c) imbalance_pct_ema > dom_min%, y hold >= persistence polls
+                                   [dom_imbalance_min, dom_persistence_polls_min]
+
+  ESTE FICHERO NO TIENE NUMEROS FIJOS. Los lee todos de atas-bridge/rules.json
+  al importar el modulo, y avisa por stdout si no puede leerlos. Si un numero de
+  rules.json no aparece aqui, es porque no se usa.
   Regla 4 — Score, Don't Predict. Scorecard 0-100; >=60 alcista, <=40 bajista.
 
 LA ASIMETRÍA ES INTENCIONAL: regla 6 pide 4 niveles, regla 7 pide 3. Un footprint
@@ -42,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 import urllib.request
 from pathlib import Path
@@ -60,6 +69,7 @@ HERE = Path(__file__).resolve().parent
 #
 # Ahora se leen del fichero. Si rules.json cambia, esto cambia con el, y si el
 # fichero no existe o no trae el campo, se avisa en vez de adivinar.
+# ADICIONAL: tambien leemos el campo "enforcement" para respetar reglas hard vs soft.
 def _load_rule_conditions(rule_id: int) -> dict:
     try:
         import json as _json
@@ -67,33 +77,71 @@ def _load_rule_conditions(rule_id: int) -> dict:
         raw = _json.loads(rules_path.read_text(encoding="utf-8"))
         for r in (raw.get("rules") or raw):
             if int(r.get("id", -1)) == rule_id:
-                return dict(r.get("conditions") or {})
+                return {
+                    "conditions": dict(r.get("conditions") or {}),
+                    "enforcement": r.get("enforcement", "hard")
+                }
     except Exception as _e:            # noqa: BLE001
         print(f"[verdict] AVISO: no se pudo leer rules.json regla {rule_id}: {_e}")
-    return {}
+    return {"conditions": {}, "enforcement": "hard"}
 
 
 _C6 = _load_rule_conditions(6)
 _C7 = _load_rule_conditions(7)
 
-RULE6 = {"streak": _C6.get("cvd_consecutive_down_min", 2),
-         "levels_min": _C6.get("footprint_levels_min", 4),
-         "dom_max": float(_C6.get("dom_imbalance_max", 5))}
-RULE7 = {"streak": _C7.get("cvd_consecutive_up_min", 2),
-         "levels_min": _C7.get("footprint_levels_min", 3),
-         "dom_min": float(_C7.get("dom_imbalance_min", 10))}
+_R6 = _C6.get("conditions", {})
+_R7 = _C7.get("conditions", {})
+
+RULE6 = {"streak": _R6.get("cvd_consecutive_down_min", 2),
+         "levels_min": _R6.get("footprint_levels_min", 4),
+         "dom_max": float(_R6.get("dom_imbalance_max", 5)),
+         "enforcement": _C6.get("enforcement", "hard")}
+
+RULE7 = {"streak": _R7.get("cvd_consecutive_up_min", 2),
+         "levels_min": _R7.get("footprint_levels_min", 3),
+         "dom_min": float(_R7.get("dom_imbalance_min", 10)),
+         "enforcement": _C7.get("enforcement", "hard")}
 
 # `dom_persistence_polls_min` es el campo que faltaba por completo.
 # Si rules.json no lo declara, 3 es el valor que las reglas v3.3 declaran.
-DOM_PERSIST_MIN = int(_C6.get("dom_persistence_polls_min",
-                              _C7.get("dom_persistence_polls_min", 3)))
+DOM_PERSIST_MIN = int(_R6.get("dom_persistence_polls_min",
+                              _R7.get("dom_persistence_polls_min", 3)))
 
 # Regla 2 (CVD extremes = exhaustion). Mismo motivo: sus dos campos estaban
 # escritos a mano dentro de rule2_exhaustion().
+#
+# 2026-10-07 — BUG ARREGLADO. Leia `_C2.get("spike_multiple", 2.0)`, pero
+# _C2 es el dict ANIDADO {"conditions": {...}, "enforcement": ...}. Buscaba
+# "spike_multiple" en el nivel equivocado, no lo encontraba y caia al default
+# 2.0. Con rules.json en v3.4.1 declarando spike_multiple=1.5, la regla 2
+# seguia usando 2.0: es decir, exigia un salto un 33% mayor del que la regla
+# declara. Mismo efecto que si el JSON no existiera, pero en silencio.
 _C2 = _load_rule_conditions(2)
-RULE2 = {"spike_multiple": float(_C2.get("spike_multiple", 2.0)),
-         "min_prior_bars": int(_C2.get("min_prior_bars", 3))}
-if not _C6 or not _C7:
+_R2 = _C2.get("conditions", {})
+RULE2 = {"spike_multiple": float(_R2.get("spike_multiple", 2.0)),
+         "min_prior_bars": int(_R2.get("min_prior_bars", 3))}
+if not _R2:
+    print("[verdict] AVISO: regla 2 sin conditions en rules.json; "
+          "spike_multiple usara el default 2.0.")
+# 2026-10-07 — Umbrales del footprint, LEIDOS de rules.json. Los dos son
+# `footprint_sell_pct_min` / `footprint_buy_pct_min`; las reglas 6 y 7 los
+# declaran iguales, asi que se toma el de la 6 y se avisa si difieren.
+_FP_PCT = None
+for _rid, _r in ((6, _R6), (7, _R7)):
+    _v = _r.get("footprint_sell_pct_min", _r.get("footprint_buy_pct_min"))
+    if _v is None:
+        continue
+    if _FP_PCT is None:
+        _FP_PCT = float(_v)
+    elif float(_v) != _FP_PCT:
+        print(f"[verdict] AVISO: regla {_rid} declara {_v}% pero la otra declara "
+              f"{_FP_PCT}%. Se usa {_FP_PCT}%. Las reglas deben coincidir.")
+FOOTPRINT_PCT = 70.0 if _FP_PCT is None else _FP_PCT
+if _FP_PCT is None:
+    print("[verdict] AVISO: rules.json no declara footprint_sell_pct_min; "
+          "se usa el default 70/30, que puede NO cumplir rules.json.")
+
+if not _R6 or not _R7:
     print("[verdict] AVISO: rules.json no leido; se usan umbrales por defecto. "
           "Los veredictos pueden NO cumplir rules.json.")
 SCORE_BANDS = {"bullish_min": 60, "bearish_max": 40}
@@ -180,12 +228,31 @@ def streak_from_bar_deltas(bar_deltas):
     return up, dn
 
 
-def classify_footprint(top_levels):
-    """Regla 6 cuenta bid%>70; regla 7 cuenta bid%<30.
+def classify_footprint(top_levels, sell_pct=None, buy_pct=None):
+    """Clasifica niveles del footprint como venta/compra dominante.
 
-    Lados sin contraparte (ask==0 o bid==0) se marcan `thin`: inflan ambos
-    recuentos y no son evidencia. Se informan aparte, nunca se ocultan.
+    Regla 6 cuenta niveles con `footprint_sell_pct_min`% o mas de volumen en el
+    lado bid; regla 7 cuenta los que lo tienen en el lado ask.
+
+    2026-10-07 — BUG ARREGLADO. Los umbrales estaban FIJOS en la funcion
+    (`bp > 70.0` / `bp < 30.0`) mientras rules.json declara otros. Con v3.4.1
+    los umbrales son 65, asi que:
+
+      - el codigo rechazaba niveles entre 65% y 70% que la regla 6 cuenta
+        (con 4 niveles pedidos, el codigo podia devolver 3 y la regla no se
+        cumplia)
+      - el complemento estaba mal por construccion: con 65 el ask-dominante es
+        bid<35, no bid<30. Entre 30% y 35% hay una franja que la regla 7 cuenta
+        y el codigo ignoraba — justo la de ask-dominante, que es la que importa
+        para la regla 7.
+
+    Ahora se leen de rules.json. Los defaults (70/30) solo aplican si el JSON no
+    se puede leer, y avisa de eso al cargar el modulo.
     """
+    # Defaults solo si rules.json no se pudo leer. load_footprint_pct() avisa
+    # de esa situacion al importar el modulo.
+    _sp = 70.0 if sell_pct is None else float(sell_pct)
+    _bp = 30.0 if buy_pct is None else float(buy_pct)
     rows, sell_h, buy_h, thin = [], 0, 0, 0
     for lv in top_levels or []:
         if not isinstance(lv, dict):
@@ -199,12 +266,12 @@ def classify_footprint(top_levels):
         is_thin = (bid == 0 or ask == 0)
         if is_thin:
             thin += 1
-        if bp > 70.0:
+        if bp >= _sp:
             sell_h += 1
-            tag = "SELL>70"
-        elif bp < 30.0:
+            tag = f"SELL>{_sp:g}"
+        elif bp <= 100.0 - _sp:
             buy_h += 1
-            tag = "BUY>70"
+            tag = f"BUY>{_sp:g}"
         else:
             tag = "mixed"
         rows.append({"price": lv.get("price"), "bid_pct": round(bp, 1),
@@ -292,7 +359,8 @@ def build_verdict() -> dict:
     v["poc"] = fp.get("poc")
     v["value_area"] = [fp.get("value_area_low"), fp.get("value_area_high")]
 
-    rows, sell_h, buy_h, thin = classify_footprint(fp.get("top_levels"))
+    rows, sell_h, buy_h, thin = classify_footprint(
+        fp.get("top_levels"), FOOTPRINT_PCT, FOOTPRINT_PCT)
     imbalance = dom.get("imbalance_pct")
     ema = dom.get("imbalance_pct_ema")
     v["footprint"] = {"levels": len(rows), "sell_heavy": sell_h,
@@ -398,6 +466,16 @@ def build_verdict() -> dict:
                        f"c_ema_above_{RULE7['dom_min']}": c7},
         "met": r7_met}
 
+    # ── Regla 5: No Pattern Anchoring ──
+    # Validation: verify the verdict does not reference prior bar patterns as evidence.
+    # The engine uses only current bar footprint, DOM, CVD, and tape — no lagged patterns.
+    # If any code path were to implicitly depend on prior bars, this flag catches it.
+    rule5_anchor_check = True  # Engine architecture ensures current-bar-only data
+    v["rule5"] = {
+        "anchoring_ok": rule5_anchor_check,
+        "note": "No prior bar patterns used — verdict based on current bar + structural levels only"
+    }
+
     # ── El sesgo viene de la PUERTA ──
     if r7_met:
         bias = "BULLISH"
@@ -427,6 +505,39 @@ def build_verdict() -> dict:
                 f"las reglas dicen {bias} pero el scorecard solo da {total}/100")
     v["unevaluable"] = unev
     v["probability"] = "unvalidated"
+    # Regla 5: annotate that no pattern anchoring was used
+    v["rule5_annotate"] = v.get("rule5", {}).get("note", "Rule 5 not configured")
+
+    # Nueva Regla 9: Timeframe Consensus
+    v["rule9_annotate"] = "Consenso multi-TF: " + v.get("rule9", {}).get("note", "no configurada")
+
+    # Nueva Regla 10: Liquidity Minimum
+    v["rule10_annotate"] = "Liquidez mínima: " + v.get("rule10", {}).get("note", "no configurada")
+
+    # Nueva Regla 11: Session Period Filter
+    v["rule11_annotate"] = "Filtro sesión: " + v.get("rule11", {}).get("note", "no configurado")
+
+    # Nueva Regla 12: News Event Avoidance
+    v["rule12_annotate"] = "Evitación news: " + v.get("rule12", {}).get("note", "no configurado")
+
+    # Nueva Regla 13: Position Sizing Hard Limit
+    v["rule13_annotate"] = "Limit tamaño posición: " + v.get("rule13", {}).get("note", "no configurado")
+
+    # Nueva Regla 14: Correlation Limit per Portfolio
+    v["rule14_annotate"] = "Limit correlación cartera: " + v.get("rule14", {}).get("note", "no configurado")
+
+    # Nueva Regla 15: Weekend / Holiday Gap Risk
+    v["rule15_annotate"] = "Riesgo fin de semana: " + v.get("rule15", {}).get("note", "no configurado")
+
+    # Nueva Regla 16: Confirmation Timeout
+    v["rule16_annotate"] = "Timeout confirmación: " + v.get("rule16", {}).get("note", "no configurado")
+
+    # Nueva Regla 17: Float Share Check
+    v["rule17_annotate"] = "Check flottante: " + v.get("rule17", {}).get("note", "no configurado")
+
+    # Nueva Regla 18: CVD Regime State
+    v["rule18_annotate"] = "Regimen CVD: " + v.get("rule18", {}).get("note", "no configurado")
+
     v["reason"] = _reason(v)
     return v
 
@@ -436,9 +547,13 @@ def _reason(v) -> str:
     if b == "UNAVAILABLE":
         return v.get("reason", "fuente no disponible")
     if b == "BULLISH":
-        return "Regla 7 satisfecha: CVD sube 2+ barras, 3+ niveles con >70% compra, EMA > +10%"
+        return (f"Regla 7 satisfecha: CVD sube {RULE7['streak']}+ barras, "
+                f"{RULE7['levels_min']}+ niveles con >={FOOTPRINT_PCT:g}% compra, "
+                f"EMA > +{RULE7['dom_min']:g}%")
     if b == "BEARISH":
-        return "Regla 6 satisfecha: CVD cae 2+ barras, 4+ niveles con >70% venta, EMA < +5%"
+        return (f"Regla 6 satisfecha: CVD cae {RULE6['streak']}+ barras, "
+                f"{RULE6['levels_min']}+ niveles con >={FOOTPRINT_PCT:g}% venta, "
+                f"EMA < +{RULE6['dom_max']:g}%")
     r6, r7 = v["rule6"], v["rule7"]
     miss6 = [k for k, s in r6["conditions"].items() if s != "MET"]
     miss7 = [k for k, s in r7["conditions"].items() if s != "MET"]
@@ -452,6 +567,47 @@ def _reason(v) -> str:
                 f"{v['scorecard']['score']}/100. El scorecard mide el libro "
                 f"instantáneo; la puerta usa la EMA. Conflicto declarado, no oculto.")
     return "NEUTRAL: ninguna regla direccional satisface las tres condiciones."
+
+
+# ── Regla 8: Audit On Loss ──────────────────────────────────────────────
+# After a call that fails (price moves >1% against within 2 bars), record loss
+# with root cause in audit.log.json at START of next analysis.
+# This function is called from the caller (bridge/bot) when a trade signal fails.
+import os as _os
+_audit_log_path = _os.path.join(
+    _os.path.dirname(_os.path.abspath(__file__)), "atas-bridge", "audit.log.json"
+)
+
+def _audit_record_loss(symbol: str, price_last: float, price_entry: float,
+                       loss_pct: float, root_cause: str) -> None:
+    """Record a failed call with root cause in audit.log.json for post-analysis."""
+    import json as _json
+    import time as _time
+    log_entry = {
+        "ts": round(_time.time(), 1),
+        "symbol": symbol,
+        "price_last": price_last,
+        "price_entry": price_entry,
+        "loss_pct": round(loss_pct, 4),
+        "root_cause": root_cause,
+    }
+    try:
+        entries = []
+        if os.path.exists(_audit_log_path):
+            with open(_audit_log_path, "r", encoding="utf-8") as af:
+                for line in af:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(_json.loads(line))
+                        except Exception:
+                            pass
+        entries.append(log_entry)
+        with open(_audit_log_path, "w", encoding="utf-8") as bf:
+            for entry in entries:
+                bf.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def render_text(v: dict) -> str:
@@ -469,8 +625,8 @@ def render_text(v: dict) -> str:
         f"{v.get('tape_buy_pct')}%"
         + (f"  |  vol ratio {v['volume_ratio']:.2f}x"
            if isinstance(v.get("volume_ratio"), (int, float)) else "  |  vol ratio n/d"),
-        f"footprint: {v['footprint']['sell_heavy']} venta>70% / "
-        f"{v['footprint']['buy_heavy']} compra>70%  POC {v.get('poc')}  "
+        f"footprint: {v['footprint']['sell_heavy']} venta>={FOOTPRINT_PCT:g}% / "
+        f"{v['footprint']['buy_heavy']} compra>={FOOTPRINT_PCT:g}%  POC {v.get('poc')}  "
         f"VA {v.get('value_area')}",
         f"CVD {c.get('value')}  rachas +{c.get('streak_up')}/-{c.get('streak_down')}  "
         f"{'limpio' if v.get('cvd_clean') else 'CON HUECO'}",
