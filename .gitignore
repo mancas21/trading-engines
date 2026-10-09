@@ -69,3 +69,8 @@ reader/supervisor_stderr.log
 reader/supervisor_launch.log
 reader/supervisor_status.json
 reader/__pycache__/
+
+# scanner-engine runtime
+scanner-engine/data/
+scanner-engine/*.db
+scanner-engine/scanner.db
