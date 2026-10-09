@@ -31,6 +31,8 @@ from __future__ import annotations
 import json
 import pathlib
 import sqlite3
+import threading
+from contextlib import contextmanager
 
 # Directed return, derived in SQL. direction = 0 yields NULL, which AVG ignores
 # and a WHERE ... IS NOT NULL filter removes — the exclusion is structural, not
@@ -76,13 +78,32 @@ CREATE TABLE IF NOT EXISTS recorder_meta (
 
 
 def open_db(path: str | pathlib.Path) -> sqlite3.Connection:
-    """Open (creating if needed) the scanner database. Idempotent."""
+    """Open (creating if needed) the scanner database. Idempotent.
+
+    `check_same_thread=False` plus a module lock. The HTTP surface runs on
+    ThreadingHTTPServer worker threads while the scan loop owns the writer, and
+    sqlite3 refuses a connection used from a thread other than the one that
+    created it — measured: /health raised
+    "SQLite objects created in a thread can only be used in that same thread"
+    and returned an empty body. The lock serializes access so the threading is
+    safe rather than merely permitted.
+    """
     p = pathlib.Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(str(p))
+    db = sqlite3.connect(str(p), check_same_thread=False)
     db.executescript(SCHEMA)
     db.commit()
     return db
+
+
+# Serializes every DB touch. A scan cycle writes while /health may read.
+DB_LOCK = threading.RLock()
+
+
+@contextmanager
+def _guard(db: sqlite3.Connection):
+    with DB_LOCK:
+        yield db
 
 
 def record_verdict(
@@ -113,18 +134,19 @@ def record_verdict(
     if horizon_bars <= 0:
         raise ValueError(f"horizon_bars must be > 0, got {horizon_bars}")
 
-    cur = db.execute(
-        """INSERT INTO verdicts
-             (ts, pair, direction, venues_live, rules_met, rules_unevaluable,
-              score, horizon_bars, fill_price, forward_return, resolved, bar_closed)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (ts, pair, int(direction), int(venues_live),
-         json.dumps(list(rules_met)), json.dumps(list(rules_unevaluable)),
-         int(score), int(horizon_bars), fill_price, forward_return,
-         0, 1),
-    )
-    db.commit()
-    return int(cur.lastrowid)
+    with _guard(db):
+        cur = db.execute(
+            """INSERT INTO verdicts
+                 (ts, pair, direction, venues_live, rules_met, rules_unevaluable,
+                  score, horizon_bars, fill_price, forward_return, resolved, bar_closed)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ts, pair, int(direction), int(venues_live),
+             json.dumps(list(rules_met)), json.dumps(list(rules_unevaluable)),
+             int(score), int(horizon_bars), fill_price, forward_return,
+             0, 1),
+        )
+        db.commit()
+        return int(cur.lastrowid)
 
 
 def resolve(db: sqlite3.Connection, ids: list[int],
@@ -139,40 +161,43 @@ def resolve(db: sqlite3.Connection, ids: list[int],
     Returns the number of rows resolved.
     """
     n = 0
-    for rid in ids:
-        row = db.execute("SELECT pair FROM verdicts WHERE id=?", (rid,)).fetchone()
-        if row is None:
-            continue
-        pair = row[0]
-        if pair not in return_by_pair:
-            continue                      # stays unresolved; NOT zeroed
-        db.execute(
-            "UPDATE verdicts SET forward_return=?, resolved=1 WHERE id=?",
-            (float(return_by_pair[pair]), rid),
-        )
-        n += 1
-    db.commit()
+    with _guard(db):
+        for rid in ids:
+            row = db.execute("SELECT pair FROM verdicts WHERE id=?", (rid,)).fetchone()
+            if row is None:
+                continue
+            pair = row[0]
+            if pair not in return_by_pair:
+                continue                  # stays unresolved; NOT zeroed
+            db.execute(
+                "UPDATE verdicts SET forward_return=?, resolved=1 WHERE id=?",
+                (float(return_by_pair[pair]), rid),
+            )
+            n += 1
+        db.commit()
     return n
 
 
 def unresolved(db: sqlite3.Connection, limit: int = 500) -> list[tuple[int, str, float]]:
     """Rows awaiting resolution: (id, pair, ts)."""
-    return db.execute(
-        "SELECT id, pair, ts FROM verdicts WHERE resolved=0 ORDER BY ts LIMIT ?",
-        (limit,),
-    ).fetchall()
+    with _guard(db):
+        return db.execute(
+            "SELECT id, pair, ts FROM verdicts WHERE resolved=0 ORDER BY ts LIMIT ?",
+            (limit,),
+        ).fetchall()
 
 
 def counts(db: sqlite3.Connection) -> dict:
     """Coverage summary for /health and the auditor's sanity checks."""
-    row = db.execute(
-        """SELECT COUNT(*),
-                  SUM(resolved),
-                  SUM(CASE WHEN resolved=1 AND direction!=0 THEN 1 ELSE 0 END),
-                  SUM(CASE WHEN direction=0 THEN 1 ELSE 0 END),
-                  MIN(ts), MAX(ts)
-             FROM verdicts"""
-    ).fetchone()
+    with _guard(db):
+        row = db.execute(
+            """SELECT COUNT(*),
+                      SUM(resolved),
+                      SUM(CASE WHEN resolved=1 AND direction!=0 THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN direction=0 THEN 1 ELSE 0 END),
+                      MIN(ts), MAX(ts)
+                 FROM verdicts"""
+        ).fetchone()
     total = row[0] or 0
     return {
         "rows_total": total,
