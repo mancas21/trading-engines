@@ -1,0 +1,114 @@
+{
+  "version": "1.0.0",
+  "engine": "scanner-engine",
+
+  "capabilities": {
+    "l2_footprint": false,
+    "footprint_note": "No public venue exposes footprint aggregation. Rule 6/7 condition (b) of the ATAS engine CANNOT be evaluated here. This is a hard limitation, not a config gap.",
+    "venues": ["binance", "okx", "kraken", "bybit"],
+    "cross_venue_basis": true,
+    "per_bar_cvd_venues": ["binance"],
+    "per_bar_cvd_note": "Only Binance publishes taker-buy volume in its klines. OKX candles have 9 fields and no taker volume; Kraken OHLC is total-volume only. The other three derive flow from per-trade taker side, normalized to a fixed time window."
+  },
+
+  "normalization": {
+    "why": "Venue spreads are NOT uniform, so a fixed threshold on raw basis dispersion fires on venue microstructure rather than on signal. Measured 2026-10-08:",
+    "measured_spread_bps": {
+      "XAU/USD": {"binance": 0.024, "bybit": 0.024, "okx": 0.238, "kraken": 0.239},
+      "HYPE/USD": {"binance": 0.119, "okx": 0.119, "bybit": 1.194, "kraken": 2.391},
+      "XRP/USD": {"binance": 0.723, "okx": 0.723, "bybit": 0.723, "kraken": 0.072}
+    },
+    "basis_zscore": {
+      "method": "z = (venue_mid - cross_venue_vwap_mid) / (own_venue_spread_bps + eps)",
+      "eps_bps": 0.01,
+      "why": "Expressing the basis in units of the venue's OWN spread makes a thin book unable to manufacture a signal out of its own tick size. A 23bps XAU basis is ~1000x Kraken's spread and ~1x nothing else; normalized, Kraken cannot dominate the ranking by having a wider book."
+    },
+    "dispersion": {
+      "method": "spread-normalized max-min across live venues, in units of the median venue spread",
+      "min_venues_required": 2,
+      "why": "A single venue has no dispersion. Two venues give a basis but no consensus."
+    }
+  },
+
+  "rules": {
+    "1": {
+      "name": "Cross-venue basis dislocation",
+      "requires_venues": 2,
+      "direction": "both",
+      "conditions": {
+        "a": "basis_zscore of at least one venue vs cross-venue vwap exceeds z_threshold",
+        "b": "dislocation persists for at least persist_cycles consecutive cycles"
+      },
+      "thresholds": {
+        "z_threshold": 6.0,
+        "persist_cycles": 2
+      },
+      "rationale": "The signal ATAS structurally cannot produce: it sees one venue. A venue trading materially away from the others while its own book is not simply wider is a real dislocation or a stale quote, and persistence separates the two.",
+      "audit_status": "UNVALIDATED - no recorded outcomes yet. Phase 4's auditor decides whether it survives."
+    },
+    "2": {
+      "name": "Single-venue flow dominance",
+      "requires_venues": 2,
+      "direction": "both",
+      "conditions": {
+        "a": "one venue's aggressor delta ratio deviates from the cross-venue median by more than flow_gap",
+        "b": "the deviating venue's own price has NOT moved proportionally (absorption)"
+      },
+      "thresholds": {
+        "flow_gap": 0.35,
+        "min_coverage_s": 20.0
+      },
+      "rationale": "A venue showing large buying that the others do not, with price failing to respond, is absorption. Volume without price movement is the observable form.",
+      "audit_status": "UNVALIDATED"
+    },
+    "3": {
+      "name": "Cross-venue liquidity vacuum",
+      "requires_venues": 3,
+      "direction": "both",
+      "conditions": {
+        "a": "touch imbalance beyond +/- vac_band on at least vac_venues venues simultaneously",
+        "b": "total top-N depth falls below its own trailing median for the pair"
+      },
+      "thresholds": {
+        "vac_band": 0.30,
+        "vac_venues": 3,
+        "depth_z": -1.5
+      },
+      "requires_three_venues": true,
+      "three_venue_note": "UNEVALUABLE for SPCX/USD and NVDA/USD, which list on 3 venues. This rule MUST declare UNEVALUABLE for them rather than silently evaluating on 2 — a 2-venue reading of a 3-venue condition is a different, weaker claim.",
+      "audit_status": "UNVALIDATED"
+    },
+    "4": {
+      "name": "Aggressor flow agreement",
+      "requires_venues": 3,
+      "direction": "both",
+      "conditions": {
+        "a": "at least agree_venues venues share the same delta_ratio sign",
+        "b": "the agreeing set's median |delta_ratio| exceeds flow_strength"
+      },
+      "thresholds": {
+        "agree_venues": 3,
+        "flow_strength": 0.25,
+        "min_coverage_s": 30.0
+      },
+      "requires_three_venues": true,
+      "audit_status": "UNVALIDATED"
+    }
+  },
+
+  "gates": {
+    "default_min_venues": 3,
+    "min_venues_is_per_pair": true,
+    "min_venues_note": "SPCX/USD and NVDA/USD list on 3 venues and their floor is 3, so they satisfy every rule's venue requirement. A pair whose live count falls below its floor makes all rules UNEVALUABLE and the verdict is reduced-evidence, not directional.",
+    "max_age_s": 300,
+    "min_history_bars": 60,
+    "gate_signals": false,
+    "gate_note": "No rule may suppress a signal until the Phase 4 auditor has measured it with a direction-adjusted t-statistic and t < -1.65. Four rules that have never been audited must not be allowed to gate anything."
+  },
+
+  "carried_overs": {
+    "from": "quant-alert-engine rules.json v3.4.1",
+    "excluded": ["6", "7"],
+    "why": "Rules 6 and 7 are order-flow rules whose condition (b) needs footprint aggregation. Shipping them here would mean shipping conditions that can never evaluate, which is the UNEVALUABLE-condition failure already documented in this repo's STATUS.md."
+  }
+}
