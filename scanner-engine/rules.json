@@ -76,6 +76,7 @@
       },
       "requires_three_venues": true,
       "three_venue_note": "UNEVALUABLE for SPCX/USD and NVDA/USD, which list on 3 venues. This rule MUST declare UNEVALUABLE for them rather than silently evaluating on 2 — a 2-venue reading of a 3-venue condition is a different, weaker claim.",
+      "rationale": "Top-of-book depletion across venues at once is a liquidity event; on a single venue it is indistinguishable from that venue's own microstructure. Measured venue spreads differ by up to 100x, so condition (b) compares against the pair's own trailing depth median rather than an absolute.",
       "audit_status": "UNVALIDATED"
     },
     "4": {
@@ -92,6 +93,7 @@
         "min_coverage_s": 30.0
       },
       "requires_three_venues": true,
+      "rationale": "Aggressor flow agreeing across independent venues is the one cross-venue reading that cannot be faked by a single venue's stale quote or washed book. Requires 3 venues so a 2-venue agreement (which two correlated books can fake) is not enough.",
       "audit_status": "UNVALIDATED"
     }
   },
