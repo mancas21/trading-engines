@@ -136,7 +136,38 @@ def main() -> int:
 
     db.close()
 
-    if not changes and not broken:
+    # A CONTINUING pipeline problem is not news every 30 minutes. Report each
+    # distinct problem once; re-report only if it persists AND the numbers
+    # moved, or if a NEW problem appears. Measured: the "347 rows never
+    # resolve" warning was identical on every tick because the row count had
+    # not changed, so the change-detection never fired and the job repeated
+    # itself forever.
+    prev_problems = set(prev.get("problems", []))
+    now_problems = set(broken)
+    fresh = now_problems - prev_problems
+    resolved_now = prev_problems - now_problems
+
+    to_report = list(fresh)
+    for b in resolved_now:
+        to_report.append(f"RESOLVED: {b}")
+
+    # Re-report a still-open problem only when the numbers behind it moved, so
+    # a stuck backlog does not repeat verbatim forever. Keyed on resolved rows,
+    # not total rows: the legacy pre-resolver backlog keeps total constant
+    # while resolved climbs, and "resolved" is the number that proves the
+    # resolver is making progress.
+    still_open = now_problems & prev_problems
+    if still_open and health["rows_resolved"] != prev.get("rows_resolved"):
+        to_report.append("still open (progressing): " + "; ".join(sorted(still_open)))
+
+    save_state({"fingerprint": fp, "eligible": now_elig,
+                "rows_total": health["rows_total"],
+                "rows_resolved": health["rows_resolved"],
+                "problems": sorted(now_problems),
+                "ts": time.time()})
+    db.close()
+
+    if not changes and not to_report:
         return 0                       # silence: nothing changed
 
     lines = ["scanner-engine: audit update", ""]
@@ -145,9 +176,9 @@ def main() -> int:
                  f"directed {health['directed_resolved']}  "
                  f"awaiting {health['awaiting']}")
     lines.append("")
-    if broken:
-        lines.append("PIPELINE PROBLEM:")
-        lines += [f"  ! {b}" for b in broken]
+    if to_report:
+        lines.append("STATUS:")
+        lines += [f"  - {b}" for b in to_report]
         lines.append("")
     if changes:
         lines.append("CHANGED:")
