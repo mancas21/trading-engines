@@ -249,18 +249,26 @@ class Supervisor:
 
 def main() -> int:
     import argparse
+    # A supervised command arrives as raw argv, not through argparse.
+    #
+    # `add_argument("--", nargs=REMAINDER)` does NOT work here: argparse rejects
+    # the bare "--" separator and exits with
+    #   error: unrecognized arguments: -- python.exe scanner.py
+    # so the supervisor never started. Everything after a literal "--" on the
+    # command line is the child command, and argparse only ever sees the flags
+    # before it.
+    argv = sys.argv[1:]
+    sep = argv.index("--") if "--" in argv else len(argv)
+    my_flags, child_cmd = argv[:sep], argv[sep + 1:]
+
     ap = argparse.ArgumentParser(description="scanner-engine supervisor")
     ap.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
     ap.add_argument("--backoff", type=float, default=DEFAULT_BACKOFF_S)
     ap.add_argument("--lock", default=str(HERE / "data" / "scanner.lock"))
     ap.add_argument("--log", default=str(HERE / "data" / "supervisor.log"))
-    ap.add_argument("--", dest="dash", nargs=argparse.REMAINDER,
-                    help="command to supervise (default: scanner.py)")
-    args = ap.parse_args()
+    args = ap.parse_args(my_flags)
 
-    cmd = args.dash or [sys.executable, str(HERE / "scanner.py")]
-    if cmd and cmd[0] == "--":
-        cmd = cmd[1:]
+    cmd = child_cmd or [sys.executable, str(HERE / "scanner.py")]
 
     sup = Supervisor(command=cmd, lock_path=args.lock, log_path=args.log,
                      max_attempts=args.max_attempts, backoff_s=args.backoff)
