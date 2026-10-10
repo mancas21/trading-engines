@@ -37,6 +37,27 @@ DEFAULT_BACKOFF_S = 3.0
 # Never read a stale lock held by a PID that no longer exists.
 STALE_LOCK_GRACE_S = 0.0
 
+# Exit code reported when the watchdog kills a hung child. Module level so it
+# can be imported and asserted on: it must be NON-ZERO, or should_restart()
+# would read a hang as a clean exit and refuse to relaunch.
+WATCHDOG_KILLED = -9
+
+# Default watchdog deadline for the child.
+#
+# MEASURED, and the first value was wrong. A poll-only cycle takes ~21s, so
+# 300s looked generous. It is not: the real cycle writes 8 rows then runs the
+# outcome resolver, which issues one HTTP request per row per venue. Measured
+# cycle-to-cycle interval with the resolver attached: median 422s, max 583s.
+# A 300s watchdog therefore killed HEALTHY scanners -- verified live, it fired
+# on a scanner that was polling normally, and the log shows the cycle being
+# cut short at exactly 300s.
+#
+# The deadline must clear the SLOWEST legitimate cycle with headroom. 1200s
+# (~20 min) is roughly 2x the observed worst case, which still catches a true
+# wedge (the original bug ran past 300s with zero rows written, and a genuine
+# hang is unbounded) without punishing a slow-but-working scanner.
+WATCHDOG_S = 1200.0
+
 # Which lock paths THIS process has claimed. The PID file alone cannot express
 # "a second lock object in the same interpreter must be refused", because the
 # pid it holds is our own and therefore always alive.
@@ -160,16 +181,24 @@ class InstanceLock:
 
 
 class Supervisor:
+    # A child that hangs must be a CRASH, not silence. Measured: a cycle wedged
+    # in the outcome resolver held the scanner alive with no new rows for 312s
+    # while every venue aged past max_age_s, and `subprocess.run` with no
+    # timeout waited forever, so the restart policy never engaged. A watchdog
+    # deadline turns a hang into exit != 0, which the existing policy already
+    # knows how to handle.
     def __init__(self, command: list[str], lock_path: pathlib.Path | str,
                  log_path: pathlib.Path | str | None = None,
                  max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-                 backoff_s: float = DEFAULT_BACKOFF_S):
+                 backoff_s: float = DEFAULT_BACKOFF_S,
+                 watchdog_s: float | None = None):
         self.command = list(command)
         self.lock = InstanceLock(lock_path)
         self.log_path = pathlib.Path(log_path) if log_path else \
             HERE / "data" / "supervisor.log"
         self.max_attempts = max_attempts
         self.backoff_s = backoff_s
+        self.watchdog_s = WATCHDOG_S if watchdog_s is None else watchdog_s
         self.attempts = 0
 
     # ── policy ─────────────────────────────────────────────────────────────
@@ -188,6 +217,53 @@ class Supervisor:
         with open(self.log_path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
         print(line, flush=True)
+
+    def _run_with_watchdog(self):
+        """Run the child, killing it if it outlives the watchdog.
+
+        `subprocess.run` has no timeout, so a wedged child looks identical to a
+        healthy one from the supervisor's side: no exit, no output, no restart.
+        Measured -- the scanner sat for 312s with zero new rows while every
+        venue aged past max_age_s, and the restart policy never engaged.
+
+        Killing the whole process group matters: the child may have spawned
+        helpers, and killing only the parent would leave them holding the port.
+        """
+        import subprocess as sp
+        kwargs = dict(stdout=sp.PIPE, stderr=sp.STDOUT, text=True,
+                      errors="replace")
+        if sys.platform == "win32":
+            flags = getattr(sp, "CREATE_NEW_PROCESS_GROUP", 0)
+            kwargs["creationflags"] = flags
+        proc = sp.Popen(self.command, **kwargs)
+        try:
+            out, _ = proc.communicate(timeout=self.watchdog_s)
+        except sp.TimeoutExpired:
+            self._kill_tree(proc)
+            try:
+                out, _ = proc.communicate(timeout=15)
+            except Exception:                               # noqa: BLE001
+                out = ""
+            done = sp.CompletedProcess(self.command, WATCHDOG_KILLED,
+                                       out or "", None)
+            return done
+        return sp.CompletedProcess(self.command, proc.returncode, out or "", None)
+
+    @staticmethod
+    def _kill_tree(proc) -> None:
+        import subprocess as sp
+        try:
+            if sys.platform == "win32":
+                sp.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True, timeout=20)
+            else:
+                import os as _os, signal as _sig
+                _os.killpg(_os.getpgid(proc.pid), _sig.SIGKILL)
+        except Exception:                                   # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:                               # noqa: BLE001
+                pass
 
     # ── the loop ───────────────────────────────────────────────────────────
 
@@ -208,18 +284,22 @@ class Supervisor:
                 self.log(f"attempt {self.attempts}/{self.max_attempts} "
                          f"launching: {' '.join(self.command)}")
                 try:
-                    proc = subprocess.run(
-                        self.command,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        errors="replace",
-                    )
+                    if self.watchdog_s and self.watchdog_s > 0:
+                        proc = self._run_with_watchdog()
+                    else:
+                        proc = subprocess.run(
+                            self.command, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            errors="replace",
+                        )
                     last_rc = proc.returncode
                     out = (proc.stdout or "").strip()
                     if out:
                         for line in out.splitlines()[-20:]:
                             self.log(f"  | {line}")
+                    if last_rc == WATCHDOG_KILLED:
+                        self.log(f"  ! child exceeded the {self.watchdog_s:.0f}s "
+                                 f"watchdog and was killed -- treating as a crash")
                 except Exception as e:                        # noqa: BLE001
                     last_rc = None
                     self.log(f"  ! failed to launch: {type(e).__name__}: {e}")

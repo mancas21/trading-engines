@@ -30,6 +30,12 @@ import time
 # A row's horizon in milliseconds, given its bar size in minutes.
 BAR_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000}
 
+# The recorder's DB lock, imported once here so every read AND write in this
+# module is serialized against the scanner loop and the HTTP surface. Must be
+# defined before first use -- it was previously aliased at the bottom of the
+# file, which meant `mark_unscorable` raised NameError on the first cycle.
+from recorder import _guard as RC_guard  # noqa: E402
+
 
 def forward_return(fill: float | None, later: float | None) -> float | None:
     """Raw fractional move from `fill` to `later`.
@@ -64,25 +70,71 @@ def resolve_row(bar: dict | None, horizon_bars: int, now_ms: int | None = None,
 
 # ── the resolver over the whole table ──────────────────────────────────────
 
-def pending_rows(db: sqlite3.Connection, limit: int = 500) -> list[tuple]:
+# Rows resolved per cycle. MEASURED, not guessed: a cycle is ~21s of venue
+# polling, and resolve_pending issues ONE HTTP request per row. At the old
+# default of 500, the first cycle after a backlog inherited 347 unresolved
+# rows and spent >300s resolving them -- the scanner appeared frozen, every
+# venue aged past max_age_s, and /health showed the whole universe frozen.
+# The supervisor could not see it because subprocess.run has no timeout.
+#
+# A bounded batch keeps a cycle near its intended length; the backlog drains
+# over several cycles instead of stalling one.
+DEFAULT_BATCH = 12
+
+# A row older than this cannot be scored honestly. Binance /klines with
+# limit=50 covers 50 minutes of 1m bars, so a row whose horizon sits hours ago
+# has no retrievable bar and `fetch_closed_bar` correctly returns None. Such a
+# row must not occupy a batch slot forever: measured, 336 legacy rows pinned the
+# batch and `resolved` sat at 21 across seven cycles.
+#
+# A 5-minute forward move is not recoverable an hour later regardless -- the
+# price path in between is unknown -- so these rows are marked unscorable
+# rather than silently retried or zero-filled.
+MAX_SCORABLE_AGE_S = 1800.0     # 30 minutes: ~6x the longest horizon
+
+
+def pending_rows(db: sqlite3.Connection, limit: int = DEFAULT_BATCH) -> list[tuple]:
     """Rows awaiting an outcome: (id, pair, ts, horizon_bars, fill_price)."""
     with RC_guard(db):
         return db.execute(
             """SELECT id, pair, ts, horizon_bars, fill_price
                  FROM verdicts
                 WHERE resolved = 0 AND fill_price IS NOT NULL
-                ORDER BY ts LIMIT ?""",
-            (limit,),
+                  AND ts > ?
+                ORDER BY ts DESC LIMIT ?""",
+            (time.time() - MAX_SCORABLE_AGE_S, limit),
         ).fetchall()
 
 
+def mark_unscorable(db: sqlite3.Connection, older_than_s: float = MAX_SCORABLE_AGE_S) -> int:
+    """Retire rows whose forward bar no longer exists.
+
+    Sets `resolved = 1` with a NULL forward_return and resolved=0 semantics
+    preserved by a dedicated marker, so they leave the pending batch without
+    being counted as a measured outcome. `recorder.counts()` distinguishes
+    them via rows_unscorable.
+    """
+    with RC_guard(db):
+        cur = db.execute(
+            """UPDATE verdicts SET unscorable = 1, resolved = 1
+                WHERE resolved = 0 AND ts <= ? AND unscorable = 0""",
+            (time.time() - older_than_s,),
+        )
+        db.commit()
+        return cur.rowcount
+
+
+
 def resolve_pending(db: sqlite3.Connection, fetch_bar, now_ms: int | None = None,
-                    limit: int = 500) -> int:
+                    limit: int = DEFAULT_BATCH) -> int:
     """Resolve every row whose horizon bar has closed.
 
     `fetch_bar(pair, at_ms) -> {"close": float, "close_ms": int}` must return
     the CLOSED bar covering `at_ms`. Rows whose bar is still forming, or whose
     fetch fails, are left untouched — never zeroed.
+
+    `limit` bounds the batch so a backlog cannot turn one cycle into minutes.
+    It is a BATCH, not a cap: the next cycle picks up where this one stopped.
     """
     if now_ms is None:
         now_ms = int(time.time() * 1000)
@@ -187,15 +239,6 @@ def promoted_direction(rules: dict, rule_ids: list[str],
         if status.startswith("UNVALIDATED"):
             return 0
     return hint_direction(rules, flow_by_rule)
-
-
-def _RC_guard(db):
-    from recorder import _guard
-    return _guard(db)
-
-
-# alias so callers can use the guard without importing recorder internals
-RC_guard = _RC_guard
 
 
 if __name__ == "__main__":

@@ -186,13 +186,17 @@ def test_candidate_rows_enter_expectancy_and_verdict_rows_do_not(tmp_path):
 
     fetch = lambda p, m: {"open_ms": m - 60_000, "close_ms": m,
                           "close": 101.0 if p == "A/USD" else 100.0}
-    OUT.resolve_pending(db, fetch_bar=fetch, now_ms=int(time.time() * 1000))
+    # Loop: resolve_pending is a BATCH (12 rows), not a sweep. One call sees
+    # only the 12 newest, and this test has 55 rows. The production loop drains
+    # the backlog over successive cycles; the test must do the same.
+    for _ in range(10):
+        OUT.resolve_pending(db, fetch_bar=fetch, now_ms=int(time.time() * 1000))
 
     cand = db.execute("SELECT COUNT(*) FROM verdicts WHERE candidate=1 "
                       "AND resolved=1 AND direction!=0").fetchone()[0]
     verdict = db.execute("SELECT COUNT(*) FROM verdicts WHERE candidate=0 "
                          "AND resolved=1 AND direction!=0").fetchone()[0]
-    assert cand == 5
+    assert cand == 5, f"expected all 5 candidate rows resolved, got {cand}"
     assert verdict == 0
 
 

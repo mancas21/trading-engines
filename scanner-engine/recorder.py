@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS verdicts (
     forward_return     REAL,                  -- RAW move; adjusted at audit time
     resolved           INTEGER NOT NULL DEFAULT 0,
     bar_closed         INTEGER NOT NULL DEFAULT 1,
-    candidate          INTEGER NOT NULL DEFAULT 0   -- hypothesis under test
+    candidate          INTEGER NOT NULL DEFAULT 0,  -- hypothesis under test
+    unscorable         INTEGER NOT NULL DEFAULT 0   -- horizon bar no longer exists
 );
 
 CREATE INDEX IF NOT EXISTS idx_verdicts_pair   ON verdicts(pair);
@@ -109,6 +110,9 @@ def _migrate(db: sqlite3.Connection) -> None:
     if "candidate" not in cols:
         db.execute("ALTER TABLE verdicts "
                    "ADD COLUMN candidate INTEGER NOT NULL DEFAULT 0")
+    if "unscorable" not in cols:
+        db.execute("ALTER TABLE verdicts "
+                   "ADD COLUMN unscorable INTEGER NOT NULL DEFAULT 0")
 
 
 # Serializes every DB touch. A scan cycle writes while /health may read.
@@ -219,7 +223,8 @@ def counts(db: sqlite3.Connection) -> dict:
                       SUM(CASE WHEN direction=0 THEN 1 ELSE 0 END),
                       MIN(ts), MAX(ts),
                       SUM(CASE WHEN resolved=1 AND direction!=0 AND candidate=1
-                           THEN 1 ELSE 0 END)
+                           THEN 1 ELSE 0 END),
+                  SUM(CASE WHEN unscorable=1 THEN 1 ELSE 0 END)
                  FROM verdicts"""
         ).fetchone()
     total = row[0] or 0
@@ -231,6 +236,7 @@ def counts(db: sqlite3.Connection) -> dict:
         "first_ts": row[4],
         "last_ts": row[5],
         "rows_candidate_resolved": row[6] or 0,
+        "rows_unscorable": row[7] or 0,
     }
 
 

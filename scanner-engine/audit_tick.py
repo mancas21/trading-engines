@@ -29,6 +29,7 @@ sys.path.insert(0, str(HERE))
 import expectancy as E          # noqa: E402
 import promotion as PROM        # noqa: E402
 import recorder as RC          # noqa: E402
+from recorder import _guard     # noqa: E402
 import rules_eval as RE         # noqa: E402
 
 DB = HERE / "data" / "scanner.db"
@@ -91,10 +92,21 @@ def main() -> int:
     broken = []
     if audit.get("verdict") == "INSUFFICIENT DATA" and health["rows_total"] > 20:
         broken.append("no directed rows despite data being recorded")
-    if health["awaiting"] > health["rows_total"] * 0.9 and health["rows_total"] > 100:
-        broken.append(f"{health['awaiting']} rows never resolve — resolver may be down")
+    # The legacy backlog predates the resolver and cannot be scored honestly:
+    # a 5-minute forward move is not recoverable from a 16-hour-old row. It is
+    # expected to stay pending forever and is NOT a fault. Only rows recorded
+    # recently are a real signal about resolver health.
+    recent_cutoff = time.time() - 3600
+    with _guard(db):
+        recent_pending = db.execute(
+            "SELECT COUNT(*) FROM verdicts WHERE resolved = 0 AND ts > ?",
+            (recent_cutoff,),
+        ).fetchone()[0]
     if health["rows_resolved"] == 0 and health["rows_total"] > 50:
         broken.append("zero rows resolved — outcome resolver is not running")
+    elif recent_pending > 40:
+        broken.append(f"{recent_pending} rows from the last hour are not resolving "
+                      f"— resolver may be slow or wedged")
 
     prev = load_state()
     fp = fingerprint(audit)

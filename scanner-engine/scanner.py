@@ -100,6 +100,7 @@ class Scanner:
         self.verdicts: dict[str, RE.Verdict] = {}
         self.features: dict[str, F.CrossVenueFeatures] = {}
         self.rows_resolved = 0
+        self.rows_unscorable = 0
         self.resolver_errors = 0
         self.last_resolver_error = ""
 
@@ -228,6 +229,10 @@ class Scanner:
 
         # close out rows whose horizon bar has now closed
         self._install_bar_fetchers()
+        # Retire rows whose horizon bar no longer exists, then score what is
+        # still scoreable. Without this the batch fills with un-retrievable
+        # rows and nothing ever resolves.
+        self.rows_unscorable += OUT.mark_unscorable(self.db)
         self.resolve_pending()
 
     def _fetch_one(self, fn, pair: str):
@@ -288,6 +293,7 @@ class Scanner:
             "coverage": _coverage_for(self.pairs),
             "recorder": RC.counts(self.db),
             "rows_resolved": self.rows_resolved,
+            "rows_unscorable": self.rows_unscorable,
             "resolver_errors": self.resolver_errors,
             "last_resolver_error": self.last_resolver_error,
             # Compare on PREFIX, not equality: rule 1's audit_status reads
