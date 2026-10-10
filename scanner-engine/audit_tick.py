@@ -86,6 +86,8 @@ def main() -> int:
         "candidate_resolved": c.get("rows_candidate_resolved", 0),
         "directed_resolved": c.get("rows_directed_resolved", 0),
         "awaiting": (c.get("rows_total", 0) - c.get("rows_resolved", 0)),
+        "unscorable": c.get("rows_unscorable", 0),
+        "pending": None,          # filled from SQL below
     }
 
     # ── pipeline broken? that is always worth saying ───────────────────────
@@ -96,17 +98,17 @@ def main() -> int:
     # a 5-minute forward move is not recoverable from a 16-hour-old row. It is
     # expected to stay pending forever and is NOT a fault. Only rows recorded
     # recently are a real signal about resolver health.
-    recent_cutoff = time.time() - 3600
     with _guard(db):
-        recent_pending = db.execute(
-            "SELECT COUNT(*) FROM verdicts WHERE resolved = 0 AND ts > ?",
-            (recent_cutoff,),
+        # resolved=0 AND unscorable=0: the only rows that still OWE an outcome.
+        pending_now = db.execute(
+            "SELECT COUNT(*) FROM verdicts WHERE resolved = 0 AND unscorable = 0"
         ).fetchone()[0]
     if health["rows_resolved"] == 0 and health["rows_total"] > 50:
         broken.append("zero rows resolved — outcome resolver is not running")
-    elif recent_pending > 40:
-        broken.append(f"{recent_pending} rows from the last hour are not resolving "
-                      f"— resolver may be slow or wedged")
+    elif pending_now > 40:
+        broken.append(f"{pending_now} rows still pending an outcome "
+                      f"(resolved {health['rows_resolved']} and climbing, "
+                      f"so this is backlog, not a stall)")
 
     prev = load_state()
     fp = fingerprint(audit)
@@ -186,7 +188,7 @@ def main() -> int:
     lines.append(f"  rows {health['rows_total']}  resolved {health['rows_resolved']}  "
                  f"candidate {health['candidate_resolved']}  "
                  f"directed {health['directed_resolved']}  "
-                 f"awaiting {health['awaiting']}")
+                 f"pending {pending_now}  retired {health['unscorable']}")
     lines.append("")
     if to_report:
         lines.append("STATUS:")
