@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS verdicts (
     fill_price         REAL,
     forward_return     REAL,                  -- RAW move; adjusted at audit time
     resolved           INTEGER NOT NULL DEFAULT 0,
-    bar_closed         INTEGER NOT NULL DEFAULT 1
+    bar_closed         INTEGER NOT NULL DEFAULT 1,
+    candidate          INTEGER NOT NULL DEFAULT 0   -- hypothesis under test
 );
 
 CREATE INDEX IF NOT EXISTS idx_verdicts_pair   ON verdicts(pair);
@@ -92,8 +93,22 @@ def open_db(path: str | pathlib.Path) -> sqlite3.Connection:
     p.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(str(p), check_same_thread=False)
     db.executescript(SCHEMA)
+    _migrate(db)
     db.commit()
     return db
+
+
+def _migrate(db: sqlite3.Connection) -> None:
+    """Add columns introduced after a database was first created.
+
+    An engine that has been running must not require deleting its data because
+    a schema field was added. Measured: the running scanner.db already held 336
+    rows before `candidate` existed.
+    """
+    cols = {r[1] for r in db.execute("PRAGMA table_info(verdicts)")}
+    if "candidate" not in cols:
+        db.execute("ALTER TABLE verdicts "
+                   "ADD COLUMN candidate INTEGER NOT NULL DEFAULT 0")
 
 
 # Serializes every DB touch. A scan cycle writes while /health may read.
@@ -119,10 +134,15 @@ def record_verdict(
     rules_unevaluable: list[str],
     score: int = 0,
     bar_closed: bool = True,
+    candidate: bool | None = None,
 ) -> int:
     """Insert one observation. Returns its row id.
 
     Raises ValueError on an unclosed bar — see the module docstring, bug 3.
+
+    `candidate` defaults to "did any rule fire MET". A candidate row carries a
+    PROVISIONAL side and enters expectancy math; it cannot suppress, alert or
+    gate. That restriction lives in `outcomes.promoted_direction`.
     """
     if not bar_closed:
         raise ValueError(
@@ -134,16 +154,18 @@ def record_verdict(
     if horizon_bars <= 0:
         raise ValueError(f"horizon_bars must be > 0, got {horizon_bars}")
 
+    cand = 1 if (bool(rules_met) if candidate is None else candidate) else 0
     with _guard(db):
         cur = db.execute(
             """INSERT INTO verdicts
                  (ts, pair, direction, venues_live, rules_met, rules_unevaluable,
-                  score, horizon_bars, fill_price, forward_return, resolved, bar_closed)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  score, horizon_bars, fill_price, forward_return, resolved,
+                  bar_closed, candidate)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (ts, pair, int(direction), int(venues_live),
              json.dumps(list(rules_met)), json.dumps(list(rules_unevaluable)),
              int(score), int(horizon_bars), fill_price, forward_return,
-             0, 1),
+             0, 1, cand),
         )
         db.commit()
         return int(cur.lastrowid)
@@ -195,7 +217,9 @@ def counts(db: sqlite3.Connection) -> dict:
                       SUM(resolved),
                       SUM(CASE WHEN resolved=1 AND direction!=0 THEN 1 ELSE 0 END),
                       SUM(CASE WHEN direction=0 THEN 1 ELSE 0 END),
-                      MIN(ts), MAX(ts)
+                      MIN(ts), MAX(ts),
+                      SUM(CASE WHEN resolved=1 AND direction!=0 AND candidate=1
+                           THEN 1 ELSE 0 END)
                  FROM verdicts"""
         ).fetchone()
     total = row[0] or 0
@@ -206,6 +230,7 @@ def counts(db: sqlite3.Connection) -> dict:
         "rows_non_directional": row[3] or 0,
         "first_ts": row[4],
         "last_ts": row[5],
+        "rows_candidate_resolved": row[6] or 0,
     }
 
 

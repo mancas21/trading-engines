@@ -16,6 +16,11 @@ The candles response DOES carry a `confirm` flag as its last element
 """
 from __future__ import annotations
 
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking proxy)
+
 import json
 import time
 import urllib.request
@@ -24,9 +29,7 @@ OKX = "https://www.okx.com"
 
 
 def _get(path: str, timeout: float = 15.0):
-    req = urllib.request.Request(OKX + path, headers={"User-Agent": "scanner-engine/0.1"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    return http_io.get(OKX + path, timeout=timeout)
 
 
 def symbol_for(pair: str) -> str:
@@ -118,6 +121,27 @@ def fetch_candles(pair: str, bar: str = "1m", limit: int = 5) -> list[dict]:
     return parse_candles(
         _get(f"/api/v5/market/candles?instId={symbol_for(pair)}&bar={bar}&limit={limit}")
     )
+
+
+def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None):
+    """The closed bar covering `at_ms`.
+
+    OKX candles carry an explicit trailing `confirm` flag (1 = closed), so this
+    uses that rather than inferring closure from the timestamp alone.
+    """
+    if at_ms is None:
+        at_ms = int(time.time() * 1000)
+    rows = fetch_candles(pair, bar=bar, limit=50)
+    best = None
+    for row in rows:
+        if not row["closed"]:
+            continue
+        if row["ts_ms"] <= at_ms:
+            best = row
+    if best is None:
+        return None
+    return {"open_ms": best["ts_ms"], "close_ms": best["ts_ms"],
+            "close": best["close"], "volume": best["volume"]}
 
 
 def fetch_open_interest(pair: str):

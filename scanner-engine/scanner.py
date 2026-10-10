@@ -39,6 +39,7 @@ sys.path.insert(0, str(HERE))
 
 import features as F          # noqa: E402
 import pairs as P            # noqa: E402
+import outcomes as OUT       # noqa: E402
 import recorder as RC        # noqa: E402
 import rules_eval as RE      # noqa: E402
 from poller import Poller    # noqa: E402
@@ -98,11 +99,15 @@ class Scanner:
 
         self.verdicts: dict[str, RE.Verdict] = {}
         self.features: dict[str, F.CrossVenueFeatures] = {}
+        self.rows_resolved = 0
+        self.resolver_errors = 0
+        self.last_resolver_error = ""
 
         for pair in self.pairs:
             self.poller.set_min_venues(pair, _min_venues_for(pair))
 
         self._fetchers: dict[str, callable] = {}
+        self._bar_fetch: dict[str, callable] = {}
 
     # ── wiring ─────────────────────────────────────────────────────────────
 
@@ -142,6 +147,28 @@ class Scanner:
             "bybit": wrap(bb.fetch_depth, bb.fetch_trades),
         }
 
+    def _install_bar_fetchers(self) -> None:
+        """Bar fetcher for outcome resolution, built once.
+
+        Resolution uses ONE venue per pair — the deepest one available — rather
+        than polling all four. A forward return is a price move, and four
+        venues' prices for the same instant is not four independent
+        observations; it is one observation measured four times, and averaging
+        it would understate the real spread. Binance is the default because it
+        has the deepest book on 6 of the 8 pairs.
+        """
+        import venues.binance as bn
+        import venues.okx as okx
+        import venues.bybit as bb
+        import venues.kraken as kr
+
+        self._bar_fetch = {
+            "binance": bn.fetch_closed_bar,
+            "okx": okx.fetch_closed_bar,
+            "bybit": bb.fetch_closed_bar,
+            "kraken": kr.fetch_closed_bar,
+        }
+
     # ── one cycle ──────────────────────────────────────────────────────────
 
     def run_cycle(self) -> None:
@@ -177,21 +204,77 @@ class Scanner:
             met = [rid for rid, r in v.rules.items() if r.state == RE.MET]
             unev = [rid for rid, r in v.rules.items() if r.state == RE.UNEVALUABLE]
 
+            # CANDIDATE side: a hypothesis under test, from the firing rule's
+            # own direction_hint. It enters expectancy math so the auditor can
+            # measure whether the rule has an edge. It CANNOT suppress, alert
+            # or gate -- only an AUDITED rule reaches the verdict ledger.
+            cand_dir = OUT.hint_direction(self.rules, _flow_by_rule(feat, met))
+            # VERDICT side: what downstream may act on. Zero unless every
+            # fired rule has been promoted by the auditor.
+            verdict_dir = OUT.promoted_direction(
+                self.rules, met, _flow_by_rule(feat, met))
+
             RC.record_verdict(
                 self.db, pair=pair, ts=v.ts,
-                # No rule may name a side until audited -> always 0 today.
-                direction=_direction(v),
+                direction=cand_dir if met else verdict_dir,
                 forward_return=None,
                 horizon_bars=horizon_for(pair),
                 fill_price=_mid(snaps),
                 venues_live=v.n_venues,
                 rules_met=met, rules_unevaluable=unev,
                 score=v.score,
+                candidate=bool(met),
             )
+
+        # close out rows whose horizon bar has now closed
+        self._install_bar_fetchers()
+        self.resolve_pending()
 
     def _fetch_one(self, fn, pair: str):
         book, tape = fn(pair)
         return {"pair": pair, "book": book, "tape": tape, "ts": time.time()}
+
+    def resolve_pending(self) -> int:
+        """Close out rows whose horizon bar has now closed.
+
+        GAP 1. `recorder.resolve()` existed and was tested but NOTHING CALLED
+        IT: measured on the running engine, 336 rows and `forward_return NOT
+        NULL` = 0. Without this call every row stays direction=0 forever and the
+        auditor can never measure anything.
+
+        A bar fetch failure leaves the row untouched rather than writing a zero.
+        """
+        try:
+            n = OUT.resolve_pending(self.db, fetch_bar=self._fetch_horizon_bar)
+        except Exception as e:                               # noqa: BLE001
+            self.resolver_errors += 1
+            self.last_resolver_error = f"{type(e).__name__}: {e}"
+            return 0
+        self.rows_resolved += n
+        return n
+
+    def _fetch_horizon_bar(self, pair: str, at_ms: int):
+        """The CLOSED bar covering `at_ms`, in the pair's own bar size.
+
+        Tries the pair's venues in depth order and returns the first that
+        answers. A venue that cannot serve the pair is skipped silently — that
+        is a fact about the venue, not an error to log on every row.
+        """
+        try:
+            bar = P.bar_for(pair)
+        except KeyError:
+            bar = "1m"
+        for venue in P.venues_for(pair):
+            fn = self._bar_fetch.get(venue)
+            if fn is None:
+                continue
+            try:
+                got = fn(pair, bar, at_ms)
+            except Exception:                              # noqa: BLE001
+                continue
+            if got is not None:
+                return got
+        return None
 
     # ── surfaces ───────────────────────────────────────────────────────────
 
@@ -204,6 +287,9 @@ class Scanner:
             "stopped_cleanly": self.stopped_cleanly,
             "coverage": _coverage_for(self.pairs),
             "recorder": RC.counts(self.db),
+            "rows_resolved": self.rows_resolved,
+            "resolver_errors": self.resolver_errors,
+            "last_resolver_error": self.last_resolver_error,
             # Compare on PREFIX, not equality: rule 1's audit_status reads
                         # "UNVALIDATED - no recorded outcomes yet. Phase 4's auditor
                         # decides whether it survives." An exact `!= "UNVALIDATED"` check
@@ -283,6 +369,28 @@ def _direction(v: RE.Verdict) -> int:
     if v.direction == "bearish":
         return -1
     return 0
+
+
+def _flow_by_rule(feat, met: list[str]) -> dict[str, float]:
+    """The flow each fired rule is asserting, as a delta_ratio in [0,1].
+
+    For rule 4 (flow agreement) that is the median ratio of the agreeing
+    venues. For rules without a flow leg it is the overall median, which is
+    what a `follow` hint needs. A rule with no usable tape gets nothing, and
+    therefore no provisional side.
+    """
+    out: dict[str, float] = {}
+    if not met:
+        return out
+    if feat.flow_median is not None:
+        for rid in met:
+            out[rid] = feat.flow_median
+    elif feat.flow_by_venue:
+        vals = sorted(feat.flow_by_venue.values())
+        med = vals[len(vals) // 2]
+        for rid in met:
+            out[rid] = med
+    return out
 
 
 def _mid(snaps: dict) -> float | None:

@@ -11,6 +11,11 @@ Verified gotchas (2026-10-08):
 """
 from __future__ import annotations
 
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking proxy)
+
 import json
 import urllib.request
 
@@ -21,9 +26,7 @@ VALID_BOOK_LIMITS = {1, 50, 200, 500}
 
 
 def _get(path: str, timeout: float = 15.0):
-    req = urllib.request.Request(BYBIT + path, headers={"User-Agent": "scanner-engine/0.1"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    return http_io.get(BYBIT + path, timeout=timeout)
 
 
 def symbol_for(pair: str) -> str:
@@ -95,3 +98,37 @@ def fetch_open_interest(pair: str, interval: str = "5min"):
              f"&intervalTime={interval}&limit=2")
     )
     return float(raw["result"]["list"][0]["openInterest"])
+
+
+BYBIT_INTERVAL = {"1m": "1", "3m": "3", "5m": "5", "15m": "15",
+                  "30m": "30", "1h": "60", "4h": "240", "1d": "D"}
+
+
+def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None):
+    """The closed bar covering `at_ms`.
+
+    Bybit's kline endpoint uses numeric interval codes ("1", "5"), not "1m".
+    """
+    if at_ms is None:
+        at_ms = int(time.time() * 1000)
+    code = BYBIT_INTERVAL.get(bar, "1")
+    raw = _get(f"/v5/market/kline?category=linear&symbol={symbol_for(pair)}"
+               f"&interval={code}&limit=50")
+    if raw.get("retCode") != 0:
+        raise ValueError(f"bybit error {raw.get('retCode')}: {raw.get('retMsg')}")
+    best = None
+    for row in raw["result"]["list"]:          # newest first
+        start_ms = int(row[0])
+        end_ms = start_ms + BAR_MS[code]
+        if end_ms <= at_ms:
+            if best is None or start_ms > best[0]:
+                best = (start_ms, end_ms, row)
+    if best is None:
+        return None
+    start_ms, end_ms, row = best
+    return {"open_ms": start_ms, "close_ms": end_ms,
+            "close": float(row[4]), "volume": float(row[5])}
+
+
+BAR_MS = {"1": 60_000, "3": 180_000, "5": 300_000, "15": 900_000,
+          "30": 1_800_000, "60": 3_600_000, "240": 14_400_000, "D": 86_400_000}

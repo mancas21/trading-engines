@@ -78,14 +78,20 @@ def directed_rows(db: sqlite3.Connection) -> list[tuple]:
 
 
 def by_rule(db: sqlite3.Connection) -> dict[str, list[float]]:
-    """Directed returns grouped by which rule MET.
+    """Directed returns grouped by which rule MET, over the CANDIDATE ledger.
 
     A row contributes to every rule it lists as MET. Rows are not double
     counted across rules because each rule's expectancy is computed
     independently — a row firing two rules legitimately appears in both.
+
+    CANDIDATE ONLY. A row with candidate=0 has direction=0 by construction and
+    is already excluded by the `direction != 0` filter, but the flag is made
+    explicit here so the population under audit is never ambiguous. This is the
+    population that makes promotion possible: before the candidate split, every
+    row was direction=0 and this function could only ever return {}.
     """
     out: dict[str, list[float]] = {}
-    for _rid, _pair, met_json, _unev, _vl, _hb, dr in directed_rows(db):
+    for rid, pair, met_json, dr in candidate_directed_rows(db):
         try:
             met = json.loads(met_json)
         except (TypeError, ValueError):
@@ -93,6 +99,21 @@ def by_rule(db: sqlite3.Connection) -> dict[str, list[float]]:
         for rule in met:
             out.setdefault(str(rule), []).append(dr)
     return out
+
+
+def candidate_directed_rows(db: sqlite3.Connection) -> list[tuple]:
+    """Resolved, directed, candidate rows: (id, pair, rules_met, directed_return)."""
+    sql = """
+        SELECT id, pair, rules_met,
+               CASE WHEN direction > 0 THEN  forward_return
+                    WHEN direction < 0 THEN -forward_return END AS dr
+          FROM verdicts
+         WHERE resolved = 1
+           AND forward_return IS NOT NULL
+           AND direction != 0
+           AND candidate = 1
+    """
+    return db.execute(sql).fetchall()
 
 
 def by_pair(db: sqlite3.Connection) -> dict[str, list[float]]:
@@ -173,10 +194,12 @@ def render(a: dict) -> str:
         L.append("=" * 74)
         L.append(f"reason: {a['reason']}")
         c = a["counts"]
-        L.append(f"  rows total          {c['rows_total']}")
-        L.append(f"  rows resolved       {c['rows_resolved']}")
-        L.append(f"  directed + resolved {c['rows_directed_resolved']}   <- enters math")
-        L.append(f"  non-directional     {c['rows_non_directional']}   <- excluded from math")
+        L.append(f"  rows total            {c['rows_total']}")
+        L.append(f"  rows resolved         {c['rows_resolved']}")
+        L.append(f"  candidate + resolved  {c.get('rows_candidate_resolved', 0)}   <- enters math")
+        L.append(f"  directed + resolved   {c['rows_directed_resolved']}   <- directed rows")
+        L.append(f"  non-directional       {c['rows_non_directional']}   <- no direction at all")
+        L.append(f"  awaiting resolution   {c['rows_total'] - c['rows_resolved']}   <- horizon not elapsed")
         L.append("")
         L.append("This is the correct day-one answer. Nothing here supports or")
         L.append("refutes any rule. Keep collecting; re-run at n >= 50 directed rows.")

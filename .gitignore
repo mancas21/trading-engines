@@ -74,3 +74,4 @@ reader/__pycache__/
 scanner-engine/data/
 scanner-engine/*.db
 scanner-engine/scanner.db
+scanner-engine/tests/_ssl_*.py

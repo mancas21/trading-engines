@@ -34,6 +34,11 @@ not derivable on Kraken.
 """
 from __future__ import annotations
 
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking proxy)
+
 import json
 import urllib.request
 
@@ -41,9 +46,7 @@ KRAKEN = "https://api.kraken.com"
 
 
 def _get(path: str, timeout: float = 20.0):
-    req = urllib.request.Request(KRAKEN + path, headers={"User-Agent": "scanner-engine/0.1"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    return http_io.get(KRAKEN + path, timeout=timeout)
 
 
 def symbol_for(pair: str) -> str:
@@ -141,6 +144,34 @@ def fetch_trades(pair: str) -> list[dict]:
     if trades is None:
         raise ValueError(f"kraken: could not resolve pair key for {pair}")
     return trades
+
+
+KRAKEN_INTERVAL = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}
+
+
+def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None):
+    """The closed bar covering `at_ms`.
+
+    Kraken's OHLC interval is in MINUTES as an integer, and the response key is
+    venue-mapped (XBTUSD -> XXBTZUSD) so it must be discovered, never assumed.
+    """
+    if at_ms is None:
+        at_ms = int(time.time() * 1000)
+    interval = KRAKEN_INTERVAL.get(bar, 1)
+    rows = fetch_ohlc(pair, interval=interval)
+    step_ms = interval * 60_000
+    best = None
+    for c in rows:
+        # c: (time, open, high, low, close, vwap, volume, count)
+        start_ms = int(c[0]) * 1000
+        end_ms = start_ms + step_ms
+        if end_ms <= at_ms and (best is None or start_ms > best[0]):
+            best = (start_ms, end_ms, c)
+    if best is None:
+        return None
+    start_ms, end_ms, c = best
+    return {"open_ms": start_ms, "close_ms": end_ms,
+            "close": float(c[4]), "volume": float(c[6])}
 
 
 def fetch_ohlc(pair: str, interval: int = 1) -> list[dict]:

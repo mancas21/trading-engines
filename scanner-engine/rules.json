@@ -1,22 +1,42 @@
 {
   "version": "1.0.0",
   "engine": "scanner-engine",
-
   "capabilities": {
     "l2_footprint": false,
     "footprint_note": "No public venue exposes footprint aggregation. Rule 6/7 condition (b) of the ATAS engine CANNOT be evaluated here. This is a hard limitation, not a config gap.",
-    "venues": ["binance", "okx", "kraken", "bybit"],
+    "venues": [
+      "binance",
+      "okx",
+      "kraken",
+      "bybit"
+    ],
     "cross_venue_basis": true,
-    "per_bar_cvd_venues": ["binance"],
+    "per_bar_cvd_venues": [
+      "binance"
+    ],
     "per_bar_cvd_note": "Only Binance publishes taker-buy volume in its klines. OKX candles have 9 fields and no taker volume; Kraken OHLC is total-volume only. The other three derive flow from per-trade taker side, normalized to a fixed time window."
   },
-
   "normalization": {
     "why": "Venue spreads are NOT uniform, so a fixed threshold on raw basis dispersion fires on venue microstructure rather than on signal. Measured 2026-10-08:",
     "measured_spread_bps": {
-      "XAU/USD": {"binance": 0.024, "bybit": 0.024, "okx": 0.238, "kraken": 0.239},
-      "HYPE/USD": {"binance": 0.119, "okx": 0.119, "bybit": 1.194, "kraken": 2.391},
-      "XRP/USD": {"binance": 0.723, "okx": 0.723, "bybit": 0.723, "kraken": 0.072}
+      "XAU/USD": {
+        "binance": 0.024,
+        "bybit": 0.024,
+        "okx": 0.238,
+        "kraken": 0.239
+      },
+      "HYPE/USD": {
+        "binance": 0.119,
+        "okx": 0.119,
+        "bybit": 1.194,
+        "kraken": 2.391
+      },
+      "XRP/USD": {
+        "binance": 0.723,
+        "okx": 0.723,
+        "bybit": 0.723,
+        "kraken": 0.072
+      }
     },
     "basis_zscore": {
       "method": "z = (venue_mid - cross_venue_vwap_mid) / (own_venue_spread_bps + eps)",
@@ -29,7 +49,6 @@
       "why": "A single venue has no dispersion. Two venues give a basis but no consensus."
     }
   },
-
   "rules": {
     "1": {
       "name": "Cross-venue basis dislocation",
@@ -44,7 +63,11 @@
         "persist_cycles": 2
       },
       "rationale": "The signal ATAS structurally cannot produce: it sees one venue. A venue trading materially away from the others while its own book is not simply wider is a real dislocation or a stale quote, and persistence separates the two.",
-      "audit_status": "UNVALIDATED - no recorded outcomes yet. Phase 4's auditor decides whether it survives."
+      "audit_status": "UNVALIDATED - no recorded outcomes yet. Phase 4's auditor decides whether it survives.",
+      "direction_hint": {
+        "side": null,
+        "claim": "NONE. A venue trading away from the others identifies a venue, not a direction. This rule stays observation-only until a directional claim can be justified; the auditor reporting 'no directional edge' is a legitimate result."
+      }
     },
     "2": {
       "name": "Single-venue flow dominance",
@@ -59,7 +82,11 @@
         "min_coverage_s": 20.0
       },
       "rationale": "A venue showing large buying that the others do not, with price failing to respond, is absorption. Volume without price movement is the observable form.",
-      "audit_status": "UNVALIDATED"
+      "audit_status": "UNVALIDATED",
+      "direction_hint": {
+        "side": "follow",
+        "claim": "when one venue's tape diverges from the others while its price does NOT respond, the move follows the OTHER venues' direction (the absorbing venue's flow is absorbed, not acted on)."
+      }
     },
     "3": {
       "name": "Cross-venue liquidity vacuum",
@@ -70,14 +97,18 @@
         "b": "total top-N depth falls below its own trailing median for the pair"
       },
       "thresholds": {
-        "vac_band": 0.30,
+        "vac_band": 0.3,
         "vac_venues": 3,
         "depth_z": -1.5
       },
       "requires_three_venues": true,
       "three_venue_note": "UNEVALUABLE for SPCX/USD and NVDA/USD, which list on 3 venues. This rule MUST declare UNEVALUABLE for them rather than silently evaluating on 2 — a 2-venue reading of a 3-venue condition is a different, weaker claim.",
       "rationale": "Top-of-book depletion across venues at once is a liquidity event; on a single venue it is indistinguishable from that venue's own microstructure. Measured venue spreads differ by up to 100x, so condition (b) compares against the pair's own trailing depth median rather than an absolute.",
-      "audit_status": "UNVALIDATED"
+      "audit_status": "UNVALIDATED",
+      "direction_hint": {
+        "side": null,
+        "claim": "NONE yet. A cross-venue liquidity vacuum identifies a condition, not a side. No directional claim until measured."
+      }
     },
     "4": {
       "name": "Aggressor flow agreement",
@@ -94,10 +125,13 @@
       },
       "requires_three_venues": true,
       "rationale": "Aggressor flow agreeing across independent venues is the one cross-venue reading that cannot be faked by a single venue's stale quote or washed book. Requires 3 venues so a 2-venue agreement (which two correlated books can fake) is not enough.",
-      "audit_status": "UNVALIDATED"
+      "audit_status": "UNVALIDATED",
+      "direction_hint": {
+        "side": "follow",
+        "claim": "when >=3 venues agree on taker direction with strength, the move follows the agreed flow."
+      }
     }
   },
-
   "gates": {
     "default_min_venues": 3,
     "min_venues_is_per_pair": true,
@@ -107,10 +141,19 @@
     "gate_signals": false,
     "gate_note": "No rule may suppress a signal until the Phase 4 auditor has measured it with a direction-adjusted t-statistic and t < -1.65. Four rules that have never been audited must not be allowed to gate anything."
   },
-
   "carried_overs": {
     "from": "quant-alert-engine rules.json v3.4.1",
-    "excluded": ["6", "7"],
+    "excluded": [
+      "6",
+      "7"
+    ],
     "why": "Rules 6 and 7 are order-flow rules whose condition (b) needs footprint aggregation. Shipping them here would mean shipping conditions that can never evaluate, which is the UNEVALUABLE-condition failure already documented in this repo's STATUS.md."
+  },
+  "promotion": {
+    "requires": "auditor reports bucket=keep with n >= min_n and t >= -min_t on the CANDIDATE ledger for that rule",
+    "on_promotion": "set audit_status to 'AUDITED keep <n> <t> <mean>' and the rule may then contribute a side to the verdict ledger",
+    "candidate_ledger": "rows where candidate=1 -- carries a provisional side from direction_hint, enters expectancy math, CANNOT suppress, alert, or gate",
+    "verdict_ledger": "rows where candidate=0 -- direction stays 0 until the firing rule is AUDITED; downstream reads only this",
+    "never": "do not promote on the first favourable read; do not lower min_n or min_t to force a conclusion; do not infer a side from a rule's name"
   }
 }

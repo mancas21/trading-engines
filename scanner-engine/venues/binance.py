@@ -19,6 +19,11 @@ it has no 1m period (returns []), and this engine runs at 1m/5m.
 """
 from __future__ import annotations
 
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking proxy)
+
 import json
 import time
 import urllib.request
@@ -29,9 +34,7 @@ FAPI = "https://fapi.binance.com"
 
 
 def _get(path: str, timeout: float = 15.0):
-    req = urllib.request.Request(FAPI + path, headers={"User-Agent": "scanner-engine/0.1"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    return http_io.get(FAPI + path, timeout=timeout)
 
 
 # ── symbol mapping ─────────────────────────────────────────────────────────
@@ -147,6 +150,28 @@ def fetch_kline_cvd(pair: str, interval: str = "1m", limit: int = 5,
         now_ms = int(time.time() * 1000)
     raw = _get(f"/fapi/v1/klines?symbol={symbol_for(pair)}&interval={interval}&limit={limit}")
     return [cvd_from_klines(row, now_ms) for row in raw]
+
+
+def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None):
+    """The bar covering `at_ms`, or None if it has not closed.
+
+    Uses /klines and returns the row whose closeTime <= at_ms, taking the most
+    recent such row. A bar still forming is never returned: scoring against a
+    partially formed bar invents a forward return that did not happen.
+    """
+    if at_ms is None:
+        at_ms = int(time.time() * 1000)
+    raw = _get(f"/fapi/v1/klines?symbol={symbol_for(pair)}&interval={bar}&limit=50")
+    best = None
+    for row in raw:
+        close_ms = int(row[6])
+        if close_ms <= at_ms:
+            best = row
+    if best is None:
+        return None
+    return {"open_ms": int(best[0]), "close_ms": int(best[6]),
+            "close": float(best[4]), "volume": float(best[5]),
+            "taker_buy": float(best[9])}
 
 
 def fetch_open_interest(pair: str):
