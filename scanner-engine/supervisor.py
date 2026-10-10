@@ -42,21 +42,21 @@ STALE_LOCK_GRACE_S = 0.0
 # would read a hang as a clean exit and refuse to relaunch.
 WATCHDOG_KILLED = -9
 
-# Default watchdog deadline for the child.
+# STALL limit, not a runtime limit.
 #
-# MEASURED, and the first value was wrong. A poll-only cycle takes ~21s, so
-# 300s looked generous. It is not: the real cycle writes 8 rows then runs the
-# outcome resolver, which issues one HTTP request per row per venue. Measured
-# cycle-to-cycle interval with the resolver attached: median 422s, max 583s.
-# A 300s watchdog therefore killed HEALTHY scanners -- verified live, it fired
-# on a scanner that was polling normally, and the log shows the cycle being
-# cut short at exactly 300s.
+# TWO earlier values were both wrong, in the same way. A "kill after N
+# seconds" rule cannot supervise a daemon: `scanner.py` runs run_forever(), an
+# infinite loop, so EVERY child eventually exceeds any runtime bound. 300s
+# killed healthy scanners; raising it to 1200s only made the kill cycle
+# longer. Measured from the log: "exceeded the 1200s watchdog" three times,
+# exactly 1200s apart, each terminating a scanner that was writing rows
+# normally.
 #
-# The deadline must clear the SLOWEST legitimate cycle with headroom. 1200s
-# (~20 min) is roughly 2x the observed worst case, which still catches a true
-# wedge (the original bug ran past 300s with zero rows written, and a genuine
-# hang is unbounded) without punishing a slow-but-working scanner.
-WATCHDOG_S = 1200.0
+# The correct signal is PROGRESS. The scanner writes 8 rows per cycle, so the
+# SQLite file's mtime advances while it works and stops the instant it wedges.
+# Measured worst-case cycle is ~583s, so 900s of true silence means wedged,
+# while a slow-but-working cycle is never punished.
+STALL_S = 900.0
 
 # Which lock paths THIS process has claimed. The PID file alone cannot express
 # "a second lock object in the same interpreter must be refused", because the
@@ -191,14 +191,19 @@ class Supervisor:
                  log_path: pathlib.Path | str | None = None,
                  max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                  backoff_s: float = DEFAULT_BACKOFF_S,
-                 watchdog_s: float | None = None):
+                 stall_s: float | None = None,
+                 progress_marker=None,
+                 poll_s: float = 10.0):
         self.command = list(command)
         self.lock = InstanceLock(lock_path)
         self.log_path = pathlib.Path(log_path) if log_path else \
             HERE / "data" / "supervisor.log"
         self.max_attempts = max_attempts
         self.backoff_s = backoff_s
-        self.watchdog_s = WATCHDOG_S if watchdog_s is None else watchdog_s
+        # STALL, not runtime. See _run_with_watchdog.
+        self.stall_s = STALL_S if stall_s is None else stall_s
+        self.progress_marker = progress_marker
+        self._poll_s = poll_s
         self.attempts = 0
 
     # ── policy ─────────────────────────────────────────────────────────────
@@ -219,35 +224,64 @@ class Supervisor:
         print(line, flush=True)
 
     def _run_with_watchdog(self):
-        """Run the child, killing it if it outlives the watchdog.
+        """Run the child, killing it only if it STOPS MAKING PROGRESS.
 
-        `subprocess.run` has no timeout, so a wedged child looks identical to a
-        healthy one from the supervisor's side: no exit, no output, no restart.
-        Measured -- the scanner sat for 312s with zero new rows while every
-        venue aged past max_age_s, and the restart policy never engaged.
+        A RUNTIME watchdog is wrong for this child, and both earlier versions
+        were runtime-based. `scanner.py` calls `run_forever()` -- an infinite
+        loop that never exits -- so any "kill after N seconds" rule kills a
+        perfectly healthy scanner, always. Measured: the log shows
+        "exceeded the 1200s watchdog" three times, exactly 1200s apart, each
+        one terminating a scanner that was writing rows normally.
 
-        Killing the whole process group matters: the child may have spawned
-        helpers, and killing only the parent would leave them holding the port.
+        Progress is the right signal. The scanner writes 8 rows every cycle to
+        SQLite, so the database file's mtime advances continuously while it
+        works and stops the moment it wedges. `stall_s` therefore means "no
+        progress for this long", not "ran for this long".
+
+        A child that has genuinely wedged stops touching the DB, which is the
+        condition the original bug produced (312s with zero new rows while
+        every venue aged past max_age_s).
         """
         import subprocess as sp
         kwargs = dict(stdout=sp.PIPE, stderr=sp.STDOUT, text=True,
                       errors="replace")
         if sys.platform == "win32":
-            flags = getattr(sp, "CREATE_NEW_PROCESS_GROUP", 0)
-            kwargs["creationflags"] = flags
+            kwargs["creationflags"] = getattr(sp, "CREATE_NEW_PROCESS_GROUP", 0)
+
+        marker_fn = self.progress_marker or (lambda: 0.0)
         proc = sp.Popen(self.command, **kwargs)
-        try:
-            out, _ = proc.communicate(timeout=self.watchdog_s)
-        except sp.TimeoutExpired:
-            self._kill_tree(proc)
+        last_marker = marker_fn()
+        last_progress = time.time()
+        killed = False
+
+        while True:
             try:
-                out, _ = proc.communicate(timeout=15)
-            except Exception:                               # noqa: BLE001
-                out = ""
-            done = sp.CompletedProcess(self.command, WATCHDOG_KILLED,
-                                       out or "", None)
-            return done
-        return sp.CompletedProcess(self.command, proc.returncode, out or "", None)
+                out, _ = proc.communicate(timeout=self._poll_s)
+            except sp.TimeoutExpired:
+                now = time.time()
+                # the marker moves on its own timeout; re-read it each poll
+                try:
+                    cur = marker_fn()
+                except Exception:                        # noqa: BLE001
+                    cur = last_marker
+                if cur != last_marker:
+                    last_marker = cur
+                    last_progress = now
+                elif self.stall_s and (now - last_progress) > self.stall_s:
+                    self.log(f"  ! no progress for {now - last_progress:.0f}s "
+                             f"(stall limit {self.stall_s:.0f}s) -- killing")
+                    self._kill_tree(proc)
+                    try:
+                        out, _ = proc.communicate(timeout=15)
+                    except Exception:                    # noqa: BLE001
+                        out = ""
+                    killed = True
+                    break
+                continue
+            break
+
+        rc = WATCHDOG_KILLED if killed else proc.returncode
+        return sp.CompletedProcess(self.command, rc, out or "", None)
 
     @staticmethod
     def _kill_tree(proc) -> None:
@@ -284,7 +318,7 @@ class Supervisor:
                 self.log(f"attempt {self.attempts}/{self.max_attempts} "
                          f"launching: {' '.join(self.command)}")
                 try:
-                    if self.watchdog_s and self.watchdog_s > 0:
+                    if self.stall_s and self.stall_s > 0:
                         proc = self._run_with_watchdog()
                     else:
                         proc = subprocess.run(
@@ -298,8 +332,8 @@ class Supervisor:
                         for line in out.splitlines()[-20:]:
                             self.log(f"  | {line}")
                     if last_rc == WATCHDOG_KILLED:
-                        self.log(f"  ! child exceeded the {self.watchdog_s:.0f}s "
-                                 f"watchdog and was killed -- treating as a crash")
+                        self.log("  ! child stalled and was killed -- "
+                                 "treating as a crash")
                 except Exception as e:                        # noqa: BLE001
                     last_rc = None
                     self.log(f"  ! failed to launch: {type(e).__name__}: {e}")
@@ -346,12 +380,26 @@ def main() -> int:
     ap.add_argument("--backoff", type=float, default=DEFAULT_BACKOFF_S)
     ap.add_argument("--lock", default=str(HERE / "data" / "scanner.lock"))
     ap.add_argument("--log", default=str(HERE / "data" / "supervisor.log"))
+    ap.add_argument("--stall", type=float, default=STALL_S,
+                    help="kill the child if it makes no progress for N seconds")
     args = ap.parse_args(my_flags)
 
     cmd = child_cmd or [sys.executable, str(HERE / "scanner.py")]
 
+    # Progress signal: the scanner writes rows every cycle, so the SQLite
+    # file's mtime advances while it works. Independent of the child's own
+    # HTTP surface, which may itself be what is wedged.
+    db_path = HERE / "data" / "scanner.db"
+
+    def _db_progress() -> float:
+        try:
+            return db_path.stat().st_mtime
+        except OSError:
+            return 0.0
+
     sup = Supervisor(command=cmd, lock_path=args.lock, log_path=args.log,
-                     max_attempts=args.max_attempts, backoff_s=args.backoff)
+                     max_attempts=args.max_attempts, backoff_s=args.backoff,
+                     stall_s=args.stall, progress_marker=_db_progress)
     return sup.run()
 
 
