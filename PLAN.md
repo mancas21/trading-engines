@@ -79,28 +79,55 @@ hijo huérfano escribiendo.
 
 ---
 
-## 2. Saber si la regla 4 sirve o no — es la pregunta que importa
+## 2. Saber si la regla 4 sirve o no — RESPONDIDO (y la respuesta es NO)
 
-El veredicto de hoy, con n=65 filas dirigidas:
+**Veredicto final, sobre 662 señales con horizonte coherente:**
 
 ```
-media  +0.000053   t=0.15   hit 44.6%   ->  INCONCLUSO, sin borde medible
+regla 4   n=662   media -0.000052   t=-1.34   hit 48.0%   ->  SIN EDGE
+ningun par alcanza significancia
 ```
 
-Media positiva de 0.0053%, t=0.15. Eso es indistinguible del ruido. La regla
-**no tiene ventaja demostrable**, y el pipeline de datos sí está sano (froz=0,
-err=0, 3376 filas). O sea: no es un problema de datos, es que la señal no sirve.
+Media -0.0052% por operación, t=-1.34. Es una moneda al aire que pierde un poco
+contra los costos. **No hay edge demostrable y no lo va a haber por pulir más.**
 
-**Qué hacer:**
-- Dejarlo acumular hasta n≥200 dirigidas (~2-3 semanas a este ritmo: dir pasó
-  de 145 a 485 en ~18h, así que puede ser mucho antes).
-- NO promover la regla a nada mientras t<2. NO usarla para gatear alertas.
-- Cuando n≥200: recalcular t y hit. Si sigue en t<2, **matar la regla** y no
-  seguir puliéndola. Ese es el resultado honesto y hay que aceptarlo.
+### Cómo se llegó acá, porque el camino importa más que el número
 
-**Lo que NO hay que hacer:** seguir optimizando features para subir un AUC de
-0.552. Ya está medido que no alcanza (permutado 0.510). Más tuning no arregla
-una señal sin edge.
+Primero había 213 señales medidas y el resultado era inconcluso (t=0.15).
+
+Después el backfill subió a 658 y el resultado se volvió **significativamente
+negativo** (media -0.000111, t=-2.37, hit 41.9%), con SUI/USD a t=-4.81. Eso
+invitaba a invertir la señal y operar al revés.
+
+**Era artefacto de un bug, no un hallazgo.** Al verificar filas del backfill
+contra un recálculo independiente, 3 de 6 no coincidían — y las tres eran pares
+de 5m mientras los de 1m coincidían al último dígito.
+
+Causa: `resolve_pending` calculaba `at_ms = ts + horizon_bars * 60_000`. Pero
+`horizon_bars` está en las barras PROPIAS del par: un par de 1m lleva
+`horizon_bars=5` (300s ✓) y uno de 5m lleva `horizon_bars=1`, que son **300s,
+no 60s**. Los pares de 5m medían 60 segundos. Y una ventana de 60s en crypto es
+casi puro ruido y microestructura, así que medir ahí producía una negativa
+**sistemática** — y un sesgo estable es exactamente lo que parece edge en vez de
+parecer error.
+
+Corregido (`bar_ms_for` con el tamaño de barra real, `backfill --all` recomputó
+4,216 filas): SUI pasó de t=-4.81 a **t=+0.16**, y la regla de t=-2.37 a
+**t=-1.34**.
+
+**Regla que queda escrita:** antes de reportar cualquier resultado que alcanza
+significancia, recomputar una muestra al azar contra una fuente independiente y
+exigir coincidencia exacta. Y desconfiar especialmente de un negativo
+significativo: invertirlo es la forma más fácil de fabricar una estrategia que
+nunca existió.
+
+### Qué hacer con esto
+
+- **NO invertir la señal.** El "edge invertido" no existe; era el instrumento.
+- **NO seguir optimizando features** para subir un AUC de 0.552 (permutado
+  0.510). Más tuning no arregla una señal que no existe.
+- La regla 4 queda medida y **sin edge**. Si se quiere seguir, hay que buscar
+  OTRA regla, no pulir esta.
 
 ---
 
@@ -152,11 +179,54 @@ Verificación: forzar un cambio de bucket y ver que el mensaje sale.
 
 ---
 
+## 6. Dónde vive esto en el servidor — NO ESTÁ DESPLEGADO
+
+Verificado por SSH el 2026-10-11 (no asumido desde el checklist):
+
+```
+host      vps-japan -> 52.195.120.63   (ip-172-26-14-97, Ubuntu 24.04, AWS, us-east)
+repo      /home/ubuntu/workspace/trading-engines
+branch    master
+commit    75e6c73          <- 3 commits ATRÁS del local (local: fca8fce)
+remote    github-trading:mancas21/trading-engines.git
+```
+
+**`scanner-engine/` NO existe en el servidor.** El repo allá tiene sólo
+`atas-bridge/`, `docs/`, `quant-alert-engine/`, `scripts/`, `tradingview-bridge/`.
+
+Ojo con la discrepancia: `scanner-engine/docs/VPS-CHECKLIST.md` planea
+`/opt/trading-engines/scanner-engine` con un unit systemd, pero **la convención
+real de la máquina es `/home/ubuntu/workspace/trading-engines`**. Al desplegar,
+seguir la realidad, no el checklist.
+
+Corriendo hoy en la VPS (nada de esto es el scanner):
+
+```
+freqtrade trade            --userdir /home/ubuntu/freqtrade     (desde Oct 6)
+binance_rest_collector.py  --out /home/ubuntu/of-collector/...  (x2, desde Oct 7)
+grid_paper.py --days 120                                        (empezado 15:15 hoy)
+```
+
+**Para desplegar el scanner hace falta, en orden:**
+1. Commitear y pushear lo local (el servidor está 3 commits atrás y el fix del
+   horizonte — §2 — cambia los números, así que desplegar la versión vieja no
+   sirve).
+2. `git pull` en `/home/ubuntu/workspace/trading-engines`.
+3. Unit systemd apuntando a `/home/ubuntu/workspace/trading-engines/scanner-engine`.
+   **NO** envolverlo además en `supervisor.py`: systemd y el supervisor ambos
+   reinician, y un crash persistente se vuelve un doble loop de reinicios. En
+   Linux elegir systemd (el checklist ya lo dice).
+4. Verificación: `curl -s localhost:8090/health` con `frozen_venues` y
+   `failures` vacíos.
+Sin dependencias: el scanner es stdlib puro, `python3` alcanza.
+
+---
+
 ## Orden de ejecución
 
-1. **(ahora)** Nada. Dejar correr. El scanner está acumulando.
-2. Cerrar la incoherencia de intérprete (§1) en el próximo reinicio, no antes.
-3. Commitear la capa ML + destrackear `obj/bin` (§3) — 15 min, riesgo cero.
-4. Arreglar la entrega del cron (§4) — 10 min.
-5. **Esperar a n≥200 y dictar sentencia sobre la regla 4 (§2).** Esta es la única
-   decisión que cambia el rumbo del proyecto. Todo lo demás es mantenimiento.
+1. **(ahora)** Nada. Dejar correr. El scanner acumula en la máquina local.
+2. **Commitear la capa ML + destrackear `obj/bin` (§3)** — 15 min, riesgo cero.
+3. Arreglar la entrega del cron (§4) — 10 min.
+4. Decidir si se despliega el scanner a la VPS (§6) — requiere commit+push primero.
+5. **La regla 4 ya está respondida: SIN EDGE (§2).** No pulirla más. Si se quiere
+   seguir, hay que medir OTRA regla contra este mismo banco de pruebas.
