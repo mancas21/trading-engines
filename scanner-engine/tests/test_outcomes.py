@@ -337,6 +337,52 @@ def test_pending_batch_is_oldest_first(tmp_path):
     assert not (done & set(young_ids)), "a forming bar must never be scored"
 
 
+def test_horizon_bars_counts_the_pairs_own_bars(tmp_path):
+    """`horizon_bars` is in the PAIR's bars, never in minutes.
+
+    `scanner.horizon_for` holds a fixed 5-minute WALL-CLOCK horizon and converts
+    it per pair, so the same five minutes is written as a different bar count:
+
+        1m pair  ->  horizon_bars=5   (5 x  60s = 300s)
+        5m pair  ->  horizon_bars=1   (1 x 300s = 300s)
+
+    `resolve_pending` used to multiply by a flat 60_000. That made a 5m pair
+    measure a ~60-second move while its own row said five minutes -- the label
+    and the arithmetic disagreed, and every expectancy figure for those pairs
+    described a window nobody asked for. Measured consequence: a spot check of
+    backfilled rows found 3 of 6 disagreeing with an independent recomputation,
+    every one of them a 5m pair.
+    """
+    db = _db(tmp_path)
+    now = time.time()
+    base = now - 900
+
+    def run(pair, horizon):
+        RC.record_verdict(db, pair=pair, ts=base, direction=1,
+                          forward_return=None, horizon_bars=horizon,
+                          fill_price=1.0, venues_live=4,
+                          rules_met=["4"], rules_unevaluable=[])
+        seen = {}
+
+        def fetch(_pair, at_ms, seen=seen):
+            seen["at_ms"] = at_ms
+            return {"open_ms": at_ms - 60_000, "close_ms": at_ms, "close": 1.1}
+
+        step = 300_000 if pair.startswith("SUI") else 60_000
+        OUT.resolve_pending(db, fetch_bar=fetch, now_ms=int(now * 1000),
+                            limit=12, bar_ms_for=lambda _p, s=step: s)
+        return seen["at_ms"] - int(base * 1000)
+
+    one_m = run("ETH/USD", 5)      # 1m bar, horizon 5
+    five_m = run("SUI/USD", 1)     # 5m bar, horizon 1
+
+    assert one_m == 300_000, f"1m pair: {one_m}ms, expected 300000"
+    assert five_m == 300_000, (
+        f"5m pair: {five_m}ms, expected 300000 -- horizon_bars is counted in "
+        f"the pair's bars, not in minutes")
+    assert one_m == five_m, "the wall-clock horizon must be identical"
+
+
 def test_a_second_batch_drains_the_rest(tmp_path):
     """The batch is a BATCH, not a cap: the next cycle continues.
 

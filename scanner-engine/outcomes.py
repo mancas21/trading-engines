@@ -147,7 +147,7 @@ def mark_unscorable(db: sqlite3.Connection, older_than_s: float = MAX_SCORABLE_A
 
 
 def resolve_pending(db: sqlite3.Connection, fetch_bar, now_ms: int | None = None,
-                    limit: int = DEFAULT_BATCH) -> int:
+                    limit: int = DEFAULT_BATCH, bar_ms_for=None) -> int:
     """Resolve every row whose horizon bar has closed.
 
     `fetch_bar(pair, at_ms) -> {"close": float, "close_ms": int}` must return
@@ -156,13 +156,33 @@ def resolve_pending(db: sqlite3.Connection, fetch_bar, now_ms: int | None = None
 
     `limit` bounds the batch so a backlog cannot turn one cycle into minutes.
     It is a BATCH, not a cap: the next cycle picks up where this one stopped.
+
+    `bar_ms_for(pair) -> ms` MUST give the pair's own bar size, and it is not
+    cosmetic. `horizon_bars` is expressed in the PAIR'S bars, not in minutes:
+    `scanner.horizon_for` holds a fixed 5-minute wall-clock horizon and converts
+    it per pair, so a 1m pair carries `horizon_bars=5` and a 5m pair carries
+    `horizon_bars=1`. Both mean 300 seconds.
+
+    This function used to hardcode `* 60_000`, which silently made the 5m pairs
+    measure a ~60-second move while their row said five minutes: the horizon
+    label and the horizon arithmetic disagreed, and every expectancy figure for
+    those pairs described a window nobody intended. Measured consequence: the
+    5m pairs' rows resolved against the wrong bar, and a spot check of
+    backfilled rows found 3 of 6 disagreeing with an independent recomputation
+    -- all of them 5m pairs.
+
+    Defaults to 60_000 so a caller that only knows about 1m bars (and the unit
+    tests) behaves as before, but the live scanner passes the real value.
     """
+    if bar_ms_for is None:
+        bar_ms_for = lambda _pair: 60_000                       # noqa: E731
     if now_ms is None:
         now_ms = int(time.time() * 1000)
     n = 0
     for rid, pair, ts, horizon_bars, fill in pending_rows(db, limit):
         try:
-            bar = fetch_bar(pair, int(ts * 1000) + int(horizon_bars) * 60_000)
+            step_ms = int(bar_ms_for(pair))
+            bar = fetch_bar(pair, int(ts * 1000) + int(horizon_bars) * step_ms)
         except Exception:                                  # noqa: BLE001
             continue
         fwd = resolve_row(bar, horizon_bars, now_ms=now_ms, fill=fill)

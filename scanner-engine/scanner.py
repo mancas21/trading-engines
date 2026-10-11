@@ -250,13 +250,28 @@ class Scanner:
         A bar fetch failure leaves the row untouched rather than writing a zero.
         """
         try:
-            n = OUT.resolve_pending(self.db, fetch_bar=self._fetch_horizon_bar)
+            n = OUT.resolve_pending(self.db, fetch_bar=self._fetch_horizon_bar,
+                                    bar_ms_for=self._bar_ms_for)
         except Exception as e:                               # noqa: BLE001
             self.resolver_errors += 1
             self.last_resolver_error = f"{type(e).__name__}: {e}"
             return 0
         self.rows_resolved += n
         return n
+
+    def _bar_ms_for(self, pair: str) -> int:
+        """This pair's bar size in ms -- what `horizon_bars` is counted in.
+
+        `horizon_for` holds a fixed 5-minute wall-clock horizon and converts it
+        to bars per pair, so `horizon_bars=5` on a 1m pair and `horizon_bars=1`
+        on a 5m pair both mean 300 seconds. The resolver needs the pair's real
+        bar size to turn the count back into milliseconds; assuming 1 minute
+        made every 5m pair measure a 60-second move instead.
+        """
+        try:
+            return OUT.BAR_MS[P.bar_for(pair)]
+        except KeyError:
+            return 60_000
 
     def _fetch_horizon_bar(self, pair: str, at_ms: int):
         """The CLOSED bar covering `at_ms`, in the pair's own bar size.
