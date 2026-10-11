@@ -4,41 +4,78 @@
 decidimos de nuevo qué hacer". El orden de abajo es el orden real. No se salta
 al item 4 sin cerrar el 1.
 
-Estado verificado hoy antes de escribir esto:
+Estado verificado. Actualizado 2026-10-11 10:05 tras cerrar el item 1.
 
 ```
-supervisor  pid=8052   Python312       <- UNO solo, vivo
-scanner     (hijo del 8052)            <- escribe normal
-lock: 8052
-:8090/health -> 200   cyc=5  rows=3376  dir=485  froz=0  err=0
+supervisor  pid=1364   (venv via pyvenv.cfg)
+scanner     pid=25704  (hijo del 1364)     <- UNO y UNO, escribe normal
+:8090/health -> 200     froz=0  err=0
+pendientes  127 -> 91    resueltos +108    unscorable +0   (5 min, fix activo)
 watchdog fires: 0
 ```
 
 ---
 
-## 1. Dejar el scanner corriendo — HECHO, pero con una incoherencia que hay que cerrar
+## 1. El 41% de filas unscorable — HECHO y verificado
 
-**Está corriendo y acumulando.** Eso es lo pedido y está cumplido.
+**Causa raíz:** `pending_rows` ordenaba `ORDER BY ts DESC` — las más NUEVAS
+primero — pero `resolve_pending` sólo puede puntuar una fila cuando su barra de
+horizonte ya CERRÓ, y un horizonte de 5 barras cierra 5 minutos después de
+escribirse. Las filas más nuevas son justo las que todavía NO se pueden
+resolver. Con `DESC` el resolver gastaba cada ciclo pidiendo sus 12 filas más
+nuevas, no encontraba ninguna lista, no resolvía nada, y **nunca llegaba a las
+viejas que sí estaban listas.** Esas envejecían y `mark_unscorable` las retiraba
+a los 1800s.
 
-El problema que queda: **hay dos intérpretes en juego.** El supervisor vivo es
-`AppData\Local\Programs\Python\Python312\python.exe`, pero `start-scanner.ps1` /
-`run_supervisor.bat` lanzan el venv (`quant-alert-engine\venv`). O sea: cada vez
-que el script arranca uno y ya hay uno viejo vivo, gana el viejo, el nuevo sale
-con código 0 por lock tomado, y quedan dos.
+Medido antes del fix en la base viva:
+- **298 filas candidato** retiradas unscorable = **52% de las 569 señales**
+- filas sentadas a **edad 1790s con horizon_bars=5** — listas a los ~300s,
+  esperando a los 1790s, a un poll de la retirada
 
-Por qué duele: dos supervisores compiten por el lock, el segundo gana a veces, y
-un stop deja huérfanos. Es exactamente la clase de fallo que causó los
-supervisores duplicados que vimos.
+**Fix:** `ORDER BY ts ASC`. El más viejo primero es el más probablemente listo,
+que es el orden que necesita un consumidor con retardo temporal.
 
-**Cerrar así:**
-- Regla única: el scanner corre con **el venv**. Punto.
-- `stop-scanner.ps1` ya mata el árbol y verifica; usarlo SIEMPRE antes de un start.
-- Añadir a `scanner_audit_tick.py`: si hay >1 supervisor, reportarlo (hoy no lo ve).
-- Verificación: `start-scanner.ps1` tras un stop limpio → exactamente 1 supervisor,
-  y su intérprete debe contener `quant-alert-engine\venv`.
+**Verificado en vivo (5 min con el fix):**
 
-**No hacer:** reiniciar el scanner ahora solo por estética. Está trabajando.
-El reinicio limpio se hace cuando haya que tocarlo por otra razón.
+```
+pendientes : 127 -> 91     (drena, monótono)
+resueltos  : +108
+unscorable : +0            (antes: ráfagas de 130-350/hora)
+>30min     : 0             (nada varado pasado el límite)
+```
+
+Test de regresión: `tests/test_outcomes.py::test_pending_batch_is_oldest_first`.
+Comprobado que **falla con `DESC` y pasa con `ASC`** — no es un test decorativo.
+Monitor reutilizable: `watch_outcomes.py [minutos]`.
+
+**Pendiente de este item:** las 298 señales perdidas **son recuperables** —
+Binance `/klines` acepta `startTime`, así que la barra histórica existe aunque
+el pipeline ya la diera por muerta. Backfill = +298 mediciones gratis sobre una
+muestra de 569. Vale la pena porque duplica la evidencia disponible para el
+item 2.
+
+---
+
+### Corrección: el "Python312 vs venv" NO era un problema
+
+Lo di por incoherencia en la versión anterior de este plan y **estaba
+equivocado.** En Windows el `python.exe` de un venv **es** el binario base
+(`Python312\python.exe`) con un `pyvenv.cfg` al lado; el process list muestra
+el exe base, no el venv. Ejecutado desde el venv reporta:
+
+```
+sys.executable : ...\quant-alert-engine\venv\Scripts\python.exe
+sys.prefix     : ...\quant-alert-engine\venv
+base_prefix    : ...\Python312          -> en venv? True
+```
+
+O sea: **"Python312" en la lista de procesos es lo esperado**, no evidencia de
+intérprete equivocado. Los supervisores duplicados eran dos lanzamientos
+separados, no dos intérpretes peleando. No hay nada que arreglar acá.
+
+Lo que sí se mantiene: `stop-scanner.ps1` antes de cada start, porque el
+supervisor se relanza solo (`--max-attempts 999`) y matar sólo al padre deja al
+hijo huérfano escribiendo.
 
 ---
 

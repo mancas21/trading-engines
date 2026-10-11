@@ -283,3 +283,77 @@ def test_mixed_fired_rules_promote_only_if_all_are_audited():
                     "direction_hint": {"side": "follow"}}}
     assert OUT.promoted_direction(rules=rules2, rule_ids=["3", "4"],
                                   flow_by_rule={"3": 0.8, "4": 0.72}) == 1
+
+
+# ── queue ordering: the batch must not starve the rows that are ready ──────
+
+def test_pending_batch_is_oldest_first(tmp_path):
+    """A time-gated consumer must drain from the FRONT of the queue.
+
+    This is the bug that lost half the signals. `pending_rows` ordered
+    `ts DESC` -- newest first -- but `resolve_pending` can only score a row
+    once its horizon bar has CLOSED, and a 5-bar horizon closes 5 minutes
+    after the row is written. So the newest rows are exactly the ones that
+    cannot be resolved yet: the resolver spent every cycle fetching its
+    batch of newest rows, resolved none of them, and never reached the older
+    rows that were ready. Those aged out and were retired unscorable.
+
+    Measured on the live database before the fix: 296 candidate rows (52% of
+    all 569 signals) retired unscorable, and rows sitting at age 1790s with
+    horizon_bars=5 -- ready at ~300s, still waiting at 1790s, one poll away
+    from the 1800s retirement.
+
+    Here 24 rows are staged: 12 old enough to score, 12 too new. With a batch
+    of 12, DESC resolves 0 of them; ASC resolves all 12 ready ones.
+    """
+    db = _db(tmp_path)
+    now = time.time()
+    ready_ids, young_ids = [], []
+    for i in range(12):
+        # 600s old, horizon 5 -> its bar closed ~300s ago
+        ready_ids.append(RC.record_verdict(
+            db, pair="ETH/USD", ts=now - 600 - i, direction=0,
+            forward_return=None, horizon_bars=5, fill_price=2000.0,
+            venues_live=4, rules_met=[], rules_unevaluable=[]))
+    for i in range(12):
+        # 5s old, horizon 5 -> its bar is still ~295s in the future
+        young_ids.append(RC.record_verdict(
+            db, pair="ETH/USD", ts=now - 5 - (i * 0.1), direction=0,
+            forward_return=None, horizon_bars=5, fill_price=2000.0,
+            venues_live=4, rules_met=[], rules_unevaluable=[]))
+
+    # a bar that closes exactly at at_ms: closed for the old rows, still
+    # forming for the young ones
+    n = OUT.resolve_pending(
+        db,
+        fetch_bar=lambda pair, at_ms: {"open_ms": at_ms - 60_000,
+                                       "close_ms": at_ms, "close": 2020.0},
+        now_ms=int(now * 1000), limit=12)
+
+    assert n == 12, f"batch resolved {n} of 12 READY rows -- queue is starved"
+    done = {r[0] for r in db.execute(
+        "SELECT id FROM verdicts WHERE resolved=1")}
+    assert done == set(ready_ids), "the OLD ready rows are the ones that must resolve"
+    assert not (done & set(young_ids)), "a forming bar must never be scored"
+
+
+def test_a_second_batch_drains_the_rest(tmp_path):
+    """The batch is a BATCH, not a cap: the next cycle continues.
+
+    True before and after the ordering fix, but it is the property that makes
+    ASC safe -- a backlog drains at `limit` per cycle instead of starving.
+    """
+    db = _db(tmp_path)
+    now = time.time()
+    for i in range(20):
+        RC.record_verdict(db, pair="ETH/USD", ts=now - 600 - i, direction=0,
+                          forward_return=None, horizon_bars=5,
+                          fill_price=2000.0, venues_live=4,
+                          rules_met=[], rules_unevaluable=[])
+    bar = lambda pair, at_ms: {"open_ms": at_ms - 60_000,
+                               "close_ms": at_ms, "close": 2020.0}
+    now_ms = int(now * 1000)
+    first = OUT.resolve_pending(db, fetch_bar=bar, now_ms=now_ms, limit=8)
+    second = OUT.resolve_pending(db, fetch_bar=bar, now_ms=now_ms, limit=8)
+    third = OUT.resolve_pending(db, fetch_bar=bar, now_ms=now_ms, limit=8)
+    assert (first, second, third) == (8, 8, 4), "each cycle must drain its batch"

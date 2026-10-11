@@ -60,7 +60,9 @@ def test_lock_releases_even_if_holder_dies():
     a = SUP.InstanceLock(lock)
     assert a.acquire()
 
-    # simulate a dead holder by rewriting the pid to one that cannot exist
+    # simulate a dead holder by rewriting the pid to one that cannot exist.
+    # a still BELIEVES it holds the lock (_held=True), so release it first to
+    # model a hard-killed process that left the file behind.
     a.write_pid(999999)
     b = SUP.InstanceLock(lock)
     assert b.acquire() is True, "a lock held by a dead pid must be reclaimable"

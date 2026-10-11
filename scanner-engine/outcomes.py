@@ -94,14 +94,35 @@ MAX_SCORABLE_AGE_S = 1800.0     # 30 minutes: ~6x the longest horizon
 
 
 def pending_rows(db: sqlite3.Connection, limit: int = DEFAULT_BATCH) -> list[tuple]:
-    """Rows awaiting an outcome: (id, pair, ts, horizon_bars, fill_price)."""
+    """Rows awaiting an outcome: (id, pair, ts, horizon_bars, fill_price).
+
+    OLDEST FIRST, and that ordering is load-bearing.
+
+    This used to be `ORDER BY ts DESC` -- the newest rows first -- which
+    starved the queue into losing half the signals. The consumer is
+    time-gated: `resolve_pending` can only score a row once its horizon bar
+    has CLOSED, and a 5-bar horizon closes 5 minutes after the row is written.
+    So the newest rows are exactly the ones that cannot be resolved yet.
+
+    With DESC the resolver spent every cycle fetching its `limit` newest rows,
+    found none of them ready, resolved nothing, and never reached the older
+    rows that WERE ready. Those aged out and `mark_unscorable` retired them.
+
+    Measured on the live database before the fix:
+      * 296 candidate rows (52% of all 569 signals) retired unscorable
+      * rows sitting at age 1790s with horizon_bars=5 -- ready at ~300s,
+        still waiting at 1790s, one poll away from the 1800s retirement
+
+    ASC inverts it: the oldest pending rows are the most likely to be ready,
+    which is the order a time-gated consumer needs. Nothing starves.
+    """
     with RC_guard(db):
         return db.execute(
             """SELECT id, pair, ts, horizon_bars, fill_price
                  FROM verdicts
                 WHERE resolved = 0 AND fill_price IS NOT NULL
                   AND ts > ?
-                ORDER BY ts DESC LIMIT ?""",
+                ORDER BY ts ASC LIMIT ?""",
             (time.time() - MAX_SCORABLE_AGE_S, limit),
         ).fetchall()
 

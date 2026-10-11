@@ -1,13 +1,17 @@
 @echo off
 REM scanner-engine launcher
-REM Uses the quant-alert-engine venv: it already has the deps this engine needs
-REM (pandas/numpy are unused here, but a second venv is not worth the drift).
+REM
+REM 2026-10-11 — DESACOPLADO de quant-alert-engine. Antes este script usaba
+REM   %ROOT%\quant-alert-engine\venv\Scripts\python.exe, lo que ataba este motor
+REM   al de QAE: borrar QAE mataba el scanner. Verificado que no hace falta:
+REM   las unicas dependencias no-stdlib del scanner son `certifi` (opcional, con
+REM   fallback en http_io.py:40-47) y nada mas. Python del sistema las tiene.
+REM   scanner corre con Python312 y su /health responde igual (verificado).
 setlocal
-set ROOT=%~dp0..
-set PY=%ROOT%\quant-alert-engine\venv\Scripts\python.exe
+set "PY=C:\Users\Lenovo\AppData\Local\Programs\Python\Python312\python.exe"
 
 if not exist "%PY%" (
-  echo venv not found at %PY%
+  echo python not found at %PY%
   exit /b 1
 )
 

@@ -24,7 +24,7 @@ WHAT THIS DELIBERATELY DOES NOT DO
 (`pairs.bar_for`), because a fixed horizon across a 1m and a 5m pair makes
 expectancy incomparable.
 
-Run:  quant-alert-engine/venv/Scripts/python.exe scanner-engine/scanner.py --once
+Run:  python scanner-engine/scanner.py --once
 """
 from __future__ import annotations
 

@@ -21,7 +21,7 @@ THE TWO FAILURE MODES THIS EXISTS TO PREVENT
    brought it back. `should_restart(returncode=0)` is False and the supervisor
    exits 0 with the lock released.
 
-Run:  quant-alert-engine/venv/Scripts/python.exe scanner-engine/supervisor.py
+Run:  python scanner-engine/supervisor.py
 """
 from __future__ import annotations
 
@@ -142,30 +142,54 @@ class InstanceLock:
     def acquire(self) -> bool:
         if self._held:
             return True
-        # A second InstanceLock object on the SAME path inside THIS process must
-        # be refused, or the exclusivity the supervisor depends on is a fiction.
-        # The original code let it through: `if holder != os.getpid()` was meant
-        # to let the supervisor reclaim its own lock, but it also let a fresh
-        # object claim a lock the current process already owned.
+
+        # ATOMIC claim via O_CREAT|O_EXCL, then liveness check.
         #
-        # The stale-holder case is different and MUST still reclaim: a dead pid
-        # makes the lock garbage regardless of any in-process claim. So the pid
-        # liveness is tested FIRST, then the in-process claim.
-        holder = self._read_pid()
-        holder_alive = holder is not None and self._alive(holder)
-        if holder_alive and holder != os.getpid():
-            return False                      # another live process holds it
-        if holder_alive and _CLAIMED.get(str(self.path)) is not None:
-            return False                      # this process already holds it
-        # no holder, dead holder, or only our own stale claim -> reclaim
-        # free, stale, or already ours -> (re)claim it
-        try:
-            self.write_pid()
-            _CLAIMED[str(self.path)] = os.getpid()
-            self._held = True
-            return True
-        except OSError:
-            return False
+        # The previous version was a TOCTOU race: read the pid, test liveness,
+        # then write. Two supervisors starting within the same second both read
+        # "no lock", both wrote, and BOTH ran -- verified live, two supervisor
+        # trees and two scanner children on one database. The lock is the only
+        # thing preventing the duplicate-spawn class of failure (the flashing
+        # "Already running" dialog in the sibling engine), so it has to be
+        # atomic, not sequential.
+        #
+        # O_EXCL makes the create itself the claim: exactly one caller can win,
+        # even across processes. A stale file is handled after the fact by
+        # checking whether the pid inside is still alive.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        for _ in range(2):                     # one retry after clearing stale
+            try:
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                holder = self._read_pid()
+                if holder is not None and holder != os.getpid() and self._alive(holder):
+                    return False               # a live process holds it
+                if holder == os.getpid():
+                    # The file says OUR pid. Either another InstanceLock object
+                    # in this process holds it (must be refused -- that is the
+                    # exclusivity the supervisor depends on) or this object
+                    # already holds it, which the `self._held` check above
+                    # already returned True for. So: refuse.
+                    return False
+                # dead holder, unreadable file, or same-process re-claim: clear it
+                try:
+                    self.path.unlink()
+                except OSError:
+                    return False
+                continue
+            except OSError:
+                return False
+            else:
+                try:
+                    os.write(fd, f"{os.getpid()}\n".encode())
+                finally:
+                    os.close(fd)
+                _CLAIMED[str(self.path)] = os.getpid()
+                self._held = True
+                return True
+
+        return False
 
     def release(self) -> None:
         if not self._held:
@@ -385,6 +409,21 @@ def main() -> int:
     args = ap.parse_args(my_flags)
 
     cmd = child_cmd or [sys.executable, str(HERE / "scanner.py")]
+
+    # HARD GUARD: a supervisor must never supervise another supervisor.
+    #
+    # Observed live: two supervisor processes and two scanners appeared, one
+    # supervisor running under the venv python and one under the SYSTEM python,
+    # the second being the child of the first. A nesting supervisor multiplies
+    # the lock's failure mode instead of being caught by it -- the inner one
+    # takes the lock, the outer one keeps spawning, and the duplicate is
+    # invisible because only the inner one logs.
+    #
+    # Whatever produced that chain, the supervisor refuses to reproduce it.
+    if any("supervisor.py" in str(a).lower() for a in cmd):
+        print("refusing to supervise another supervisor: "
+              + " ".join(str(c) for c in cmd), file=sys.stderr)
+        return 2
 
     # Progress signal: the scanner writes rows every cycle, so the SQLite
     # file's mtime advances while it works. Independent of the child's own

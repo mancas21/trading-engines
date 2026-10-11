@@ -13,7 +13,10 @@
 $ErrorActionPreference = "Stop"
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$py   = Join-Path $here "..\quant-alert-engine\venv\Scripts\python.exe"
+# 2026-10-11 — DESACOPLADO de quant-alert-engine. Antes: ..\quant-alert-engine\venv.
+# Ese venv es de QAE; depender de el ataba este motor al de QAE. El scanner solo
+# necesita stdlib + certifi (opcional). Python del sistema sirve.
+$py   = "C:\Users\Lenovo\AppData\Local\Programs\Python\Python312\python.exe"
 $vbs  = Join-Path $here "launch_scanner.vbs"
 $lock = Join-Path $here "data\scanner.lock"
 

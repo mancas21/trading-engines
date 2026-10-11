@@ -14,7 +14,7 @@ Everything else exits 0 with no output, and the cron delivers nothing.
 STATE FILE: data/audit_state.json holds the last emitted summary. It is what
 makes "changed" mean something across ticks.
 
-Run:  quant-alert-engine/venv/Scripts/python.exe scanner-engine/audit_tick.py
+Run:  python scanner-engine/audit_tick.py
 """
 from __future__ import annotations
 
