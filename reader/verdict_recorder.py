@@ -57,9 +57,14 @@ BRIDGE = "http://127.0.0.1:8000"
 LIVE_MAX_AGE_S = 300.0          # misma regla live-only que el resto del sistema
 DEFAULT_HORIZON_BARS = 12
 
-# Reglas 6/7 de atas-bridge/rules.json v3.3
-R6 = {"levels_min": 4, "dom_imbalance_max": 5.0}
-R7 = {"levels_min": 3, "dom_imbalance_min": 10.0}
+# Reglas 6/7 de atas-bridge/rules.json. Los niveles de footprint se leen del
+# modulo verdict (que los carga de rules.json) — antes estaban transcritos a
+# mano AQUI con otros numeros, y la condicion (c) se evaluaba con umbrales
+# (dom 5/10) que rules.json ya no declara: el ledger media una regla distinta
+# de la que la puerta decia aplicar. La (c) ahora es la MISMA funcion que usa
+# la puerta: verdict.dom_vac_eval (consenso multi-venue del scanner).
+R6 = {"levels_min": 4}
+R7 = {"levels_min": 3}
 
 
 def get(path: str, timeout: float = 25.0):
@@ -81,6 +86,9 @@ def classify_footprint(top_levels):
     predominantemente vendedores NO satisface ninguna de las dos.
     Lados sin contraparte (ask==0) cuentan como 100% bid y distorsionan el
     recuento, así que se marcan aparte.
+    El umbral viene de rules.json via verdict.FOOTPRINT_PCT (65 en v3.4.1) —
+    el 70/30 hardcoded hacia que el ledger contara con un umbral distinto del
+    que la puerta aplica.
     """
     sell_h = buy_h = thin = 0
     rows = []
@@ -96,9 +104,9 @@ def classify_footprint(top_levels):
         is_thin = (bid == 0 or ask == 0)
         if is_thin:
             thin += 1
-        if bp > 70.0:
+        if bp > verdict.FOOTPRINT_PCT:
             sell_h += 1
-        elif bp < 30.0:
+        elif bp < 100.0 - verdict.FOOTPRINT_PCT:
             buy_h += 1
         rows.append({"price": lv.get("price"), "bid_pct": round(bp, 1),
                      "delta": lv.get("delta", 0), "thin": is_thin})
@@ -163,10 +171,11 @@ def read_live():
     cond_b6 = "MET" if sell_h >= R6["levels_min"] else "FAIL"
     cond_b7 = "MET" if buy_h >= R7["levels_min"] else "FAIL"
 
-    cond_c6 = ("UNEVALUABLE" if ema_v is None else
-               ("MET" if ema_v < R6["dom_imbalance_max"] else "FAIL"))
-    cond_c7 = ("UNEVALUABLE" if ema_v is None else
-               ("MET" if ema_v > R7["dom_imbalance_min"] else "FAIL"))
+    # (c) multi-venue: LA MISMA funcion que evalua la puerta (verdict.py).
+    # Cada lectura del grabador es un ciclo del gate — ver verdict.dom_vac_eval.
+    _gate = verdict.dom_vac_eval(str(i.get("ticker")).upper())
+    cond_c6 = _gate["sell"]["state"]     # distribucion = lado vendedor del libro
+    cond_c7 = _gate["buy"]["state"]      # acumulacion = lado comprador del libro
 
     r6 = [cond_a6, cond_b6, cond_c6]
     r7 = [cond_a7, cond_b7, cond_c7]
@@ -180,17 +189,25 @@ def read_live():
         bias = "NEUTRAL"
 
     # ── Scorecard: SEPARADO de la puerta, nunca la sustituye ──
-    parts = {}
-    parts["footprint_depth"] = min(25, 3 * len(rows))
-    parts["dom_imbalance"] = (max(0, min(25, int(round(12.5 + ((imbalance or 0) / 100.0) * 12.5))))
-                              if isinstance(imbalance, (int, float)) else 0)
-    parts["tape_ratio"] = (max(0, min(20, int(round((tape_buy_pct or 0) / 100.0 * 20))))
-                           if tape_buy_pct is not None else 0)
+    #
+    # UNA SOLA implementacion: verdict.scorecard(). Este modulo tenia su PROPIA
+    # copia del scorecard v3.4.1, y por eso reader.db guardaba el score
+    # ANTI-PREDICTIVO mientras rules.json declaraba por escrito que no se usa
+    # ("No se usan: verdict.py puntua por percentil con
+    # scorecard_calibration.json") y mientras verdict.py ya puntuaba por
+    # percentil. Habia TRES copias de la misma formula — aqui, en
+    # verdict.py:_scorecard_v341 y en build_scorecard_calibration.py:140-148 —
+    # y tres copias garantizan que una diverge. Medido el 2026-10-11: mismo
+    # instante, v3.4.1 daba 54/NEUTRAL y v2 daba 79,8/BULLISH; 26 puntos y un
+    # cambio de banda.
+    #
+    # OJO: verificado en vivo que verdict.scorecard() funciona con la MISMA
+    # calibracion que el resto del sistema (scorecard_calibration.json, 7 dias
+    # de caducidad). Si falta o no es legible, verdict.py cae al v3.4.1 y lo
+    # avisa por stdout — el fallback sigue existiendo, pero en UN solo sitio.
     vr = vol.get("volume_ratio")
-    parts["volume_climax"] = (max(0, min(15, int(round(min(vr, 3.0) / 3.0 * 15))))
-                              if isinstance(vr, (int, float)) and vr > 0 else 0)
-    parts["footprint_confirmation"] = min(15, (5 if buy_h >= 3 else 0) + (5 if sell_h >= 3 else 0))
-    score = sum(parts.values())
+    score, parts, _score_notes = verdict.scorecard(
+        rows, imbalance, ema_v, tape_buy_pct, vr, sell_h, buy_h)
 
     rec = {
         "ts": time.time(),
