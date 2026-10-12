@@ -65,6 +65,157 @@ RETRY_BACKOFF_S = 60.0
 RETRY_BACKOFF_MAX_S = 300.0
 MAX_RETRY_ATTEMPTS = 20
 
+# Lock de instancia unica.
+#
+# Por que: el supervisor se lanza desde la carpeta Inicio, y TAMBIEN a mano
+# cuando alguien lo revisa. Sin lock, dos supervisores graban a la vez y
+# reader.db recibe veredictos DUPLICADOS — y ningun consumidor puede distinguir
+# la duplicacion de una racha real. Es el mismo fallo que se verifico en vivo en
+# scanner-engine ("two supervisor trees and two scanner children on one
+# database"). Sin este lock, meter el lector en Inicio habria creado ese bug.
+LOCK = HERE / "reader_supervisor.lock"
+
+# Rutas de lock que ESTE proceso ha reclamado. El fichero de PID por si solo no
+# puede expresar "un segundo objeto InstanceLock en el mismo interprete debe ser
+# rechazado", porque el pid que contiene es el nuestro y por tanto siempre vivo.
+_CLAIMED: dict[str, int] = {}
+
+
+class InstanceLock:
+    """Un fichero de PID exclusivo entre procesos y reclamable si el titular murio.
+
+    La reclamabilidad importa: si al supervisor lo matan a lo bruto, el fichero
+    de PID queda; un supervisor que se niega a arrancar por el fichero de un
+    titular muerto es indistinguible de uno que esta trabado.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self._held = False
+
+    def _read_pid(self):
+        try:
+            txt = self.path.read_text(encoding="utf-8").strip()
+            return int(txt.split()[0]) if txt else None
+        except (FileNotFoundError, ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        """Esta vivo `pid`?
+
+        `os.kill(pid, 0)` NO es portable aqui: en Windows lanza
+        `OSError: [WinError 87]` para un pid cualquiera, lo que haria que todo
+        lock pareciese de un titular muerto y dejaria reclamarlo a un segundo
+        supervisor. Usa OpenProcess en Windows y os.kill en el resto.
+        """
+        if pid <= 0:
+            return False
+        if pid == os.getpid():
+            return True
+
+        if sys.platform == "win32":
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            try:
+                import ctypes
+                k32 = ctypes.windll.kernel32          # noqa: N806
+                h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                if not h:
+                    # ERROR_ACCESS_DENIED (5) significa que existe pero no es
+                    # nuestro; cualquier otra cosa significa que no esta.
+                    return k32.GetLastError() == 5
+                try:
+                    code = ctypes.c_ulong()
+                    if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                        return True
+                    return code.value == STILL_ACTIVE
+                finally:
+                    k32.CloseHandle(h)
+            except Exception:                              # noqa: BLE001
+                return False
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, ValueError):
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def acquire(self) -> bool:
+        if self._held:
+            return True
+
+        # Reclamo ATOMICO via O_CREAT|O_EXCL, y despues comprobacion de vida.
+        #
+        # La version secuencial (leer pid, comprobar vida, escribir) es una
+        # carrera TOCTOU: dos supervisores arrancando en el mismo segundo leen
+        # "sin lock", ambos escriben, y AMBOS corren — verificado en vivo en
+        # scanner-engine, dos arboles de supervisor y dos hijos sobre una base.
+        # O_EXCL hace que el propio create sea el reclamo: exactamente uno gana,
+        # incluso entre procesos. Un fichero rancio se resuelve despues mirando
+        # si el pid de dentro sigue vivo.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        for _ in range(2):                     # un reintento tras limpiar rancio
+            try:
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                holder = self._read_pid()
+                if holder is not None and holder != os.getpid() and self._alive(holder):
+                    return False               # un proceso vivo lo tiene
+                if holder == os.getpid():
+                    # El fichero dice NUESTRO pid: u otro InstanceLock del mismo
+                    # proceso lo tiene (debe rechazarse — es la exclusividad de
+                    # la que depende el supervisor), o ya lo tenemos nosotros,
+                    # caso que el `self._held` de arriba ya resolvio. Rechaza.
+                    return False
+                try:
+                    self.path.unlink()
+                except OSError:
+                    return False
+                continue
+            except OSError:
+                return False
+            else:
+                try:
+                    os.write(fd, f"{os.getpid()}\n".encode())
+                finally:
+                    os.close(fd)
+                _CLAIMED[str(self.path)] = os.getpid()
+                self._held = True
+                return True
+
+        return False
+
+    def release(self) -> None:
+        if not self._held:
+            return
+        # solo borra el fichero si sigue siendo nuestro
+        if self._read_pid() == os.getpid():
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+        _CLAIMED.pop(str(self.path), None)
+        self._held = False
+
+
+_LOCK = InstanceLock(LOCK)
+
+
+def do_loop(interval: float, dry_run: bool = False) -> int:
+    # Instancia unica ANTES de tocar nada: si ya hay un supervisor vivo, este
+    # sale sin grabar. Dos grabadores sobre reader.db duplican veredictos.
+    if not _LOCK.acquire():
+        log(f"Ya hay otro supervisor del reader activo (lock tomado en {LOCK}). "
+            f"Este proceso sale sin grabar.")
+        return ALREADY_RUNNING_EXIT
+    try:
+        return _loop_body(interval, dry_run=dry_run)
+    finally:
+        _LOCK.release()
+
 
 def log(msg: str) -> None:
     line = f"[{datetime.now():%a %d/%m/%Y %H:%M:%S}] {msg}"
@@ -137,7 +288,7 @@ def cycle(dry_run: bool = False) -> tuple[bool, str]:
     return ok, st.get("recorder_tail", "")
 
 
-def do_loop(interval: float, dry_run: bool = False) -> int:
+def _loop_body(interval: float, dry_run: bool = False) -> int:
     log(f"reader supervisor started (interval {interval:.0f}s, child "
         f"=record + notificar si cambia)")
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
