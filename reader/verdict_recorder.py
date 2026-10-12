@@ -181,9 +181,20 @@ def read_live():
     r7 = [cond_a7, cond_b7, cond_c7]
     r6_ok = all(x == "MET" for x in r6)
     r7_ok = all(x == "MET" for x in r7)
+
+    # El sesgo viene de la PUERTA, y la puerta respeta `enforcement`.
+    #
+    # Antes esto era `elif r6_ok: bias = "BEARISH"` a secas, sin mirar el flag.
+    # Efecto medido: la fila id=1479 (11/10 20:46:17) quedo grabada como
+    # BEARISH por una regla YA DESHABILITADA (r6 MET/MET/MET), cuando la puerta
+    # habria dicho NEUTRAL. reader.db publicaba una direccion que el motor no
+    # habia dado — y ningun consumidor puede distinguir eso de una senal real.
+    # Es el mismo desincronizado del scorecard: dos implementaciones de una
+    # decision. El flag se lee de la MISMA funcion que usa verdict.py.
+    r6_enforcement = verdict._rule_enforcement(6)
     if r7_ok:
         bias = "BULLISH"
-    elif r6_ok:
+    elif r6_ok and r6_enforcement != "disabled":
         bias = "BEARISH"
     else:
         bias = "NEUTRAL"

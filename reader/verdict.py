@@ -13,14 +13,18 @@ atas-bridge/rules.json v3.3, no de memoria):
       (a) CVD cae 2+ barras consecutivas          [cvd_consecutive_down_min]
       (b) footprint: 4+ niveles con >= sell_pct% venta en el lado bid
                                                         [footprint_sell_pct_min]
-      (c) imbalance_pct_ema < dom_max%, y hold >= persistence polls
-                                   [dom_imbalance_max, dom_persistence_polls_min]
+      (c) consenso de libro multi-venue del scanner: N venues con asks
+          pesados fuera de banda, sostenido P lecturas del reader
+                                   [dom_source, dom_vac_thr, dom_vac_venues_min,
+                                    dom_vac_polls_min - Fix 2-A, 2026-10-11]
   Regla 7 — Accumulation (alcista). Las TRES:
       (a) CVD sube 2+ barras consecutivas          [cvd_consecutive_up_min]
       (b) footprint: 3+ niveles con >= buy_pct% compra en el lado ask
                                                         [footprint_buy_pct_min]
-      (c) imbalance_pct_ema > dom_min%, y hold >= persistence polls
-                                   [dom_imbalance_min, dom_persistence_polls_min]
+      (c) consenso de libro multi-venue del scanner: N venues con bids
+          pesados fuera de banda, sostenido P lecturas del reader
+                                   [dom_source, dom_vac_thr, dom_vac_venues_min,
+                                    dom_vac_polls_min - Fix 2-A, 2026-10-11]
 
   ESTE FICHERO NO TIENE NUMEROS FIJOS. Los lee todos de atas-bridge/rules.json
   al importar el modulo, y avisa por stdout si no puede leerlos. Si un numero de
@@ -101,25 +105,166 @@ def _load_rule_conditions(rule_id: int) -> dict:
     return {"_enforcement": "hard", "_title": "", "_present": False}
 
 
-# Las condiciones son PLANAS: _R6["dom_imbalance_max"], sin descender niveles.
+# Las condiciones son PLANAS: _R6["dom_vac_thr"], sin descender niveles.
 _R6 = _load_rule_conditions(6)
 _R7 = _load_rule_conditions(7)
 _R2 = _load_rule_conditions(2)
 
-RULE6 = {"streak": _R6.get("cvd_consecutive_down_min", 2),
-         "levels_min": _R6.get("footprint_levels_min", 4),
-         "dom_max": float(_R6.get("dom_imbalance_max", 5)),
+# FIX 2-A (docs/FIXES-gate-DOM.md, 2026-10-11): la condición (c) ya NO es la EMA
+# del libro de Binance (std 7.5, 19-23 cambios de estado/día — no era un gate).
+# Ahora es consenso multi-venue del scanner: N venues con touch_imbalance del
+# lado de la regla más allá de la banda, sostenido P lecturas del reader.
+# La fuente se declara en rules.json ("dom_source") y el test de contrato
+# comprueba que este código lee EXACTAMENTE lo que el JSON declara.
+DOM_SOURCE = "scanner_multi_venue"
+if _R6.get("dom_source") != DOM_SOURCE or _R7.get("dom_source") != DOM_SOURCE:
+    print(f"[verdict] AVISO: rules.json declara dom_source="
+          f"{_R6.get('dom_source')!r}/{_R7.get('dom_source')!r} y este código "
+          f"solo implementa {DOM_SOURCE!r} — contrato roto, no evaluar en serio.")
+
+RULE6 = {"streak": int(_R6.get("cvd_consecutive_down_min", 2)),
+         "levels_min": int(_R6.get("footprint_levels_min", 4)),
+         "vac_thr": float(_R6.get("dom_vac_thr", 0.15)),
+         "vac_venues": int(_R6.get("dom_vac_venues_min", 3)),
+         "vac_polls": int(_R6.get("dom_vac_polls_min", 2)),
          "enforcement": _R6.get("_enforcement", "hard")}
 
-RULE7 = {"streak": _R7.get("cvd_consecutive_up_min", 2),
-         "levels_min": _R7.get("footprint_levels_min", 3),
-         "dom_min": float(_R7.get("dom_imbalance_min", 10)),
+RULE7 = {"streak": int(_R7.get("cvd_consecutive_up_min", 2)),
+         "levels_min": int(_R7.get("footprint_levels_min", 3)),
+         "vac_thr": float(_R7.get("dom_vac_thr", 0.15)),
+         "vac_venues": int(_R7.get("dom_vac_venues_min", 3)),
+         "vac_polls": int(_R7.get("dom_vac_polls_min", 2)),
          "enforcement": _R7.get("_enforcement", "hard")}
 
-# `dom_persistence_polls_min` es el campo que faltaba por completo.
-# Si rules.json no lo declara, 3 es el valor que las reglas v3.3 declaran.
-DOM_PERSIST_MIN = int(_R6.get("dom_persistence_polls_min",
-                              _R7.get("dom_persistence_polls_min", 3)))
+# La regla 7 lee el lado COMPRADOR del consenso y la 6 el VENDEDOR: la
+# acumulación pide bids descansando bajo el precio; la distribución, asks encima.
+RULE6_SIDE, RULE7_SIDE = "sell", "buy"
+
+# ── Condición (c) multi-venue: consenso de libro N-de-M del scanner ─────────
+# La fuente es scanner-engine (poller continuo, 4 venues, UNEVALUABLE declarado
+# cuando falta dato — nunca el libro de una GUI). La persistencia vive en un
+# fichero de estado porque cada lectura del reader es un ciclo del gate: dos
+# lecturas consecutivas por encima de banda son lo que la regla llama "hold".
+
+SCANNER_URL = "http://127.0.0.1:8090"
+_DOM_GATE_STATE = HERE / "dom_gate_state.json"
+
+
+def _symbol_to_scanner_pair(symbol: str) -> str | None:
+    """'XRPUSDT' -> 'XRP/USD', solo si el scanner tiene el par registrado."""
+    base = str(symbol or "").upper().replace("-", "")
+    changed = True
+    while changed:
+        changed = False
+        for suffix in ("SWAP", "USDT", "USD", "PERP"):
+            if base.endswith(suffix) and len(base) > len(suffix):
+                base = base[:-len(suffix)]
+                changed = True
+                break
+    return base + "/USD" if base else None
+
+
+def _scanner_book_imb5(symbol: str, timeout: float = 4.0) -> dict | None:
+    """Imbalance del libro top-5 por venue (escala ±1), desde el scanner.
+    None si no hay dato vivo — y None NO es 0: 'no hay dato' y 'libro
+    balanceado' son claims distintos y solo uno de ellos es bajista.
+
+    NOTA de calibración (2026-10-11): el touch (mejor nivel) se DESCARTÓ como
+    base del consenso — medido, es estructuralmente unilateral (mediana
+    |x-0.5|=0.275) y desacoplado entre venues (consenso 3-de-4: 0 en 480
+    ciclos). El consenso vive en el libro acumulado, misma construcción que
+    los números DOM de ATAS/Binance.
+    """
+    pair = _symbol_to_scanner_pair(symbol)
+    if not pair:
+        return None
+    try:
+        import urllib.parse as _up
+        url = f"{SCANNER_URL}/features?pair={_up.quote(pair, safe='')}"
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            d = json.loads(r.read().decode())
+        x = (d or {}).get(pair) or {}
+        if not x.get("live"):
+            return None
+        imb = x.get("book_imb_5") or {}
+        return {k: float(v) for k, v in imb.items() if isinstance(v, (int, float))} or None
+    except Exception:
+        return None
+
+
+def _dom_gate_load() -> dict:
+    try:
+        return json.loads(_DOM_GATE_STATE.read_text(encoding="utf-8"))
+    except Exception:                               # noqa: BLE001
+        return {}
+
+
+def _dom_gate_save(s: dict) -> None:
+    try:
+        tmp = _DOM_GATE_STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(s, indent=1), encoding="utf-8")
+        tmp.replace(_DOM_GATE_STATE)
+    except Exception:                               # noqa: BLE001
+        pass                                        # el gate degrada, no truena
+
+
+def _dom_gate_tick(symbol: str, buy_met: bool, sell_met: bool) -> tuple[int, int]:
+    """Rachas consecutivas de consenso por lado. Un fallo en cualquier fuente
+    (scanner caído, venues insuficientes) pasa buy_met/sell_met=False y la
+    racha muere — conservador por diseño."""
+    st = _dom_gate_load()
+    rec = st.get(symbol) or {"buy": 0, "sell": 0}
+    rec["buy"] = int(rec.get("buy", 0)) + 1 if buy_met else 0
+    rec["sell"] = int(rec.get("sell", 0)) + 1 if sell_met else 0
+    st[symbol] = rec
+    _dom_gate_save(st)
+    return rec["buy"], rec["sell"]
+
+
+def dom_vac_eval(symbol: str) -> dict:
+    """La condición (c) completa para las reglas AT-6/AT-7, compartida por la
+    puerta (build_verdict) y por el grabador (verdict_recorder): UNA sola
+    implementación, o las dos desincronizan como ya pasó con los umbrales.
+
+    Devuelve {"buy": {"state", "detail"}, "sell": {...}, "venues": n} donde
+    state es MET/FAIL/UNEVALUABLE. MET exige: >= vac_venues venues del lado,
+    durante vac_polls lecturas consecutivas del reader.
+    """
+    thr = RULE7["vac_thr"]
+    need = RULE7["vac_venues"]
+    polls = RULE7["vac_polls"]
+    tb = _scanner_book_imb5(symbol)
+    if tb is None:
+        _dom_gate_tick(symbol, False, False)
+        return {"buy": {"state": "UNEVALUABLE",
+                        "detail": "scanner multi-venue no disponible"},
+                "sell": {"state": "UNEVALUABLE",
+                         "detail": "scanner multi-venue no disponible"},
+                "venues": 0}
+    if len(tb) < need:
+        _dom_gate_tick(symbol, False, False)
+        return {"buy": {"state": "UNEVALUABLE",
+                        "detail": f"solo {len(tb)} venue(s) vivo(s); el consenso pide {need}"},
+                "sell": {"state": "UNEVALUABLE",
+                         "detail": f"solo {len(tb)} venue(s) vivo(s); el consenso pide {need}"},
+                "venues": len(tb)}
+    n_buy = sum(1 for v in tb.values() if v > thr)
+    n_sell = sum(1 for v in tb.values() if v < -thr)
+    b_n, s_n = _dom_gate_tick(symbol, n_buy >= need, n_sell >= need)
+    detail = (f"{n_buy}C/{n_sell}V venues con |imb5|>{thr:g} "
+              f"({len(tb)} vivos); racha C={b_n} V={s_n} de {polls}")
+    out = {"buy": {}, "sell": {}, "venues": len(tb), "detail": detail}
+    for side, count, streak in (("buy", n_buy, b_n), ("sell", n_sell, s_n)):
+        if count < need:
+            out[side] = {"state": "FAIL",
+                         "detail": f"{count} venues del lado {side} con |imb5|>{thr:g} (piden {need})"}
+        elif streak < polls:
+            out[side] = {"state": "UNEVALUABLE",
+                         "detail": f"consenso {side} en racha {streak} de {polls} lecturas"}
+        else:
+            out[side] = {"state": "MET",
+                         "detail": f"{count} venues del lado {side}, racha {streak}>= {polls}"}
+    return out
 
 # ── COBERTURA DE REGLAS ────────────────────────────────────────────────────
 # Que reglas declara rules.json y cuales implementa REALMENTE este modulo.
@@ -204,6 +349,70 @@ if not _R6 or not _R7:
 SCORE_BANDS = {"bullish_min": 60, "bearish_max": 40}
 WEIGHTS = {"footprint_depth": 25, "dom_imbalance": 25, "tape_ratio": 20,
            "volume_climax": 15, "footprint_confirmation": 15}
+
+# ── SCORECARD v2 (2026-10-11) ─────────────────────────────────────────────────
+# POR QUE CAMBIA: el scorecard v3.4.1 es ANTI-PREDICTIVO. Medido sobre sus
+# propios 1.205 registros (reader.db, resueltos; forward_return YA viene con
+# signo aplicado en quant_alert_engine.py:2375, no hay que invertirlo otra vez):
+#
+#     scorecard actual:  score alto a favor 34,0%   score bajo a favor 38,0%
+#                       SPREAD  −4,0   <- puntua al reves
+#
+# Spread util medido por componente (top vs bottom octil):
+#     imbalance_pct_ema    +27,3   <- unico que separa de verdad
+#     footprint_buy_heavy  -17,3   <- invertido; pesaba CON signo equivocado
+#     footprint_sell_heavy  +4,7
+#     imbalance_pct        -10,0   <- excluido
+#     volume_ratio         -10,0   <- excluido
+#     tape_buy_pct          +0,7   <- excluido (ruido)
+#     levels               -17,3   <- excluido
+#
+# La mediana se quedaba en 58 (justo bajo el umbral de 60) por aritmetica: los
+# pesos sumaban evidencia con el signo equivocado.
+#
+# QUE NO ES ESTO: un modelo validado. La muestra es 1 simbolo, 25 h y un solo
+# regimen. Un split-half dentro de esa ventana da 2 dias contra 2 dias del
+# MISMO dia, que no es out-of-sample real; los componentes por separado fallan
+# out-of-sample (-8,0 y -13,3) y solo la combinacion aguanta (+6,7), firma de
+# overfitting. Esto QUITA dano medido, no ANADE edge probado. La validacion de
+# verdad es medir el spread sobre barras nuevas.
+def _rule_enforcement(rule_id: int) -> str:
+    """'hard' | 'soft' | 'disabled', leido de rules.json. Default 'hard'.
+
+    Una regla 'disabled' sigue evaluandose y se publica su detalle, pero no
+    cuenta para el sesgo. Sirve para poner en cuarentena una regla con evidencia
+    en contra sin perder la trazabilidad de por que se cumple.
+    """
+    return _load_rule_conditions(rule_id).get("_enforcement", "hard")
+
+
+_CALIB_PATH = os.path.join(HERE, "scorecard_calibration.json")
+_CALIB_MAX_AGE_DAYS = 7.0     # una calibracion de 25h de muestra envejece rapido
+try:
+    import json as _json_mod
+    from datetime import datetime as _dt
+    with open(_CALIB_PATH, "r", encoding="utf-8") as _fh:
+        _CAL = _json_mod.load(_fh)
+    # STALENESS: la calibracion se midio sobre una ventana corta (span declarado
+    # en el propio fichero). Un percentil contra una distribucion de hace
+    # semanas no describe el regimen actual, y el scorecard no avisa — parece
+    # calibrado y no lo esta.
+    _cal_ts = None
+    try:
+        _cal_ts = _dt.fromisoformat(str(_CAL.get("generated_at")))
+    except Exception:  # noqa: BLE001
+        _cal_ts = None
+    if _cal_ts is not None:
+        _cal_age_days = (time.time() - _cal_ts.timestamp()) / 86400.0
+        if _cal_age_days > _CALIB_MAX_AGE_DAYS:
+            print(f"[verdict] AVISO: scorecard_calibration.json tiene "
+                  f"{_cal_age_days:.0f} dias (> {_CALIB_MAX_AGE_DAYS:.0f}); "
+                  f"regenera con build_scorecard_calibration.py — los "
+                  f"percentiles pueden no describir el regimen actual.")
+except Exception as _e:  # noqa: BLE001
+    _CAL = None
+    print(f"[verdict] AVISO: scorecard_calibration.json no legible ({_e}); "
+          f"se usa el scorecard v3.4.1 (anti-predictivo, spread -4,0 medido).")
 
 
 def _get(path: str, timeout: float = 25.0):
@@ -401,10 +610,61 @@ def classify_footprint(top_levels, sell_pct=None, buy_pct=None):
 def scorecard(rows, imbalance, ema, tape_buy_pct, volume_ratio, sell_h, buy_h):
     """Scorecard 0-100 SIN CONDICIONES. Esto ORDENA; no es una predicción.
 
-    Deliberadamente no usa el EMA: el scorecard es una foto del libro instantáneo
-    y la puerta usa el valor suavizado. Esa diferencia es la que produce el
-    conflicto score-vs-puerta que hay que declarar, no esconder.
+    v2 (2026-10-11): si existe scorecard_calibration.json, puntúa POR PERCENTIL
+    sobre la distribución empírica de cada componente y promedia los ranks. Así
+    el score se centra solo (~50 si el mercado está en su mediana) y los extremos
+    son alcanzables, cosa que el v3.4.1 no lograba: su mediana se quedaba en 58
+    con un rango intercuartil de 17 puntos, y su spread medido era -4,0
+    (anti-predictivo).
+
+    Sin calibración cae al v3.4.1. Se conserva como fallback por si el JSON
+    falta, no porque sea bueno.
     """
+    if _CAL:
+        return _scorecard_percentile(ema, sell_h, buy_h)
+    return _scorecard_v341(rows, imbalance, ema, tape_buy_pct, volume_ratio,
+                           sell_h, buy_h)
+
+
+def _percentile_rank(values, x):
+    """Rank de x dentro de una lista de percentiles calibrada. Devuelve 0-100."""
+    if x is None or not values:
+        return 50.0
+    import bisect as _bs
+    return _bs.bisect_left(values, float(x)) / len(values) * 100.0
+
+
+def _scorecard_percentile(ema, sell_h, buy_h):
+    dists = _CAL.get("distributions", {})
+    weights = _CAL.get("weights", {})
+    raw = {
+        "dom_ema": ema,
+        "footprint_sell_heavy": sell_h,
+        "footprint_buy_heavy_inv": buy_h,
+    }
+    parts, notes = {}, {}
+    total = 0.0
+    wsum = 0.0
+    for comp, w in weights.items():
+        v = raw.get(comp)
+        pr = _percentile_rank(dists.get(comp), v)
+        if comp.endswith("_inv"):
+            pr = 100.0 - pr
+        parts[comp] = round(pr * w / 100.0, 1)
+        notes[comp] = f"{v} -> percentil {pr:.0f}" + (" (invertido)" if comp.endswith("_inv") else "")
+        total += pr * w
+        wsum += w
+    score = round(total / wsum, 1) if wsum else 50.0
+    ev = _CAL.get("evidence", {})
+    notes["_useful_spread"] = {k: ev[k]["useful_spread"] for k in parts if k in ev}
+    notes["_method"] = "percentile-median (v2)"
+    notes["_calib_sample"] = _CAL.get("sample_size")
+    return score, parts, notes
+
+
+def _scorecard_v341(rows, imbalance, ema, tape_buy_pct, volume_ratio, sell_h, buy_h):
+    """v3.4.1 original. MEDIDO COMO ANTI-PREDICTIVO (spread -4,0 medido).
+    Solo fallback si falta scorecard_calibration.json."""
     parts, notes = {}, {}
 
     parts["footprint_depth"] = min(WEIGHTS["footprint_depth"], 3 * len(rows))
@@ -585,19 +845,23 @@ def build_verdict() -> dict:
     # Ahora, si no hay 3+ muestras, la condicion es UNEVALUABLE — igual que ya
     # se hacia cuando el EMA era None. Y como las reglas son AND estricto,
     # UNEVALUABLE hace que la regla entera NO se cumpla: neutral, no direccion.
-    ema_n = dom.get("imbalance_pct_ema_n")
-    dom_persist_ok = isinstance(ema_n, (int, float)) and ema_n >= DOM_PERSIST_MIN
-
-    if ema is None:
-        c6 = c7 = "UNEVALUABLE"
-    elif not dom_persist_ok:
-        # EMA sin asentar: no se puede afirmar nada sobre 3+ lecturas.
-        c6 = c7 = "UNEVALUABLE"
-    else:
-        c6 = "MET" if ema < RULE6["dom_max"] else "FAIL"
-        c7 = "MET" if ema > RULE7["dom_min"] else "FAIL"
-    v["dom"]["persist_ok"] = dom_persist_ok
-    v["dom"]["persist_min"] = DOM_PERSIST_MIN
+    # ── Condición (c): consenso de libro multi-venue (Fix 2-A) ──
+    # ANTES: imbalance_pct_ema del libro Binance WS — std 7.5, el gate cambiaba
+    # de estado 19-23 veces/día. AHORA: N venues del scanner fuera de banda,
+    # sostenido P lecturas. La EMA se SIGUE PUBLICANDO como contexto (v["dom"])
+    # pero ya no decide nada — un número que se muestra y un número que gatean
+    # dejan de ser el mismo por accidente.
+    gate = dom_vac_eval(v["symbol"])
+    c6 = gate[RULE6_SIDE]["state"]
+    c7 = gate[RULE7_SIDE]["state"]
+    v["dom_vac"] = {
+        "symbol": v["symbol"],
+        "thr": RULE7["vac_thr"],
+        "venues_min": RULE7["vac_venues"],
+        "polls_min": RULE7["vac_polls"],
+        "buy": gate["buy"], "sell": gate["sell"],
+        "detail": gate.get("detail", ""),
+    }
 
     r6 = [a6, b6, c6]
     r7 = [a7, b7, c7]
@@ -608,31 +872,51 @@ def build_verdict() -> dict:
     v["rule6"] = {
         "conditions": {"a_cvd_down_2plus": a6,
                        f"b_footprint_{RULE6['levels_min']}_sell_heavy": b6,
-                       f"c_ema_below_{RULE6['dom_max']}": c6},
+                       f"c_vac_sell_{RULE6['vac_venues']}deM_thr{RULE6['vac_thr']:g}": c6},
         "met": r6_met}
     v["rule7"] = {
         "conditions": {"a_cvd_up_2plus": a7,
                        f"b_footprint_{RULE7['levels_min']}_buy_heavy": b7,
-                       f"c_ema_above_{RULE7['dom_min']}": c7},
+                       f"c_vac_buy_{RULE7['vac_venues']}deM_thr{RULE7['vac_thr']:g}": c7},
         "met": r7_met}
 
     # ── Regla 5: No Pattern Anchoring ──
     # Validation: verify the verdict does not reference prior bar patterns as evidence.
     # The engine uses only current bar footprint, DOM, CVD, and tape — no lagged patterns.
-    # If any code path were to implicitly depend on prior bars, this flag catches it.
-    rule5_anchor_check = True  # Engine architecture ensures current-bar-only data
+    # HONESTO (2026-10-11 audit): None, no True. Un flag que no puede fallar no
+    # es un control — era True por construccion mientras la cobertura de reglas
+    # declara la 5 como "no comprobable por codigo". Lo que SI es cierto: las
+    # entradas del veredicto son solo de la barra/lectura actual (arquitectura),
+    # y eso se dice como tal en vez de simularse como chequeo pasado.
     v["rule5"] = {
-        "anchoring_ok": rule5_anchor_check,
-        "note": "No prior bar patterns used — verdict based on current bar + structural levels only"
+        "anchoring_ok": None,       # no computable; ver _rule_coverage()
+        "note": "Regla de conducta: no verificable por codigo. Cubierta por "
+                "diseno — las entradas del veredicto son solo la lectura actual "
+                "(footprint/DOM/CVD/tape de esta barra); ningun estado de "
+                "analisis anterior entra como evidencia."
     }
 
     # ── El sesgo viene de la PUERTA ──
+    # Regla 6 en cuarentena desde 2026-10-11: enforcement "disabled" en
+    # rules.json por PRECAUCION, NO por anti-edge medido — su evidencia es
+    # n_eff=2,7 sobre 159 filas solapadas (autocorr +0,97), que es ruido, y es
+    # toda de la era del gate viejo. Ver el `disabled_reason` de rules.json.
+    # Se sigue EVALUANDO y se publica el detalle, pero no decide el sesgo: una
+    # senal con apariencia de analisis sin base cuesta mas que no dar ninguna.
+    # Volver a "hard" exige n_eff >= min_n sobre el gate multi-venue.
+    r6_enforcement = _rule_enforcement(6)
     if r7_met:
         bias = "BULLISH"
-    elif r6_met:
+    elif r6_met and r6_enforcement != "disabled":
         bias = "BEARISH"
     else:
         bias = "NEUTRAL"
+    v["rule6"]["enforcement"] = r6_enforcement
+    v["rule6"]["counts_toward_bias"] = (r6_enforcement != "disabled")
+    if r6_met and r6_enforcement == "disabled":
+        v["rule6"]["note"] = (
+            "condiciones satisfechas pero la regla esta DESACTIVADA "
+            "(anti-edge medido 2026-10-11); no aporta al sesgo")
 
     total, parts, notes = scorecard(rows, imbalance, ema, tape_buy_pct,
                                     vol.get("volume_ratio"), sell_h, buy_h)
@@ -646,10 +930,20 @@ def build_verdict() -> dict:
     v["score_gate_conflict_detail"] = None
     if v["score_gate_conflict"]:
         if band != "NEUTRAL" and bias == "NEUTRAL":
+            # v2 (2026-10-11): el texto antiguo ("el scorecard mide el libro
+            # instantáneo y la puerta usa la EMA") ya no describe lo que pasa:
+            # el scorecard v2 usa la MISMA EMA que la puerta. Lo que queda es
+            # que el score promedia percentiles y la puerta exige las tres
+            # condiciones simultáneas, así que pueden discrepar sin que ninguno
+            # este equivocado. Ademas, si la unica regla que se satisfaria es la
+            # que esta en cuarentena, el conflicto es informativo, no un fallo.
+            _rs = v.get("rule7", {})
             v["score_gate_conflict_detail"] = (
-                f"el scorecard da {band} ({total}/100) pero ninguna regla "
-                f"direccional se satisface; el scorecard mide el libro instantáneo "
-                f"y la puerta usa la EMA")
+                f"el scorecard da {band} ({total}/100) pero la puerta no se abre: "
+                f"el score promedia percentiles de componentes, la puerta exige "
+                f"las 3 condiciones a la vez"
+                + (f"; la regla 6 esta DESACTIVADA (anti-edge medido)"
+                   if v.get("rule6", {}).get("enforcement") == "disabled" else ""))
         elif band == "NEUTRAL" and bias != "NEUTRAL":
             v["score_gate_conflict_detail"] = (
                 f"las reglas dicen {bias} pero el scorecard solo da {total}/100")
@@ -681,11 +975,11 @@ def _reason(v) -> str:
     if b == "BULLISH":
         return (f"Regla 7 satisfecha: CVD sube {RULE7['streak']}+ barras, "
                 f"{RULE7['levels_min']}+ niveles con >={FOOTPRINT_PCT:g}% compra, "
-                f"EMA > +{RULE7['dom_min']:g}%")
+                f"consenso de libro multi-venue comprador ({RULE7['vac_venues']} venues, |imb5|>{RULE7['vac_thr']:g}, {RULE7['vac_polls']} lecturas)")
     if b == "BEARISH":
         return (f"Regla 6 satisfecha: CVD cae {RULE6['streak']}+ barras, "
                 f"{RULE6['levels_min']}+ niveles con >={FOOTPRINT_PCT:g}% venta, "
-                f"EMA < +{RULE6['dom_max']:g}%")
+                f"consenso de libro multi-venue vendedor ({RULE6['vac_venues']} venues, |imb5|>{RULE6['vac_thr']:g}, {RULE6['vac_polls']} lecturas)")
     r6, r7 = v["rule6"], v["rule7"]
     miss6 = [k for k, s in r6["conditions"].items() if s != "MET"]
     miss7 = [k for k, s in r7["conditions"].items() if s != "MET"]
@@ -694,10 +988,18 @@ def _reason(v) -> str:
                 + ", ".join(v["unevaluable"])
                 + "). Una regla que no se puede evaluar no es una regla que no se cumple.")
     if v["score_gate_conflict"]:
+        # v2 (2026-10-11): el texto antiguo ("el scorecard mide el libro
+        # instantáneo y la puerta usa la EMA") ya no describe lo que pasa: el
+        # scorecard v2 usa la MISMA EMA que la puerta. Lo que queda es que el
+        # score promedia percentiles y la puerta exige las tres condiciones
+        # simultáneas.
+        _why = ("; la regla 6 esta DESACTIVADA (anti-edge medido)"
+                if r6.get("enforcement") == "disabled" else "")
         return (f"NEUTRAL: las reglas no disparan (regla 6 falla en {len(miss6)}, "
                 f"regla 7 falla en {len(miss7)}) aunque el scorecard da "
-                f"{v['scorecard']['score']}/100. El scorecard mide el libro "
-                f"instantáneo; la puerta usa la EMA. Conflicto declarado, no oculto.")
+                f"{v['scorecard']['score']}/100. El score promedia percentiles de "
+                f"componentes; la puerta exige las tres condiciones a la vez"
+                f"{_why}. Conflicto declarado, no oculto.")
     return "NEUTRAL: ninguna regla direccional satisface las tres condiciones."
 
 
@@ -784,7 +1086,10 @@ def render_text(v: dict) -> str:
     ]
     for rid, r in (("6", v["rule6"]), ("7", v["rule7"])):
         conds = ", ".join(f"{k.split('_')[0]}={s}" for k, s in r["conditions"].items())
-        lines.append(f"Regla {rid}: {'CUMPLE' if r['met'] else 'no cumple'} ({conds})")
+        # AT-: namespace de atas-bridge/rules.json (el scanner tiene sus
+        # propias reglas 1-4 con los mismos numeros — ver Fix 4 de
+        # docs/FIXES-gate-DOM.md).
+        lines.append(f"Regla AT-{rid}: {'CUMPLE' if r['met'] else 'no cumple'} ({conds})")
     if v.get("rule2", {}).get("applicable"):
         lines.append(f"Regla 2: {v['rule2']['note']}")
     if v.get("score_gate_conflict_detail"):
