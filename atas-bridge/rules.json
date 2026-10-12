@@ -43,29 +43,52 @@
     {
       "id": 6,
       "title": "Distribution Threshold",
-      "description": "ALL required: (a) CVD drops 2+ consecutive bars AND (b) footprint shows 4+ levels with >70% bid-side selling AND (c) DOM imbalance below +5%. Only then output bearish bias.",
-      "enforcement": "hard",
+      "description": "ALL required: (a) CVD drops 2+ consecutive bars AND (b) footprint shows 4+ levels with >=65% bid-side selling AND (c) multi-venue book consensus: 3+ venues with top-5 book loaded on the SELL side beyond band 0.25, held 2+ reader polls (scanner_multi_venue). Only then output bearish bias. NOTE: umbrales alineados con conditions{} el 2026-10-12; antes decian 70% y +5%.",
+      "enforcement": "disabled",
+      "disabled_reason": "SIN MEDICION UTILIZABLE — esto NO es anti-edge medido. La evidencia que la desactivo (159 disparos, hit 58,5% frente a base 66,5%) esta mal dimensionada: n=159 pero n_eff=2,7 (autocorr lag-1 +0,97 — el reader graba cada 30s y la regla persiste), asi que el error estandar es ~30 pp, no ~3,9 pp; la brecha de 8 pp son ~0,26 desviaciones, NO ~2. El auditor (reader/audit_atas.py) clasifica la celda INSUFFICIENT (n_eff < min_n), no DROP — y PLAN.md lo documenta asi. Ademas los 159 disparos son TODOS de la era del gate viejo (06/10 19:22 -> 07/10 19:34, condicion (c) por EMA del libro Binance): por el propio estandar de MEASUREMENT_VERSION v2 de audit_atas.py, esa es OTRA regla con el mismo numero. Se mantiene desactivada como PRECAUCION (sin evidencia a favor, una senal con apariencia de analisis es peor que ninguna), NO porque se haya medido anti-edge. Reactivar exige n_eff >= min_n sobre el gate multi-venue y walk-forward out-of-sample.",
       "conditions": {
         "cvd_consecutive_down_min": 2,
         "footprint_levels_min": 4,
         "footprint_sell_pct_min": 65,
-        "dom_imbalance_max": 3,
-        "dom_ema_field": "imbalance_pct_ema",
-        "dom_persistence_polls_min": 2
+        "dom_source": "scanner_multi_venue",
+        "dom_vac_venues_min": 3,
+        "dom_vac_polls_min": 2,
+        "dom_vac_thr": 0.25
+      },
+      "condition_c_note": "2026-10-11 Fix 2-A (docs/FIXES-gate-DOM.md): la condicion (c) deja de leer imbalance_pct_ema (libro Binance WS top-15, std 7.5, 19-23 cambios de estado/dia) y pasa a consenso multi-venue del scanner: N venues con book_imb_5 del lado sell mas alla de la banda, sostenido dom_vac_polls_min lecturas del reader. polls = lecturas del reader (~30s), no ciclos del scanner. UNEVALUABLE si el scanner no responde o hay menos de dom_vac_venues_min venues vivos.",
+      "dom_vac_calibration": {
+        "date": "2026-10-11",
+        "sample": "50 ciclos del scanner (~10 min), 8 pares x ~4 venues = 1470 valores de book_imb_5; 49 ciclos de XRP para la simulacion de estados",
+        "method": "thr al p58 de |imb5| (excursion por venue 61%); el touch de mejor nivel se DESCARTO como base del consenso: medido, es estructuralmente unilateral (mediana |x-0.5|=0.275) y desacoplado entre venues (consenso 3-de-4 en 0 de 480 ciclos)",
+        "consensus_freq": "3+/mismo lado en 19.1% de ciclos-pair a thr 0.25 (pooled)",
+        "simulated": "0 transiciones MET<->no-MET de la puerta en los 10 min muestreados, en TODO el rango de umbrales probados (el churn del gate viejo era entre estados no-MET)",
+        "acceptance_bar": "PRE-REGISTRADO (doc §7.1, antes de medir): N=10 transiciones MET<->no-MET por dia en r7_c/r6_c de reader.db. Verificar manana con: SELECT y contar cambios de estado; si N>10, el gate sigue sin servir y se vuelve a disenar",
+        "pending": "re-calibrar a 7 dias de datos cuando el ledger acumule"
       }
     },
     {
       "id": 7,
       "title": "Accumulation Threshold",
-      "description": "ALL required: (a) CVD rises 2+ consecutive bars AND (b) footprint shows 3+ levels with >70% ask-side buying AND (c) DOM imbalance > +10%. Only then output bullish bias.",
+      "description": "ALL required: (a) CVD rises 2+ consecutive bars AND (b) footprint shows 3+ levels with >=65% ask-side buying AND (c) multi-venue book consensus: 3+ venues with top-5 book loaded on the BUY side beyond band 0.25, held 2+ reader polls (scanner_multi_venue). Only then output bullish bias. NOTE: umbrales alineados con conditions{} el 2026-10-12; antes decian 70% y +10%.",
       "enforcement": "hard",
       "conditions": {
         "cvd_consecutive_up_min": 2,
         "footprint_levels_min": 3,
         "footprint_buy_pct_min": 65,
-        "dom_imbalance_min": 8,
-        "dom_ema_field": "imbalance_pct_ema",
-        "dom_persistence_polls_min": 2
+        "dom_source": "scanner_multi_venue",
+        "dom_vac_venues_min": 3,
+        "dom_vac_polls_min": 2,
+        "dom_vac_thr": 0.25
+      },
+      "condition_c_note": "2026-10-11 Fix 2-A (docs/FIXES-gate-DOM.md): la condicion (c) deja de leer imbalance_pct_ema (libro Binance WS top-15, std 7.5, 19-23 cambios de estado/dia) y pasa a consenso multi-venue del scanner: N venues con book_imb_5 del lado buy mas alla de la banda, sostenido dom_vac_polls_min lecturas del reader. polls = lecturas del reader (~30s), no ciclos del scanner. UNEVALUABLE si el scanner no responde o hay menos de dom_vac_venues_min venues vivos.",
+      "dom_vac_calibration": {
+        "date": "2026-10-11",
+        "sample": "50 ciclos del scanner (~10 min), 8 pares x ~4 venues = 1470 valores de book_imb_5; 49 ciclos de XRP para la simulacion de estados",
+        "method": "thr al p58 de |imb5| (excursion por venue 61%); el touch de mejor nivel se DESCARTO como base del consenso: medido, es estructuralmente unilateral (mediana |x-0.5|=0.275) y desacoplado entre venues (consenso 3-de-4 en 0 de 480 ciclos)",
+        "consensus_freq": "3+/mismo lado en 19.1% de ciclos-pair a thr 0.25 (pooled)",
+        "simulated": "0 transiciones MET<->no-MET de la puerta en los 10 min muestreados, en TODO el rango de umbrales probados (el churn del gate viejo era entre estados no-MET)",
+        "acceptance_bar": "PRE-REGISTRADO (doc §7.1, antes de medir): N=10 transiciones MET<->no-MET por dia en r7_c/r6_c de reader.db. Verificar manana con: SELECT y contar cambios de estado; si N>10, el gate sigue sin servir y se vuelve a disenar",
+        "pending": "re-calibrar a 7 dias de datos cuando el ledger acumule"
       }
     },
     {
@@ -76,11 +99,21 @@
     }
   ],
   "scoring_weights": {
+    "_comment_v341": "Pesos v3.4.1. MEDIDOS COMO ANTI-PREDICTIVOS: score alto a favor 34,0%, score bajo a favor 38,0% (spread -4,0) sobre 1.205 registros. No se usan: verdict.py puntua por percentil con scorecard_calibration.json.",
     "footprint_depth": 25,
     "dom_imbalance": 25,
     "tape_ratio": 20,
     "volume_climax": 15,
     "footprint_confirmation": 15
+  },
+  "scoring_weights_v2": {
+    "_method": "percentile-median. Cada componente se puntua por donde cae en su distribucion empirica (reader.db, n=1205) y se promedian los ranks. El score se centra solo: mediana ~48 si el mercado esta en su mediana.",
+    "_measured_spread": "dom_ema +27,3 | footprint_buy_heavy -17,3 (invertido) | footprint_sell_heavy +4,7. EXCLUIDOS por spread negativo o nulo: imbalance_pct -10,0 | volume_ratio -10,0 | tape_buy_pct +0,7 | levels -17,3.",
+    "_not_validated": "NO es un modelo validado. Split-half dentro de la misma ventana da 2 dias vs 2 dias del mismo dia: los componentes por separado fallan out-of-sample (-8,0 y -13,3) y solo la combinacion aguanta (+6,7). Firma de overfitting. Quita dano medido, no anade edge probado. Medir el spread sobre barras nuevas antes de llamarlo edge.",
+    "_generated_by": "reader/build_scorecard_calibration.py",
+    "dom_ema": 50,
+    "footprint_sell_heavy": 25,
+    "footprint_buy_heavy_inv": 25
   },
   "trigger_weights": {
     "taker_flow": 3.0,
@@ -92,5 +125,7 @@
     "ls_ratio_crowding": 1.5
   },
   "version": "3.4.1",
-  "changelog": "3.4.1 (2026-10-07): Parameter adjustments for Rules 2, 6, 7. spike_multiple 2.0->1.5, dom_imbalance_max 5->3, dom_imbalance_min 10->8, footprint thresholds 70->65, dom_persistence_polls_min 3->2. Enhanced sensitivity without changing rule structure."
+  "changelog": "3.4.1 (2026-10-07): Parameter adjustments for Rules 2, 6, 7. spike_multiple 2.0->1.5, dom_imbalance_max 5->3, dom_imbalance_min 10->8, footprint thresholds 70->65, dom_persistence_polls_min 3->2. Enhanced sensitivity without changing rule structure.",
+  "namespace": "atas",
+  "namespace_note": "Namespace de reglas. EXISTEN DOS rules.json EN ESTE REPO con IDs numericos que se solapan (atas-bridge: reglas 1-8 de CVD/footprint/DOM; scanner-engine: reglas 1-4 de flujo cross-venue). Citar una regla sin su namespace es citar el numero equivocado. Ver docs/FIXES-gate-DOM.md Fix 4."
 }
