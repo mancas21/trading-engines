@@ -46,24 +46,38 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 STATE = HERE / "notify_state.json"
-ENV = ROOT / "quant-alert-engine" / ".env"
 
-# Sesgos que son "direccionales". NEUTRAL es la ausencia de dirección, y un
-# retorno a NEUTRAL cuenta como evento porque cambia lo que debe hacer alguien.
-DIRECTIONAL = ("BULLISH", "BEARISH")
+# 2026-10-11 — DESACOPLADO de quant-alert-engine. Antes las credenciales de
+# Telegram se leian de QAE/.env, lo que ataba el notificador a esa carpeta. El
+# puente tiene su propio .env con TELEGRAM_TOKEN/TELEGRAM_CHAT_ID, asi que se
+# lee ahi. `load_env` acepta ambas grafias (con y sin doble underscore) para
+# que siga funcionando si alguien reintroduce una de las dos.
+_ENV_CANDIDATES = (
+    ROOT / "atas-bridge" / ".env",      # preferido: el puente es quien notifica
+    HERE / ".env",
+    ROOT / "quant-alert-engine" / ".env",  # ultimo recurso
+)
 
 
 def load_env() -> dict:
-    """Lee .env del motor. NUNCA lo escribe ni lo imprime."""
-    out = {}
-    if ENV.exists():
-        for line in ENV.read_text(encoding="utf-8", errors="replace").splitlines():
+    """Lee el primer .env disponible. NUNCA lo escribe ni lo imprime."""
+    out: dict = {}
+    for env_path in _ENV_CANDIDATES:
+        if not env_path.exists():
+            continue
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, _, v = line.partition("=")
             out[k.strip()] = v.strip().strip("'\"")
+        if out:
+            break
     return out
+
+# Sesgos que son "direccionales". NEUTRAL es la ausencia de dirección, y un
+# retorno a NEUTRAL cuenta como evento porque cambia lo que debe hacer alguien.
+DIRECTIONAL = ("BULLISH", "BEARISH")
 
 
 def telegram_creds():
@@ -137,8 +151,6 @@ def compose(r: dict) -> str:
     which = "Regla 6" if bias == "BEARISH" else "Regla 7"
     L.append("")
     L.append(f"{which} satisfecha: las 3 condiciones.")
-    if v.get("score_gate_conflict_detail"):
-        L.append(f"conflicto: {v['score_gate_conflict_detail']}")
     if v.get("rule2", {}).get("applicable"):
         L.append(f"Regla 2: {v['rule2']['note']}")
     if not v.get("cvd_clean", True):

@@ -199,26 +199,32 @@ def read_live():
     else:
         bias = "NEUTRAL"
 
-    # ── Scorecard: SEPARADO de la puerta, nunca la sustituye ──
+    # ── SCORECARD: ELIMINADO (2026-10-13) ──
     #
-    # UNA SOLA implementacion: verdict.scorecard(). Este modulo tenia su PROPIA
-    # copia del scorecard v3.4.1, y por eso reader.db guardaba el score
-    # ANTI-PREDICTIVO mientras rules.json declaraba por escrito que no se usa
-    # ("No se usan: verdict.py puntua por percentil con
-    # scorecard_calibration.json") y mientras verdict.py ya puntuaba por
-    # percentil. Habia TRES copias de la misma formula — aqui, en
-    # verdict.py:_scorecard_v341 y en build_scorecard_calibration.py:140-148 —
-    # y tres copias garantizan que una diverge. Medido el 2026-10-11: mismo
-    # instante, v3.4.1 daba 54/NEUTRAL y v2 daba 79,8/BULLISH; 26 puntos y un
-    # cambio de banda.
+    # Antes se llamaba verdict.scorecard() y se guardaba score/score_parts.
+    # Se quito por medicion, no por gusto:
     #
-    # OJO: verificado en vivo que verdict.scorecard() funciona con la MISMA
-    # calibracion que el resto del sistema (scorecard_calibration.json, 7 dias
-    # de caducidad). Si falta o no es legible, verdict.py cae al v3.4.1 y lo
-    # avisa por stdout — el fallback sigue existiendo, pero en UN solo sitio.
-    vr = vol.get("volume_ratio")
-    score, parts, _score_notes = verdict.scorecard(
-        rows, imbalance, ema_v, tape_buy_pct, vr, sell_h, buy_h)
+    #   pearson(score, forward_return)  = +0.0175   (ruido)
+    #   spearman(score, forward_return) = -0.0156
+    #   tercil alto: winrate 32.8%, retorno medio -0.392%   <- el "mejor" score PERDIA MAS
+    #   tercil bajo: winrate 37.9%, retorno medio -0.382%
+    #
+    #   y el componente de peso 50 (dom_ema = imbalance_pct_ema, el libro
+    #   Binance que se RETIRO del gate por ruidoso) tenia spread +27.3pp sobre
+    #   top150/bottom150 — pero con autocorr de forward_return rho=+0.995 eso
+    #   son ~1 observacion independiente, z=0.35, NO significativo. Es el mismo
+    #   error de muestra solapada que inhabilita la regla 6.
+    #
+    # Conclusion: el score no ordenaba, no predice, y su calibracion no tiene
+    # respaldo estadistico. Publicarlo daba apariencia de informacion.
+    #
+    # Las columnas score/score_parts de reader.db se CONSERVAN con su historico
+    # (1.205 filas medidas) para que la evidencia de esta decision siga siendo
+    # auditable; las filas nuevas las dejan en NULL.
+    #
+    # El sesgo NUNCA dependio del score: sale de `if r7_ok / elif r6_ok / else`.
+    # Esto no cambia ningun veredicto, quita un numero que no significaba nada.
+    score, parts = None, None
 
     rec = {
         "ts": time.time(),
@@ -238,7 +244,7 @@ def read_live():
         "imbalance_pct_ema": ema_v,
         "imbalance_ema_n": dom.get("imbalance_pct_ema_n"),
         "tape_buy_pct": tape_buy_pct,
-        "volume_ratio": vr,
+        "volume_ratio": vol.get("volume_ratio"),
         "cvd": cvd_state.get("cvd"),
         "cvd_bars": cvd_state.get("bars"),
         "cvd_streak_up": up,
@@ -320,7 +326,7 @@ def do_record(c) -> int:
               (str(rec["ts"]),))
     c.commit()
     print(f"  recorded {rec['symbol']} bar#{rec['bar_index']} bias={rec['bias']} "
-          f"score={rec['score']} r6={rec['r6_met']} r7={rec['r7_met']}")
+          f"r6={rec['r6_met']} r7={rec['r7_met']}")
     return 1
 
 

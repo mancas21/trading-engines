@@ -39,7 +39,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 BRIDGE = "http://127.0.0.1:8000"
-ENGINE = "http://127.0.0.1:8081"
+# 2026-10-11: ENGINE (:8081, Quant Alert Engine) eliminado de este modulo.
+# QAE es manual-only y no es fuente de nada. src_macro() va a CoinGecko directo.
 CDP = "http://127.0.0.1:9222"
 TV_SCRIPT = ROOT / "tradingview-bridge" / "tv_live.mjs"
 STALE_S = 300.0
@@ -149,9 +150,15 @@ def src_tradingview() -> dict:
     return kv
 
 
-# ── Fuente 3: Binance (precio 24h + breadth) ──
-def src_binance() -> dict:
-    out = {"ok": False}
+# ── Fuente 3: precios 24h (CoinGecko) + breadth (el DOM del bridge) ──
+#
+# La fuente se llamaba `src_binance` y el render decía "BINANCE 24h", pero el
+# endpoint era CoinGecko desde siempre. En un pipeline cuya regla central es
+# que cada dato dice de dónde viene, una etiqueta que nombra un venue que NO
+# sirvió el dato es el mismo defecto que un valor imputado — se corrige el
+# nombre, no la proveniencia.
+def src_prices_24h() -> dict:
+    out = {"ok": False, "source": "coingecko"}
     try:
         with urllib.request.urlopen(
                 "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ripple,solana"
@@ -174,26 +181,38 @@ def src_binance() -> dict:
 
 # ── Fuente 4: Macro (contexto, vía el motor) ──
 def src_macro() -> dict:
-    h = _json(f"{ENGINE}/health")
-    if h.get("_error"):
-        return {"ok": False, "error": h["_error"]}
-    mc = (h.get("checks", {}).get("macro_context", {}) or {}).get("metrics", {}) or {}
-    return {"ok": bool(h.get("status")),
-            "engine_status": h.get("status"),
-            "web_fresh": mc.get("web_fresh"), "web_eligible": mc.get("web_eligible"),
-            "symbols_cached": mc.get("symbols_cached")}
+    """Macro REST directo. 2026-10-11: ya no consulta QAE (:8081).
+
+    QAE paso a modo manual, asi que leer su /health no es una fuente de datos
+    sino una medida de si el usuario abrio una app. Se sustituyo por
+    CoinGecko directo, que es la unica pieza de macro que el pipeline de QAE
+    aportaba y que se puede leer sin el.
+    """
+    try:
+        d = _json("https://api.coingecko.com/api/v3/simple/price"
+                  "?ids=ripple,bitcoin,ethereum&vs_currencies=usd"
+                  "&include_24hr_change=true&include_24hr_vol=true", timeout=15.0)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:80]}"}
+    if d.get("_error"):
+        return {"ok": False, "error": d["_error"]}
+    rows = {k: {"usd": (v or {}).get("usd"),
+                "change_24h": (v or {}).get("usd_24h_change"),
+                "vol_24h": (v or {}).get("usd_24h_vol")}
+            for k, v in d.items() if isinstance(v, dict)}
+    return {"ok": bool(rows), "source": "coingecko", "coins": rows}
 
 
 def read_all() -> dict:
     t0 = time.time()
     atas = src_atas()
     tv = src_tradingview()
-    bn = src_binance()
+    px = src_prices_24h()
     mc = src_macro()
     present = [n for n, s in (("atas", atas), ("tradingview", tv),
-                              ("binance", bn), ("macro", mc)) if s.get("ok")]
+                              ("prices_24h", px), ("macro", mc)) if s.get("ok")]
     missing = [n for n, s in (("atas", atas), ("tradingview", tv),
-                              ("binance", bn), ("macro", mc)) if not s.get("ok")]
+                              ("prices_24h", px), ("macro", mc)) if not s.get("ok")]
     v = (atas.get("verdict") or {})
     # Si el veredicto se emitió sobre un símbolo que NO es el objetivo, no es
     # el veredicto pedido. Se marca en vez de colarse.
@@ -203,9 +222,9 @@ def read_all() -> dict:
         "sources_present": present, "sources_missing": missing,
         "complete": not missing,
         "scope_ok": scope_ok,
-        "bias": v.get("bias"), "score": (v.get("scorecard") or {}).get("score"),
+        "bias": v.get("bias"),
         "probability": v.get("probability"),
-        "atas": atas, "tradingview": tv, "binance": bn, "macro": mc,
+        "atas": atas, "tradingview": tv, "prices_24h": px, "macro": mc,
     }
 
 
@@ -246,11 +265,14 @@ def render(r: dict) -> str:
     else:
         L.append(f"TRADINGVIEW: NO DISPONIBLE — {tv.get('error')}")
     L.append("")
-    bn = r["binance"]
+    bn = r["prices_24h"]
     if bn.get("prices"):
         px = " ".join(f"{k.upper()} ${v.get('usd')}({v.get('usd_24h_change',0):+.2f}%)"
                       for k, v in bn["prices"].items())
-        L.append(f"BINANCE 24h: {px}")
+        # La fuente real es CoinGecko; la etiqueta lo dice. (Decía "BINANCE 24h"
+        # mientras el endpoint era coingecko — una etiqueta que miente sobre su
+        # proveniencia es el defecto que este módulo existe para evitar.)
+        L.append(f"24H ({bn.get('source', 'coingecko')}): {px}")
     if bn.get("breadth"):
         L.append(f"  breadth: {bn['negative']}/{bn['total']} símbolos con imbalance negativo")
     if bn.get("price_error"):
@@ -258,9 +280,9 @@ def render(r: dict) -> str:
     mc = r["macro"]
     L.append("")
     if mc.get("ok"):
-        L.append(f"MACRO: motor {mc.get('engine_status')}  web_fresh "
-                 f"{mc.get('web_fresh')}/{mc.get('web_eligible')}  "
-                 f"symbols {mc.get('symbols_cached')}")
+        px = "  ".join(f"{k.upper()} ${v.get('usd')}({v.get('change_24h',0):+.2f}%)"
+                       for k, v in mc.get("coins", {}).items())
+        L.append(f"MACRO (coingecko directo): {px}")
     else:
         L.append(f"MACRO: NO DISPONIBLE — {mc.get('error')}")
     return "\n".join(L)

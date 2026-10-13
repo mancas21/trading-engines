@@ -608,7 +608,25 @@ def classify_footprint(top_levels, sell_pct=None, buy_pct=None):
 
 
 def scorecard(rows, imbalance, ema, tape_buy_pct, volume_ratio, sell_h, buy_h):
-    """Scorecard 0-100 SIN CONDICIONES. Esto ORDENA; no es una predicción.
+    """RETIRADO (2026-10-13). No llamar. Se conserva solo para poder reproducir
+    la medicion que la retiro; ninguna ruta de produccion la usa.
+
+    MEDICION que la retiro (sobre 1.205 filas de reader.db con forward_return):
+
+      pearson(score, forward_return)  = +0.0175
+      spearman(score, forward_return) = -0.0156
+      tercil alto (el "mejor" score): winrate 32.8%, retorno medio -0.392%
+      tercil bajo                    : winrate 37.9%, retorno medio -0.382%
+
+    El score no correlaciona con el retorno y su tercil alto perdia MAS que el
+    bajo. Ademas el componente de peso 50 (dom_ema = imbalance_pct_ema, el libro
+    Binance retirado del gate) media un spread de +27.3pp sobre top150/bottom150
+    que con autocorr rho=+0.995 equivale a ~1 observacion independiente
+    (z=0.35, no significativo): la calibracion no tenia respaldo.
+
+    El sesgo nunca dependio de esto: sale de `if r7_ok / elif r6_ok / else`.
+
+    Scorecard 0-100 SIN CONDICIONES. Esto ORDENA; no es una predicción.
 
     v2 (2026-10-11): si existe scorecard_calibration.json, puntúa POR PERCENTIL
     sobre la distribución empírica de cada componente y promedia los ranks. Así
@@ -918,35 +936,27 @@ def build_verdict() -> dict:
             "condiciones satisfechas pero la regla esta DESACTIVADA "
             "(anti-edge medido 2026-10-11); no aporta al sesgo")
 
-    total, parts, notes = scorecard(rows, imbalance, ema, tape_buy_pct,
-                                    vol.get("volume_ratio"), sell_h, buy_h)
-    band = ("BULLISH" if total >= SCORE_BANDS["bullish_min"] else
-            "BEARISH" if total <= SCORE_BANDS["bearish_max"] else "NEUTRAL")
-    v["scorecard"] = {"score": total, "parts": parts, "notes": notes, "band": band}
+    # ── SCORECARD RETIRADO (2026-10-13) ──
+    # Antes se calculaba aqui y se publicaba v["scorecard"] + v["score_gate_conflict"].
+    # Retirado por medicion sobre 1.205 filas de reader.db con forward_return:
+    #
+    #   pearson(score, forward_return)  = +0.0175     (ruido)
+    #   spearman(score, forward_return) = -0.0156
+    #   tercil alto ("mejor" score): winrate 32.8%, retorno medio -0.392%
+    #   tercil bajo                : winrate 37.9%, retorno medio -0.382%
+    #
+    # No correlaciona con el retorno y el tercil alto perdia MAS que el bajo. El
+    # componente de peso 50 (dom_ema = imbalance_pct_ema, el libro Binance que se
+    # retiro del gate) media spread +27.3pp sobre top150/bottom150, que con
+    # autocorr rho=+0.995 son ~1 observacion independiente (z=0.35): la
+    # calibracion no tenia respaldo estadistico.
+    #
+    # Se eliminan tambien `score_gate_conflict` y su detalle: comparaban el
+    # veredicto de la puerta contra un numero sin poder predictivo, asi que el
+    # "conflicto" que reportaban era ruido, no una senal de desacuerdo real.
+    #
+    # El sesgo no cambia: sigue saliendo de if r7_ok / elif r6_ok / else.
     v["bias"] = bias
-    # Conflicto = el band del score NO coincide con el veredicto de la puerta.
-    # "NEUTRAL vs NEUTRAL" no es conflicto; "NEUTRAL vs BULLISH" sí lo es.
-    v["score_gate_conflict"] = (band != bias)
-    v["score_gate_conflict_detail"] = None
-    if v["score_gate_conflict"]:
-        if band != "NEUTRAL" and bias == "NEUTRAL":
-            # v2 (2026-10-11): el texto antiguo ("el scorecard mide el libro
-            # instantáneo y la puerta usa la EMA") ya no describe lo que pasa:
-            # el scorecard v2 usa la MISMA EMA que la puerta. Lo que queda es
-            # que el score promedia percentiles y la puerta exige las tres
-            # condiciones simultáneas, así que pueden discrepar sin que ninguno
-            # este equivocado. Ademas, si la unica regla que se satisfaria es la
-            # que esta en cuarentena, el conflicto es informativo, no un fallo.
-            _rs = v.get("rule7", {})
-            v["score_gate_conflict_detail"] = (
-                f"el scorecard da {band} ({total}/100) pero la puerta no se abre: "
-                f"el score promedia percentiles de componentes, la puerta exige "
-                f"las 3 condiciones a la vez"
-                + (f"; la regla 6 esta DESACTIVADA (anti-edge medido)"
-                   if v.get("rule6", {}).get("enforcement") == "disabled" else ""))
-        elif band == "NEUTRAL" and bias != "NEUTRAL":
-            v["score_gate_conflict_detail"] = (
-                f"las reglas dicen {bias} pero el scorecard solo da {total}/100")
     v["unevaluable"] = unev
     v["probability"] = "unvalidated"
     # ── COBERTURA DE REGLAS, generada desde rules.json ────────────────────────
@@ -987,20 +997,13 @@ def _reason(v) -> str:
         return ("NEUTRAL forzado: hay condiciones UNEVALUABLES ("
                 + ", ".join(v["unevaluable"])
                 + "). Una regla que no se puede evaluar no es una regla que no se cumple.")
-    if v["score_gate_conflict"]:
-        # v2 (2026-10-11): el texto antiguo ("el scorecard mide el libro
-        # instantáneo y la puerta usa la EMA") ya no describe lo que pasa: el
-        # scorecard v2 usa la MISMA EMA que la puerta. Lo que queda es que el
-        # score promedia percentiles y la puerta exige las tres condiciones
-        # simultáneas.
-        _why = ("; la regla 6 esta DESACTIVADA (anti-edge medido)"
-                if r6.get("enforcement") == "disabled" else "")
-        return (f"NEUTRAL: las reglas no disparan (regla 6 falla en {len(miss6)}, "
-                f"regla 7 falla en {len(miss7)}) aunque el scorecard da "
-                f"{v['scorecard']['score']}/100. El score promedia percentiles de "
-                f"componentes; la puerta exige las tres condiciones a la vez"
-                f"{_why}. Conflicto declarado, no oculto.")
-    return "NEUTRAL: ninguna regla direccional satisface las tres condiciones."
+    # El ramal "aunque el scorecard da N/100" se retiro con el scorecard
+    # (2026-10-13): citaba un numero medido sin poder predictivo, asi que
+    # adornaba la explicacion con precision falsa.
+    _r6note = ("; la regla 6 esta DESACTIVADA (evidencia insuficiente, "
+               "n_eff=2.7)" if r6.get("enforcement") == "disabled" else "")
+    return (f"NEUTRAL: las reglas no disparan (regla 6 falla en {len(miss6)}, "
+            f"regla 7 falla en {len(miss7)}){_r6note}.")
 
 
 # ── Regla 8: Audit On Loss ──────────────────────────────────────────────
@@ -1058,8 +1061,7 @@ def render_text(v: dict) -> str:
     d = v.get("dom") or {}
     c = v.get("cvd") or {}
     lines = [
-        f"{v['bias']}  score {v['scorecard']['score']}/100  "
-        f"probability: {v['probability']}",
+        f"{v['bias']}  probability: {v['probability']}",
         f"{v['symbol']}  px {v.get('price_last')}  barra #{v.get('bar_index')} "
         f"({v.get('bar_time')})  edad {v.get('src_age_s')}s",
         f"EMA {d.get('imbalance_pct_ema')}% (n={d.get('ema_n')}) vs "
@@ -1092,8 +1094,6 @@ def render_text(v: dict) -> str:
         lines.append(f"Regla AT-{rid}: {'CUMPLE' if r['met'] else 'no cumple'} ({conds})")
     if v.get("rule2", {}).get("applicable"):
         lines.append(f"Regla 2: {v['rule2']['note']}")
-    if v.get("score_gate_conflict_detail"):
-        lines.append("CONFLICTO score/puerta: " + v["score_gate_conflict_detail"])
     lines.append(v["reason"])
     return "\n".join(lines)
 
