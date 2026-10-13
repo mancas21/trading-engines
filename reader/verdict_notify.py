@@ -125,7 +125,13 @@ def compose(r: dict) -> str:
     """Mensaje corto. Un veredicto que necesita un párrafo no es accionable."""
     v = (r["atas"].get("verdict") or {})
     bias = r["bias"]
-    score = r["score"]
+    # 2026-10-13: el scorecard se RETIRO (commit a93147f, medido sin poder
+    # predictivo: pearson +0.0175, y el tercil alto perdia MAS que el bajo).
+    # El grabador dejo de guardar 'score', pero este modulo seguia leyendolo
+    # con r["score"] -- KeyError en cuanto el sesgo fuera direccional, que es
+    # justo cuando el mensaje importa. Se lee con .get: la ausencia de score
+    # ya no es un dato que este modulo necesite.
+    score = r.get("score")
     d = v.get("dom") or {}
     c = v.get("cvd") or {}
     fp = v.get("footprint") or {}
@@ -140,7 +146,9 @@ def compose(r: dict) -> str:
         head = f"{bias} {arrow}"
 
     L = [head, ""]
-    L.append(f"{sym}  px {v.get('price_last')}  score {score}/100")
+    # El scorecard se retiro (a93147f): no se publica score. Publicarlo seria
+    # dar precision aparente sobre un numero que se demostro no predecir.
+    L.append(f"{sym}  px {v.get('price_last')}")
     L.append(f"EMA {d.get('imbalance_pct_ema')}% (n={d.get('ema_n')}) "
              f"vs instantaneo {d.get('imbalance_pct')}%")
     L.append(f"footprint {fp.get('sell_heavy')} venta>70% / "
@@ -205,7 +213,7 @@ def do_once(dry: bool = False) -> int:
     if ok:
         st = load_state()
         sym = (r["atas"].get("verdict") or {}).get("symbol") or "?"
-        st[sym] = {"bias": r["bias"], "score": r["score"],
+        st[sym] = {"bias": r["bias"],
                    "sent_at": time.time(),
                    "sent_iso": datetime.now().isoformat(),
                    "prev": dec["prev"]}

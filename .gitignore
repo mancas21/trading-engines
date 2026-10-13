@@ -18,6 +18,9 @@ build/
 obj/
 bin/
 *.user
+# Visual Studio's build cache under the exporter (dtbcache.v2 etc.): same
+# disease as obj/ — machine-local, modified on every build.
+.vs/
 
 # Runtime / logs / data (regenerable or machine-local)
 *.log
@@ -75,3 +78,23 @@ scanner-engine/data/
 scanner-engine/*.db
 scanner-engine/scanner.db
 scanner-engine/tests/_ssl_*.py
+
+# 2026-10-13 — estado de RUNTIME del reader. Estos tres los escribe el proceso
+# en cada ciclo y son machine-local: lock de instancia, fingerprint de la
+# medicion de las reglas 6/7 y contador de racha del gate multi-venue.
+# Versionarlos haria que cada commit los traiga con el estado de otra
+# maquina, que es justo lo que un lock de instancia no debe hacer.
+reader/reader_supervisor.lock
+reader/audit_atas_state.json
+reader/dom_gate_state.json
+
+# 2026-10-13 — scripts de diagnostico de una sesion concreta. Se conservan
+# porque documentan COMO se midio lo que motivo la cuarentena de la regla 6
+# (n_eff=2.7), pero no son parte del motor.
+reader/_diag_rule8.py
+
+# 2026-10-13 — artefactos del scorecard RETIRADO en a93147f. Se conservan
+# como medida historica reproducible (build_scorecard_calibration.py genero
+# el .json), pero ninguna ruta de produccion los carga: verdict.py ya no
+# llama a scorecard() y la carga de _CAL es codigo muerto.
+reader/scorecard_calibration.json
