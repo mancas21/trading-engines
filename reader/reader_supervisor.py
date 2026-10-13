@@ -259,13 +259,44 @@ def cycle(dry_run: bool = False) -> tuple[bool, str]:
     st["last_cycle_iso"] = datetime.now().isoformat()
 
     rc_r, out_r = run_child(RECORDER, ["record"], timeout=90)
+
+    # 2026-10-13 — BUG QUE HACIA FALTA EL RESOLVER.
+    #
+    # El ciclo ejecutaba UN solo hijo: verdict_recorder.py record. Graba el
+    # veredicto, pero `record` NO resuelve nada: resolve es un subcomando
+    # aparte (verdict_recorder.py do_resolve). Nadie lo llamaba. Medido:
+    #
+    #     2026-10-07   1003 filas   1003 resueltas (100,0%)
+    #     2026-10-11     87 filas      0 resueltas (  0,0%)
+    #     2026-10-12    285 filas      0 resueltas (  0,0%)
+    #     2026-10-13    903 filas      0 resueltas (  0,0%)
+    #
+    # Las 1.205 filas resueltas son exactamente las anteriores al 11-oct: el
+    # resolver se dejo de lanzar ese dia y nadie lo noto porque el grabador
+    # seguia dando rc=0 y el supervisor logueaba "recorded ... bias=NEUTRAL"
+    # como si todo fuera bien.
+    #
+    # Por que importa mas de lo que parece: forward_return es lo unico que
+    # convierte un veredicto en evidencia. Sin el, desde el 11-oct el motor
+    # acumula filas que nadie puede medir, y TODA calibracion futura — la
+    # regla 6 incluida — se hace sobre las 1.205 antigas o no se hace.
+    #
+    # Se resuelve antes de notificar: notificar un veredicto cuyo resultado ya
+    # se conoce evita el "sesgo sin cambio" sobre una fila que si cambia.
+    rc_v = 0
+    out_v = "no-op"
+    if rc_r == 0:
+        rc_v, out_v = run_child(RECORDER, ["resolve"], timeout=120)
+        st["resolver_rc"] = rc_v
+        st["resolver_tail"] = out_v.strip().splitlines()[-1] if out_v.strip() else ""
+    else:
+        st["resolver_rc"] = None
+        st["resolver_tail"] = "no se resuelve: record fallo"
     st["recorder_rc"] = rc_r
     st["recorder_tail"] = out_r.strip().splitlines()[-1] if out_r.strip() else ""
 
     # El notificador solo se evalua si el grabador registro algo justo antes:
     # notificar sin dato nuevo es re-notificar el mismo veredicto.
-    #
-    # nuevo es re-notificar el mismo veredicto.
     #
     # BUG QUE CASI SE ENTREGA: esto llamaba al notificador con --dry-run, asi
     # que NUNCA enviaba nada y la Fase 4 entera era decoracion — el mismo fallo

@@ -44,7 +44,7 @@ Lo que se conserva es lo que funcionó. Lo que se elimina es lo que no.
    TradingView (estructura) ─┤
    Binance (precio/taker/ libro) ─┼──►  LECTOR ÚNICO  ──►  VEREDICTO
    Macro / breadth ─────┘         │      (live-only)        (reglas 6/7)
-                                   │                         + scorecard
+                                   │
                                    └──►  registro de evidencia
 ```
 
@@ -74,8 +74,10 @@ sin gates que“自调”, sin auto-confianza.
 ### Fase 3 — Motor de veredictos (reglas.json como salida principal)
 - **Entregable:** `reader/verdict.py`
   - Evalúa Reglas 6 y 7 primero (son la puerta).
-  - Scorecard 0–100 **separado** de la puerta.
-  - Sesgo = puerta. Si la puerta no dispara → NEUTRAL, aunque el score diga 65.
+  - ~~Scorecard 0–100 separado de la puerta~~ — **retirado 2026-10-13**: medido sin
+    poder predictivo (pearson +0,0175; el tercil alto perdía más que el bajo). El sesgo
+    sale únicamente de la puerta.
+  - Sesgo = puerta. Si la puerta no dispara → NEUTRAL.
   - `probability: unvalidated` siempre que no exista hit rate validado.
   - Tabla de footprint con `bid_pct` calculado (regla 6 cuenta >70%, regla 7 <30%).
 - **Aceptación:** reproduce el veredicto de las 21:48 (Rule 6 = MET) desde el log, sin intervención manual.

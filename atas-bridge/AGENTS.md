@@ -62,10 +62,18 @@ Bridge (FastAPI on :8000)
 ALL quant analyses MUST follow the 9 hard rules in `rules.json`. Key rules:
 - **Rule 1:** No directional call from a single bar — wait 2+ bars of confirmation
 - **Rule 2:** CVD spike >2x prior ATH in one bar = exhaustion — flag, never call continuation
-- **Rule 4:** Must output signal scorecard (0-100). Bias >= 60 bullish, <= 40 bearish, else neutral
-- **Rule 6:** Distribution requires ALL: CVD drops 2+ consecutive bars + 4 levels 70%+ selling + DOM < +5%
-- **Rule 7:** Accumulation requires ALL: CVD rises 2+ consecutive bars + 3 levels 70%+ buying + DOM > +10%
-- **Rule 10:** DELETED 2026-09-17 (audit C-1 action 1) — score ranks only, never gates plans.
+- **Rule 4:** **RETIRADA 2026-10-13 (commit a93147f).** Exigía un scorecard 0-100 que se
+  midió sin poder predictivo: pearson +0,0175 con `forward_return`, y el tercil alto
+  ("mejor score") ganaba 32,8% frente al 37,9% del bajo. El sesgo sale únicamente de
+  las reglas 6/7. Si alguien la reactiva, **no** reutilice el spread de +27,3pp que se
+  midió: con autocorrelación rho=+0.995 equivale a ~1 observación independiente (z=0.35).
+- **Rule 6:** Distribution requiere las 3: CVD cae 2+ barras + footprint + **consenso
+  multi-venue del scanner** (`:8090`, túnel al VPS). Con el túnel caído es UNEVALUABLE
+  y, al ser AND estricto, ninguna regla puede dispararse.
+- **Rule 7:** Accumulation, igual que la 6 con el lado comprador. Hoy `enforcement:
+  hard`.
+- **Rule 6 (estado):** `enforcement: disabled` — evidencia insuficiente (n_eff=2,7), no
+  anti-edge probado. Se sigue evaluando y publicando; no cuenta para el sesgo.
 
 Every trade plan delivered in analysis MUST be logged via `POST /calls` (outcome tracking). This builds the validated track record.
 

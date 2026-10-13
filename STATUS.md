@@ -13,7 +13,7 @@ Las seis fases de `PLAN_REDESIGN.md` están ejecutadas. Resumen del estado final
 
 | Fichero | Rol |
 |---|---|
-| `verdict.py` | Motor de veredictos. Reglas 6/7/2/4 como salida principal; el scorecard ordena, no predice. |
+| `verdict.py` | Motor de veredictos. Reglas 6/7/2 como salida principal. El scorecard 0-100 se **retiró** el 2026-10-13 (medido sin poder predictivo); el sesgo sale solo de las reglas. Requiere el túnel al scanner del VPS (`:8090`) para el gate multi-venue. |
 | `live_reader.py` | Las 4 fuentes en un punto de entrada. Una fuente ausente **se declara**, nunca se imputa. |
 | `verdict_recorder.py` | Graba cada veredicto en SQLite, resuelve el retorno futuro con fill en el OPEN de la barra siguiente. |
 | `verdict_notify.py` | Telegram **solo al cambiar de sesgo**. 12 lecturas simuladas → 6 mensajes, los 6 reales. |

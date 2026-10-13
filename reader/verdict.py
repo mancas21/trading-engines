@@ -350,32 +350,7 @@ SCORE_BANDS = {"bullish_min": 60, "bearish_max": 40}
 WEIGHTS = {"footprint_depth": 25, "dom_imbalance": 25, "tape_ratio": 20,
            "volume_climax": 15, "footprint_confirmation": 15}
 
-# ── SCORECARD v2 (2026-10-11) ─────────────────────────────────────────────────
-# POR QUE CAMBIA: el scorecard v3.4.1 es ANTI-PREDICTIVO. Medido sobre sus
-# propios 1.205 registros (reader.db, resueltos; forward_return YA viene con
-# signo aplicado en quant_alert_engine.py:2375, no hay que invertirlo otra vez):
-#
-#     scorecard actual:  score alto a favor 34,0%   score bajo a favor 38,0%
-#                       SPREAD  −4,0   <- puntua al reves
-#
-# Spread util medido por componente (top vs bottom octil):
-#     imbalance_pct_ema    +27,3   <- unico que separa de verdad
-#     footprint_buy_heavy  -17,3   <- invertido; pesaba CON signo equivocado
-#     footprint_sell_heavy  +4,7
-#     imbalance_pct        -10,0   <- excluido
-#     volume_ratio         -10,0   <- excluido
-#     tape_buy_pct          +0,7   <- excluido (ruido)
-#     levels               -17,3   <- excluido
-#
-# La mediana se quedaba en 58 (justo bajo el umbral de 60) por aritmetica: los
-# pesos sumaban evidencia con el signo equivocado.
-#
-# QUE NO ES ESTO: un modelo validado. La muestra es 1 simbolo, 25 h y un solo
-# regimen. Un split-half dentro de esa ventana da 2 dias contra 2 dias del
-# MISMO dia, que no es out-of-sample real; los componentes por separado fallan
-# out-of-sample (-8,0 y -13,3) y solo la combinacion aguanta (+6,7), firma de
-# overfitting. Esto QUITA dano medido, no ANADE edge probado. La validacion de
-# verdad es medir el spread sobre barras nuevas.
+
 def _rule_enforcement(rule_id: int) -> str:
     """'hard' | 'soft' | 'disabled', leido de rules.json. Default 'hard'.
 
@@ -386,33 +361,43 @@ def _rule_enforcement(rule_id: int) -> str:
     return _load_rule_conditions(rule_id).get("_enforcement", "hard")
 
 
-_CALIB_PATH = os.path.join(HERE, "scorecard_calibration.json")
-_CALIB_MAX_AGE_DAYS = 7.0     # una calibracion de 25h de muestra envejece rapido
-try:
-    import json as _json_mod
-    from datetime import datetime as _dt
-    with open(_CALIB_PATH, "r", encoding="utf-8") as _fh:
-        _CAL = _json_mod.load(_fh)
-    # STALENESS: la calibracion se midio sobre una ventana corta (span declarado
-    # en el propio fichero). Un percentil contra una distribucion de hace
-    # semanas no describe el regimen actual, y el scorecard no avisa — parece
-    # calibrado y no lo esta.
-    _cal_ts = None
-    try:
-        _cal_ts = _dt.fromisoformat(str(_CAL.get("generated_at")))
-    except Exception:  # noqa: BLE001
-        _cal_ts = None
-    if _cal_ts is not None:
-        _cal_age_days = (time.time() - _cal_ts.timestamp()) / 86400.0
-        if _cal_age_days > _CALIB_MAX_AGE_DAYS:
-            print(f"[verdict] AVISO: scorecard_calibration.json tiene "
-                  f"{_cal_age_days:.0f} dias (> {_CALIB_MAX_AGE_DAYS:.0f}); "
-                  f"regenera con build_scorecard_calibration.py — los "
-                  f"percentiles pueden no describir el regimen actual.")
-except Exception as _e:  # noqa: BLE001
-    _CAL = None
-    print(f"[verdict] AVISO: scorecard_calibration.json no legible ({_e}); "
-          f"se usa el scorecard v3.4.1 (anti-predictivo, spread -4,0 medido).")
+# El v2 del scorecard se reprodujo inyectando la calibracion aqui. Antes se
+# cargaba desde disco al importar el modulo, lo que hacia que este motor
+# leyera un .json en cada arranque aunque no lo fuera a usar nunca: una
+# dependencia de runtime sobre una medicion retirada.
+_CAL_OVERRIDE = None
+
+
+# ── SCORECARD: RETIRADO DE PRODUCCION (2026-10-13, commit a93147f) ──────────
+# MEDICION sobre 1.205 filas de reader.db con forward_return resuelto:
+#
+#   pearson(score, forward_return)  = +0.0175    (ruido)
+#   spearman(score, forward_return) = -0.0156
+#   tercil alto ("mejor" score): winrate 32,8%, retorno medio -0.392%
+#   tercil bajo               : winrate 37,9%, retorno medio -0.382%
+#
+# El "mejor" score ganaba MENOS y perdia MAS que el peor. El componente de
+# peso 50 (dom_ema) media spread +27,3pp sobre top150/bottom150, pero con
+# autocorrelacion de forward_return rho=+0.995 eso equivale a ~1 observacion
+# independiente (z=0.35): la calibracion no tenia respaldo estadistico.
+#
+# QUEDE ESTE CODIGO, POR QUE
+# =========================
+# _CAL, _percentile_rank(), _scorecard_percentile(), _scorecard_v341() y
+# scorecard() NO los llama ninguna ruta de produccion: build_verdict() dejo de
+# publicar v["scorecard"] y v["score_gate_conflict"]. Se conservan para poder
+# REPRODUCIR la medicion que lo retiro -- incluido el v2 percentile-median que
+# se construyo el 2026-10-11 sobre los mismos 1.205 registros, y que sufrio la
+# misma falta de respaldo al ser medido sobre la misma muestra autocorrelada.
+#
+# Mover scorecard_calibration.json a reader/build_scorecard_calibration.py y
+# ejecutar ese script reconstruye la calibracion completa. Despues:
+#   verdict._CAL_OVERRIDE = json.load(open("calib_features.json"))
+#   verdict.scorecard(None, None, ema, None, None, sell_h, buy_h)
+#
+# SI ALGUIEN REACTIVA EL SCORECARD: no reutilices el spread +27,3pp de esta
+# cabecera como evidencia. Con rho=+0.995 no es un spread de 1.205
+# observaciones, es aproximadamente una. Ver LINT en verdict.py.
 
 
 def _get(path: str, timeout: float = 25.0):
@@ -626,20 +611,20 @@ def scorecard(rows, imbalance, ema, tape_buy_pct, volume_ratio, sell_h, buy_h):
 
     El sesgo nunca dependio de esto: sale de `if r7_ok / elif r6_ok / else`.
 
-    Scorecard 0-100 SIN CONDICIONES. Esto ORDENA; no es una predicción.
+    NINGUNA RUTA DE PRODUCCION LLAMA A ESTA FUNCION. Se conserva unicamente
+    para reproducir la medicion que retiro el scorecard.
 
-    v2 (2026-10-11): si existe scorecard_calibration.json, puntúa POR PERCENTIL
-    sobre la distribución empírica de cada componente y promedia los ranks. Así
-    el score se centra solo (~50 si el mercado está en su mediana) y los extremos
-    son alcanzables, cosa que el v3.4.1 no lograba: su mediana se quedaba en 58
-    con un rango intercuartil de 17 puntos, y su spread medido era -4,0
-    (anti-predictivo).
-
-    Sin calibración cae al v3.4.1. Se conserva como fallback por si el JSON
-    falta, no porque sea bueno.
+    El v2 percentile-median (2026-10-11) tambien esta aqui, pero comparte el
+    mismo problema que se corrigio arriba: se calibro sobre los MISMOS 1.205
+    registros autocorrelacionados. Que "se centrara solo" y "?spread +36pp?"
+    no lo convierte en valido.
     """
-    if _CAL:
-        return _scorecard_percentile(ema, sell_h, buy_h)
+    # Sin _CAL (retirado del import en el mismo commit que esta nota) la
+    # reproduccion del v2 requiere cargarlo a mano:
+    #   import json; verdict._CAL = json.load(open(CAL_PATH))
+    cal = _CAL_OVERRIDE
+    if cal:
+        return _scorecard_percentile(cal, ema, sell_h, buy_h)
     return _scorecard_v341(rows, imbalance, ema, tape_buy_pct, volume_ratio,
                            sell_h, buy_h)
 
@@ -652,9 +637,9 @@ def _percentile_rank(values, x):
     return _bs.bisect_left(values, float(x)) / len(values) * 100.0
 
 
-def _scorecard_percentile(ema, sell_h, buy_h):
-    dists = _CAL.get("distributions", {})
-    weights = _CAL.get("weights", {})
+def _scorecard_percentile(cal, ema, sell_h, buy_h):
+    dists = cal.get("distributions", {})
+    weights = cal.get("weights", {})
     raw = {
         "dom_ema": ema,
         "footprint_sell_heavy": sell_h,
@@ -673,16 +658,17 @@ def _scorecard_percentile(ema, sell_h, buy_h):
         total += pr * w
         wsum += w
     score = round(total / wsum, 1) if wsum else 50.0
-    ev = _CAL.get("evidence", {})
+    ev = cal.get("evidence", {})
     notes["_useful_spread"] = {k: ev[k]["useful_spread"] for k in parts if k in ev}
-    notes["_method"] = "percentile-median (v2)"
-    notes["_calib_sample"] = _CAL.get("sample_size")
+    notes["_method"] = "percentile-median (v2) — RETIRADO, ver nota de cabecera"
+    notes["_calib_sample"] = cal.get("sample_size")
+    notes["_WARNING"] = ("calibrado sobre la misma muestra autocorrelada que la "
+                         "medicion que retiro el scorecard (rho=+0.995)")
     return score, parts, notes
 
 
 def _scorecard_v341(rows, imbalance, ema, tape_buy_pct, volume_ratio, sell_h, buy_h):
-    """v3.4.1 original. MEDIDO COMO ANTI-PREDICTIVO (spread -4,0 medido).
-    Solo fallback si falta scorecard_calibration.json."""
+    """v3.4.1 original. MEDIDO COMO ANTI-PREDICTIVO (spread -4,0 medido)."""
     parts, notes = {}, {}
 
     parts["footprint_depth"] = min(WEIGHTS["footprint_depth"], 3 * len(rows))
