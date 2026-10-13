@@ -9,10 +9,13 @@ INSUFFICIENT DATA forever.
 
 WHAT THIS DELIBERATELY DOES NOT DO
 ==================================
-* It does not pick a direction. No rule has been audited, so no rule may name
-  a side. Every row it writes carries direction 0 and is therefore excluded
-  from the expectancy math. That is correct, not broken — it becomes non-zero
-  only when `rules.json` marks a rule audited with a side.
+* It does not pick a direction for the VERDICT ledger. A rule that has not
+  been audited may not name a side that downstream acts on. What it DOES do is
+  write a PROVISIONAL side on the CANDIDATE ledger (`direction` from the
+  firing rule's `direction_hint`, `candidate=1`) so the auditor can measure
+  whether that rule has an edge. Candidate rows enter expectancy math; they
+  cannot suppress, alert or gate. The verdict ledger stays direction=0 until
+  `rules.json` marks a rule audited (`outcomes.promoted_direction`).
 
 * It does not decide a verdict is "good". It records what the rules said and
   what was UNEVALUABLE, and lets the auditor decide.
@@ -40,12 +43,16 @@ sys.path.insert(0, str(HERE))
 import features as F          # noqa: E402
 import pairs as P            # noqa: E402
 import outcomes as OUT       # noqa: E402
+import promotion as PROM     # noqa: E402  (the retirement half of the loop)
 import recorder as RC        # noqa: E402
 import rules_eval as RE      # noqa: E402
 from poller import Poller    # noqa: E402
 
 DEFAULT_POLL_S = 15.0
 DEFAULT_MAX_AGE_S = 300.0
+
+# Venue used for a pair's fill and exit when the registry has no opinion.
+DEFAULT_REF_VENUE = "binance"
 
 # Forward horizon defined in MINUTES, then converted to bars per pair.
 #
@@ -55,7 +62,12 @@ DEFAULT_MAX_AGE_S = 300.0
 # per-signal-type; a 12-bar horizon on a 1m bar is 12 minutes and on a 1h bar
 # is 12 hours"), and this module must not reproduce it in a subtler form.
 HORIZON_MINUTES = 5.0
-BAR_MINUTES = {"1m": 1.0, "5m": 5.0}
+# Derived from `outcomes.BAR_MS` so the two tables cannot drift: BAR_MS is what
+# the resolver multiplies horizon_bars by, so this map must cover the same bar
+# sizes. A literal dict here went stale the moment a bar size existed in one
+# and not the other — a 15m pair would have silently gotten horizon 5 bars of
+# 15m (75 min) while the resolver measured 75 min but the intent was 5.
+BAR_MINUTES = {k: v / 60_000.0 for k, v in OUT.BAR_MS.items()}
 
 
 def horizon_for(pair: str) -> int:
@@ -83,6 +95,20 @@ def _min_venues_for(pair: str) -> int:
         return 3
 
 
+def _ref_venue(pair: str) -> str:
+    """The venue whose price this pair is measured on — fill AND exit.
+
+    Falls back to Binance for an unconfigured pair, matching the registry
+    default. A loop that crashes on an unknown pair loses the cycle; a loop
+    that names a default keeps running and the pair stays visible as
+    unregistered.
+    """
+    try:
+        return P.ref_venue_for(pair)
+    except KeyError:
+        return DEFAULT_REF_VENUE
+
+
 class Scanner:
     def __init__(self, pairs: list[str] | None = None, db_path: str = ":memory:",
                  rules: dict | None = None, poll_interval_s: float = DEFAULT_POLL_S,
@@ -103,6 +129,23 @@ class Scanner:
         self.rows_unscorable = 0
         self.resolver_errors = 0
         self.last_resolver_error = ""
+
+        # Cross-cycle memory for rules 1-3. Without it three of the four rules
+        # could never reach MET — conditions about persistence and about a
+        # pair's own trailing baseline cannot be asked from one snapshot.
+        self.history = RE.RuleHistory()
+        # the tape-quality floors rules.json actually implies, so a declared
+        # threshold is binding rather than decorative
+        self.coverage_floor = RE.coverage_floor(self.rules)
+        self.trade_floor = RE.trade_floor(self.rules)
+        # rules the auditor measured into DROP: they keep firing as
+        # observations (rules_met stays truthful) but stop producing
+        # candidates, so they leave the expectancy math and the Bonferroni
+        # count. Computed once at startup; a retirement written to rules.json
+        # takes effect on the next scanner restart, like a promotion.
+        self._retired = {rid for rid, spec in
+                         (self.rules.get("rules") or {}).items()
+                         if PROM.is_retired(spec)}
 
         for pair in self.pairs:
             self.poller.set_min_venues(pair, _min_venues_for(pair))
@@ -135,7 +178,9 @@ class Scanner:
                         if w is not None:
                             tape = {"delta_ratio": w.delta_ratio,
                                     "coverage_s": w.coverage_s,
-                                    "n_trades": w.n_trades}
+                                    "n_trades": w.n_trades,
+                                    # the effort-vs-result leg rule 2 needs
+                                    "price_delta_bps": w.price_delta_bps}
                     except Exception:                      # noqa: BLE001
                         tape = None
                 return book, tape
@@ -151,12 +196,13 @@ class Scanner:
     def _install_bar_fetchers(self) -> None:
         """Bar fetcher for outcome resolution, built once.
 
-        Resolution uses ONE venue per pair — the deepest one available — rather
-        than polling all four. A forward return is a price move, and four
-        venues' prices for the same instant is not four independent
-        observations; it is one observation measured four times, and averaging
-        it would understate the real spread. Binance is the default because it
-        has the deepest book on 6 of the 8 pairs.
+        Resolution uses ONE venue per pair — the pair's REFERENCE venue, the
+        same one the fill was taken from. Four venues' prices for the same
+        instant is not four independent observations; it is one observation
+        measured four times. Worse, mixing venues is not merely noisy, it is
+        WRONG: filling at a cross-venue weighted mid and exiting at one venue's
+        close measures that venue's basis rather than the signal. See
+        `recorder.py` defect 4 for the measured cost of doing it the other way.
         """
         import venues.binance as bn
         import venues.okx as okx
@@ -196,35 +242,64 @@ class Scanner:
         for pair in self.pairs:
             snaps = self.poller.live_pairs(pair)
             feat = F.compute({v: {"book": s.get("book"), "tape": s.get("tape")}
-                              for v, s in snaps.items()})
+                              for v, s in snaps.items()},
+                             min_coverage_s=self.coverage_floor,
+                             min_trades=self.trade_floor)
             self.features[pair] = feat
 
-            v = RE.evaluate(feat, pair, _min_venues_for(pair), self.rules)
+            # Snapshot BEFORE observing: rule 1's persistence condition is about
+            # what happened on the PREVIOUS cycle.
+            hist = self.history.snapshot(pair)
+            v = RE.evaluate(feat, pair, _min_venues_for(pair), self.rules,
+                            history=hist)
             self.verdicts[pair] = v
+            self.history.observe(pair, feat,
+                                 z_threshold=self._z_threshold("1"))
 
             met = [rid for rid, r in v.rules.items() if r.state == RE.MET]
             unev = [rid for rid, r in v.rules.items() if r.state == RE.UNEVALUABLE]
+            # The loop-closing half of promotion: rules the auditor measured
+            # into DROP stop producing candidates. They stay in rules_met (the
+            # ledger records what actually fired) but no longer enter
+            # expectancy math, so they stop consuming Bonferroni cells and
+            # batch slots. UNVALIDATED rules keep producing candidates — that
+            # is how a hypothesis earns its first measurement.
+            live_met = [rid for rid in met if rid not in self._retired]
 
             # CANDIDATE side: a hypothesis under test, from the firing rule's
             # own direction_hint. It enters expectancy math so the auditor can
             # measure whether the rule has an edge. It CANNOT suppress, alert
             # or gate -- only an AUDITED rule reaches the verdict ledger.
-            cand_dir = OUT.hint_direction(self.rules, _flow_by_rule(feat, met))
+            cand_dir = OUT.hint_direction(self.rules, _flow_by_rule(feat, live_met))
             # VERDICT side: what downstream may act on. Zero unless every
             # fired rule has been promoted by the auditor.
             verdict_dir = OUT.promoted_direction(
-                self.rules, met, _flow_by_rule(feat, met))
+                self.rules, live_met, _flow_by_rule(feat, live_met))
 
-            RC.record_verdict(
+            fill = self._fill_for(pair, snaps, feat)
+
+            # DECISION-POINT LEDGER: one row per (pair, exit window), not one
+            # per poll. ~25 consecutive polls share a single exit window; each
+            # used to become its own row and the auditor had to repair the
+            # overlap with an effective-sample-size correction. The upsert
+            # keeps the window's FIRST row (its ts is the decision's birth)
+            # and refreshes the state fields on every later poll, so the row
+            # the resolver scores carries the freshest reading taken before
+            # the exit bar closed.
+            RC.upsert_verdict(
                 self.db, pair=pair, ts=v.ts,
-                direction=cand_dir if met else verdict_dir,
-                forward_return=None,
+                direction=cand_dir if live_met else verdict_dir,
                 horizon_bars=horizon_for(pair),
-                fill_price=_mid(snaps),
+                exit_window_ms=self._exit_window_ms(pair, v.ts),
+                fill_price=fill["price"],
                 venues_live=v.n_venues,
                 rules_met=met, rules_unevaluable=unev,
                 score=v.score,
-                candidate=bool(met),
+                candidate=bool(live_met),
+                ref_venue=fill["venue"],
+                fill_spread_bps=fill["spread_bps"],
+                cross_basis_bps=fill["cross_basis_bps"],
+                price_basis_ok=fill["ok"],
             )
 
         # close out rows whose horizon bar has now closed
@@ -238,6 +313,44 @@ class Scanner:
     def _fetch_one(self, fn, pair: str):
         book, tape = fn(pair)
         return {"pair": pair, "book": book, "tape": tape, "ts": time.time()}
+
+    def _fill_for(self, pair: str, snaps: dict, feat) -> dict:
+        """The recorded fill: ONE venue's mid, on the pair's REFERENCE venue.
+
+        This replaces a depth-weighted mid across every live venue, which was
+        the single most damaging defect in the engine.
+
+        Depth-weighting across venues makes the fill price a function of which
+        venue happens to quote the largest number, not of where the pair
+        trades. Measured: OKX quotes ~287,000 units of XAU depth against
+        Binance's ~7, so the XAU "fill" was 99.99% the OKX price while the exit
+        was Binance's close. OKX gold sits ~30bps above Binance, and every one
+        of 599 XAU rows resolved to the same ~-30bps with a 1.65bps standard
+        deviation — the auditor read that constant offset as the one
+        statistically significant loser in the book.
+
+        `cross_basis_bps` is still recorded. The dispersion is real information
+        and rule 1 is built on it; it just must not be used as a price.
+        """
+        venue = _ref_venue(pair)
+        book = (snaps.get(venue) or {}).get("book")
+        if book is None:
+            return {"price": None, "venue": venue, "spread_bps": None,
+                    "cross_basis_bps": feat.basis_dispersion_bps, "ok": False}
+        return {
+            "price": book.mid,
+            "venue": venue,
+            "spread_bps": book.spread_bps,
+            "cross_basis_bps": feat.basis_dispersion_bps,
+            "ok": True,
+        }
+
+    def _z_threshold(self, rule_id: str) -> float:
+        spec = (self.rules.get("rules") or {}).get(rule_id) or {}
+        try:
+            return float(spec["thresholds"]["z_threshold"])
+        except (KeyError, TypeError, ValueError):
+            return 6.0
 
     def resolve_pending(self) -> int:
         """Close out rows whose horizon bar has now closed.
@@ -273,28 +386,40 @@ class Scanner:
         except KeyError:
             return 60_000
 
+    def _exit_window_ms(self, pair: str, ts: float) -> int:
+        """The decision-window dedup key: first bar close at or after
+        ts+horizon, in epoch ms.
+
+        MUST stay identical to the resolver's exit selection —
+        `outcomes.select_exit_bar` picks the first venue-bar close >= at_ms,
+        and venue bar closes are aligned to bar_ms multiples, so ceil() to the
+        bar grid IS that selection. If this key and the realized exit ever
+        disagree, the dedup would merge rows that resolve differently.
+        """
+        bar_ms = self._bar_ms_for(pair)
+        at_ms = int(ts * 1000) + horizon_for(pair) * bar_ms
+        return ((at_ms + bar_ms - 1) // bar_ms) * bar_ms
+
     def _fetch_horizon_bar(self, pair: str, at_ms: int):
         """The CLOSED bar covering `at_ms`, in the pair's own bar size.
 
-        Tries the pair's venues in depth order and returns the first that
-        answers. A venue that cannot serve the pair is skipped silently — that
-        is a fact about the venue, not an error to log on every row.
+        ONLY the pair's reference venue is consulted — the same venue the fill
+        was recorded from. Falling back to another venue here would silently
+        reintroduce the fill/exit basis mismatch that produced the XAU artifact,
+        so a reference venue that cannot serve the bar yields None and the row
+        retires unscorable. Losing a measurement beats measuring the wrong one.
         """
         try:
             bar = P.bar_for(pair)
         except KeyError:
             bar = "1m"
-        for venue in P.venues_for(pair):
-            fn = self._bar_fetch.get(venue)
-            if fn is None:
-                continue
-            try:
-                got = fn(pair, bar, at_ms)
-            except Exception:                              # noqa: BLE001
-                continue
-            if got is not None:
-                return got
-        return None
+        fn = self._bar_fetch.get(_ref_venue(pair))
+        if fn is None:
+            return None
+        try:
+            return fn(pair, bar, at_ms)
+        except Exception:                                  # noqa: BLE001
+            return None
 
     # ── surfaces ───────────────────────────────────────────────────────────
 
@@ -311,6 +436,12 @@ class Scanner:
             "rows_unscorable": self.rows_unscorable,
             "resolver_errors": self.resolver_errors,
             "last_resolver_error": self.last_resolver_error,
+            # the price every fill and exit is measured on. If this is not the
+            # venue the resolver scores against, expectancy is measuring a
+            # venue spread and every number downstream is meaningless.
+            "reference_venues": {p: _ref_venue(p) for p in self.pairs},
+            "tape_coverage_floor_s": self.coverage_floor,
+            "tape_trade_floor": self.trade_floor,
             # Compare on PREFIX, not equality: rule 1's audit_status reads
                         # "UNVALIDATED - no recorded outcomes yet. Phase 4's auditor
                         # decides whether it survives." An exact `!= "UNVALIDATED"` check
@@ -322,6 +453,8 @@ class Scanner:
                             if not str(s.get("audit_status", "UNVALIDATED"))
                                  .upper().startswith("UNVALIDATED")
                         ],
+                        # reglas medidas a DROP: observadas, no candidatas
+                        "retired_rules": sorted(self._retired),
         })
         return h
 
@@ -350,6 +483,53 @@ class Scanner:
             return v.to_dict() if v else {"error": f"no verdict for {pair}"}
         return {"rank": self.rank(),
                 "verdicts": {p: v.to_dict() for p, v in self.verdicts.items()}}
+
+    def features_payload(self, pair: str | None = None) -> dict:
+        """RAW per-venue features for live pairs — the contract surface for
+        consumers that need the numbers, not the verdict (the ATAS rules 6/7
+        gate, docs/FIXES-gate-DOM.md Fix 2-A, and any future regime
+        conditioning). Only LIVE snapshots are exposed: a frozen venue is
+        absent, never zero — the same rule the poller enforces upstream.
+
+        `book_imb_5` is the top-5 BOOK imbalance per venue,
+        (bid5 - ask5) / (bid5 + ask5) in [-1, 1] — the same cumulative
+        construction as the ATAS/Binance DOM numbers, per venue. The
+        touch_imbalance (best level only) is published alongside but is NOT
+        gate material: measured 2026-10-11, it is structurally one-sided
+        (median |x-0.5| = 0.275) and uncorrelated across venues — 3-of-4
+        same-side consensus happened 0 times in 480 cycles. Consensus lives
+        in the accumulated book, not in the touch.
+        """
+        out = {}
+        pairs = [pair] if pair else self.pairs
+        for p in pairs:
+            snaps = self.poller.live_pairs(p)
+            feat = self.features.get(p)
+            if not snaps or feat is None:
+                out[p] = {"live": False}
+                continue
+            imb5 = {}
+            for v, s in snaps.items():
+                b = s.get("book")
+                if b is None:
+                    continue
+                d_bid, d_ask = b.depth_within(5)
+                tot = d_bid + d_ask
+                if tot > 0:
+                    imb5[v] = (d_bid - d_ask) / tot
+            out[p] = {
+                "live": True,
+                "n_venues": feat.n_venues,
+                "touch_imbalance": {v: s.get("book").touch_imbalance
+                                    for v, s in snaps.items()
+                                    if s.get("book") is not None},
+                "book_imb_5": imb5,
+                "spread_bps": dict(feat.spread_bps),
+                "flow_by_venue": dict(feat.flow_by_venue),
+                "depth_total": dict(feat.depth_total),
+                "ts": max((s.get("ts", 0) for s in snaps.values()), default=0),
+            }
+        return out
 
     # ── the loop ───────────────────────────────────────────────────────────
 
@@ -382,16 +562,6 @@ def _coverage_for(pairs: list[str]) -> dict:
     return cov
 
 
-def _direction(v: RE.Verdict) -> int:
-    """direction from the verdict. Neutral -> 0, which the auditor excludes.
-    Only an audited rule can ever move this off 0."""
-    if v.direction == "bullish":
-        return 1
-    if v.direction == "bearish":
-        return -1
-    return 0
-
-
 def _flow_by_rule(feat, met: list[str]) -> dict[str, float]:
     """The flow each fired rule is asserting, as a delta_ratio in [0,1].
 
@@ -412,21 +582,6 @@ def _flow_by_rule(feat, met: list[str]) -> dict[str, float]:
         for rid in met:
             out[rid] = med
     return out
-
-
-def _mid(snaps: dict) -> float | None:
-    """Depth-weighted cross-venue mid, for the recorded fill price."""
-    mids, weights = [], []
-    for s in snaps.values():
-        b = s.get("book")
-        if b is None:
-            continue
-        mids.append(b.mid)
-        weights.append(b.depth_within(5)[0] + b.depth_within(5)[1])
-    if not mids:
-        return None
-    tw = sum(weights) or float(len(mids))
-    return sum(m * w for m, w in zip(mids, weights)) / tw
 
 
 def _serve(sc: Scanner, port: int) -> None:
@@ -453,6 +608,9 @@ def _serve(sc: Scanner, port: int) -> None:
             elif u.path == "/verdict":
                 q = parse_qs(u.query)
                 body = sc.verdict_json(q.get("pair", [None])[0])
+            elif u.path == "/features":
+                q = parse_qs(u.query)
+                body = sc.features_payload(q.get("pair", [None])[0])
             else:
                 self.send_error(404, "unknown endpoint")
                 return

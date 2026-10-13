@@ -22,7 +22,15 @@ def _snap(venue, book, ts=None, tape=None):
             "tape": tape}
 
 
-def _tape(delta_ratio, coverage=50.0, n=40):
+def _tape(delta_ratio, coverage=50.0, n=120):
+    """A tape that has already cleared the quality gate.
+
+    The default was n=40, which is below `features.DEFAULT_MIN_TRADES` (50).
+    Any tape that reaches the flow-divergence computation has by definition
+    passed the trade-count gate, so a fixture with 40 trades described a state
+    the code can no longer produce. These tests are about the divergence math,
+    not the gate; the gate has its own tests.
+    """
     return {"delta_ratio": delta_ratio, "coverage_s": coverage, "n_trades": n}
 
 

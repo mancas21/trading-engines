@@ -62,11 +62,21 @@
         "z_threshold": 6.0,
         "persist_cycles": 2
       },
+      "history_note": "Condition (b) needs cross-cycle memory. `scanner.Scanner` now owns a `RuleHistory` and passes `history=` into `evaluate()`; before that it passed nothing, so this rule could never reach MET no matter what the data said.",
       "rationale": "The signal ATAS structurally cannot produce: it sees one venue. A venue trading materially away from the others while its own book is not simply wider is a real dislocation or a stale quote, and persistence separates the two.",
-      "audit_status": "UNVALIDATED - no recorded outcomes yet. Phase 4's auditor decides whether it survives.",
+      "audit_status": "DROP refuted n=314 n_eff=192.4 t=-11.45 mean=-0.001173",
       "direction_hint": {
         "side": null,
         "claim": "NONE. A venue trading away from the others identifies a venue, not a direction. This rule stays observation-only until a directional claim can be justified; the auditor reporting 'no directional edge' is a legitimate result."
+      },
+      "measured": {
+        "n": 314,
+        "n_eff": 192.4,
+        "t": -11.446027098725857,
+        "mean": -0.0011727923887983782,
+        "hit_rate": 0.12738853503184713,
+        "hit_gross": 0.49363057324840764,
+        "hz_med_s": 334.3470094203949
       }
     },
     "2": {
@@ -79,13 +89,25 @@
       },
       "thresholds": {
         "flow_gap": 0.35,
-        "min_coverage_s": 20.0
+        "min_coverage_s": 5.0,
+        "min_trades": 50,
+        "max_price_response_bps": 5.0
       },
       "rationale": "A venue showing large buying that the others do not, with price failing to respond, is absorption. Volume without price movement is the observable form.",
-      "audit_status": "UNVALIDATED",
+      "absorption_note": "max_price_response_bps is the effort-vs-result leg: the deviating venue's own price may move this much over the flow window and still count as 'did not respond'. It is read from this spec by the evaluator, not hardcoded. Condition (b) was previously a hard-coded UNEVALUABLE with the note 'price-response window not recorded yet', which made this rule structurally impossible to fire for the life of the engine.",
+      "audit_status": "DROP refuted n=327 n_eff=282.5 t=-14.53 mean=-0.001181",
       "direction_hint": {
         "side": "follow",
         "claim": "when one venue's tape diverges from the others while its price does NOT respond, the move follows the OTHER venues' direction (the absorbing venue's flow is absorbed, not acted on)."
+      },
+      "measured": {
+        "n": 327,
+        "n_eff": 282.5,
+        "t": -14.526862106590158,
+        "mean": -0.0011813443537301085,
+        "hit_rate": 0.1437308868501529,
+        "hit_gross": 0.4892966360856269,
+        "hz_med_s": 341.3129053115845
       }
     },
     "3": {
@@ -102,6 +124,7 @@
         "depth_z": -1.5
       },
       "requires_three_venues": true,
+      "depth_history_note": "Condition (b) compares today's top-N depth against this PAIR's own trailing median, which requires at least 20 cycles of history before the dispersion is usable. Until then the condition reports UNEVALUABLE, not UNMET.",
       "three_venue_note": "UNEVALUABLE for SPCX/USD and NVDA/USD, which list on 3 venues. This rule MUST declare UNEVALUABLE for them rather than silently evaluating on 2 — a 2-venue reading of a 3-venue condition is a different, weaker claim.",
       "rationale": "Top-of-book depletion across venues at once is a liquidity event; on a single venue it is indistinguishable from that venue's own microstructure. Measured venue spreads differ by up to 100x, so condition (b) compares against the pair's own trailing depth median rather than an absolute.",
       "audit_status": "UNVALIDATED",
@@ -121,9 +144,11 @@
       "thresholds": {
         "agree_venues": 3,
         "flow_strength": 0.25,
-        "min_coverage_s": 30.0
+        "min_coverage_s": 5.0,
+        "min_trades": 50
       },
       "requires_three_venues": true,
+      "tape_quality_note": "min_coverage_s was 30.0. It was never enforced by any code path, so nobody noticed it was unachievable: measured 2026-10-11, OKX's trades endpoint caps at 500 trades (~5.8s of a 60s window) and Bybit reaches ~27s even at 1000 trades. Enforcing the declared value at 30s made rule 4 permanently UNEVALUABLE. It is now 5.0s, which every venue meets, and min_trades=50 carries the real precision guarantee: a delta_ratio from fewer trades than that can only take the values 0, 1/n, 2/n... and is not a measurement. Kraken returns as few as 4 trades over 25s on thin pairs, which a span-only gate would have happily accepted.",
       "rationale": "Aggressor flow agreeing across independent venues is the one cross-venue reading that cannot be faked by a single venue's stale quote or washed book. Requires 3 venues so a 2-venue agreement (which two correlated books can fake) is not enough.",
       "audit_status": "UNVALIDATED",
       "direction_hint": {
@@ -155,5 +180,7 @@
     "candidate_ledger": "rows where candidate=1 -- carries a provisional side from direction_hint, enters expectancy math, CANNOT suppress, alert, or gate",
     "verdict_ledger": "rows where candidate=0 -- direction stays 0 until the firing rule is AUDITED; downstream reads only this",
     "never": "do not promote on the first favourable read; do not lower min_n or min_t to force a conclusion; do not infer a side from a rule's name"
-  }
+  },
+  "namespace": "scanner",
+  "namespace_note": "Namespace de reglas. EXISTEN DOS rules.json EN ESTE REPO con IDs numericos que se solapan (atas-bridge: reglas 1-8 de CVD/footprint/DOM; scanner-engine: reglas 1-4 de flujo cross-venue). Citar una regla sin su namespace es citar el numero equivocado. Ver docs/FIXES-gate-DOM.md Fix 4."
 }

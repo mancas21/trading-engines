@@ -1,6 +1,17 @@
 # The blocker: no rule can ever acquire a direction
 
-**Status: measured on the running engine, 2026-10-10.**
+**Status: RESOLVED 2026-10-11.** All six steps below are implemented. What
+followed was a measurement-integrity audit that invalidated the corpus the
+blocker fix had been collecting into — see `README.md`, "Measurement integrity".
+
+The circular dependency in Gap 2 is gone: `outcomes.hint_direction` gives a
+candidate row a provisional side, `expectancy.by_rule` measures the candidate
+ledger, and `promotion.promotion_report` decides what is earned.
+
+What replaced the blocker is quieter and arguably worse: the engine was
+measuring a rule it could not honestly measure. A direction the auditor could
+not earn was not the binding constraint; a fill venue that was not the exit
+venue was.
 
 ## What the data says
 

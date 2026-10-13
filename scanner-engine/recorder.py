@@ -22,6 +22,25 @@ engine so they cannot recur here.
    from it invents a signal and a forward return that never happened — the
    standard way a backtest manufactures edge that does not exist.
 
+4. THE FILL VENUE MUST BE THE EXIT VENUE.
+   A forward return is a price move *on one venue*. Recording the fill as a
+   depth-weighted mid across venues and then scoring it against a single
+   venue's bar close silently measures the cross-venue spread, not the signal.
+
+   This was measured, not theorised. XAU's recorded fill was ~99.99% OKX
+   (OKX quotes depth ~287k units against Binance's ~7), while the exit was
+   Binance's close. OKX gold sat ~30bps above Binance, so every XAU row
+   resolved to a near-identical negative return:
+
+       XAU/USD  n=599  raw mean -0.003029 (-30.3 bps)  sd 0.000165
+                negative in 599 of 599 rows
+
+   599/599 the same sign with ~1.6bps of variance is not a distribution, it is
+   a constant offset. The auditor reported it as the one pair with a
+   significant loser (t=-2.80). `price_basis_ok` is the exclusion: rows whose
+   fill venue is not knowable are retained but never enter expectancy math,
+   exactly like `direction = 0`.
+
 `horizon_bars` is per row, never global. A 12-bar horizon on a 1m bar is 12
 minutes and on a 1h bar is 12 hours; a single global value makes expectancy
 incomparable across timeframes, which was a documented flaw upstream.
@@ -34,10 +53,23 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 
+# A row may only enter expectancy math if its fill venue is known AND the
+# writer asserted the basis was sound. Requiring `ref_venue IS NOT NULL` as
+# well is deliberate: `price_basis_ok` has a DEFAULT of 1, so any writer that
+# predates the column — including an OLD `scanner.py` still running in memory
+# during a rolling upgrade — inserts rows that claim a trustworthy basis while
+# recording no venue at all. Deriving the gate from the evidence rather than
+# from the writer's assertion closes that hole.
+PRICE_BASIS_SQL = "price_basis_ok = 1 AND ref_venue IS NOT NULL"
+
 # Directed return, derived in SQL. direction = 0 yields NULL, which AVG ignores
 # and a WHERE ... IS NOT NULL filter removes — the exclusion is structural, not
 # a matter of remembering to skip it.
-DIRECTED_RETURN_SQL = """
+#
+# `price_basis_ok` is the second structural exclusion, for a different
+# reason: a row whose fill venue is not the exit venue does not measure a
+# signal, it measures a venue spread. See module docstring, defect 4.
+DIRECTED_RETURN_SQL = f"""
     SELECT pair,
            CASE WHEN direction > 0 THEN  forward_return
                 WHEN direction < 0 THEN -forward_return
@@ -46,6 +78,7 @@ DIRECTED_RETURN_SQL = """
      WHERE resolved = 1
        AND forward_return IS NOT NULL
        AND direction != 0
+       AND {PRICE_BASIS_SQL}
      ORDER BY id
 """
 
@@ -65,17 +98,42 @@ CREATE TABLE IF NOT EXISTS verdicts (
     resolved           INTEGER NOT NULL DEFAULT 0,
     bar_closed         INTEGER NOT NULL DEFAULT 1,
     candidate          INTEGER NOT NULL DEFAULT 0,  -- hypothesis under test
-    unscorable         INTEGER NOT NULL DEFAULT 0   -- horizon bar no longer exists
+    unscorable         INTEGER NOT NULL DEFAULT 0,  -- horizon bar no longer exists
+    ref_venue          TEXT,                  -- venue the FILL was taken from
+    fill_spread_bps    REAL,                  -- that venue's own spread at fill time
+    cross_basis_bps    REAL,                  -- cross-venue dispersion at fill time
+    price_basis_ok     INTEGER NOT NULL DEFAULT 1,  -- fill venue == exit venue?
+    exit_close_ms      INTEGER,               -- close time of the bar that served
+                                              -- as the exit; the REALIZED horizon
+                                              -- is exit_close_ms/1000 - ts
+    exit_window_ms     INTEGER                -- the DECISION WINDOW this row
+                                              -- belongs to: the first bar close
+                                              -- at or after ts+horizon. One row
+                                              -- per (pair, exit_window_ms) — the
+                                              -- dedup key of the decision-point
+                                              -- ledger (UNIQUE partial index).
 );
-
-CREATE INDEX IF NOT EXISTS idx_verdicts_pair   ON verdicts(pair);
-CREATE INDEX IF NOT EXISTS idx_verdicts_resolv ON verdicts(resolved, id);
-CREATE INDEX IF NOT EXISTS idx_verdicts_dir    ON verdicts(direction, resolved);
 
 CREATE TABLE IF NOT EXISTS recorder_meta (
     k TEXT PRIMARY KEY,
     v TEXT
 );
+"""
+
+# Indexes are created SEPARATELY from the tables. An index on a column added by
+# a later migration cannot be created until that column exists, so building them
+# in one executescript against a legacy database fails with
+# "no such column: price_basis_ok" before `_migrate` ever runs.
+SCHEMA_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_verdicts_pair   ON verdicts(pair);
+CREATE INDEX IF NOT EXISTS idx_verdicts_resolv ON verdicts(resolved, id);
+CREATE INDEX IF NOT EXISTS idx_verdicts_dir    ON verdicts(direction, resolved);
+CREATE INDEX IF NOT EXISTS idx_verdicts_basis  ON verdicts(price_basis_ok, candidate);
+-- The decision-point ledger's dedup key. Partial (exit_window_ms IS NOT NULL)
+-- so legacy rows — which have no window — can never conflict, and created
+-- here rather than in SCHEMA because it references a migrated column.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_verdicts_window
+    ON verdicts(pair, exit_window_ms) WHERE exit_window_ms IS NOT NULL;
 """
 
 
@@ -95,6 +153,8 @@ def open_db(path: str | pathlib.Path) -> sqlite3.Connection:
     db = sqlite3.connect(str(p), check_same_thread=False)
     db.executescript(SCHEMA)
     _migrate(db)
+    # indexes last: they may reference columns that `_migrate` just added
+    db.executescript(SCHEMA_INDEXES)
     db.commit()
     return db
 
@@ -105,14 +165,36 @@ def _migrate(db: sqlite3.Connection) -> None:
     An engine that has been running must not require deleting its data because
     a schema field was added. Measured: the running scanner.db already held 336
     rows before `candidate` existed.
+
+    The price-basis columns carry a migration decision that matters: pre-fix
+    rows are backfilled with `price_basis_ok = 0`, NOT 1. Their fill venue is
+    unrecoverable, so they cannot be honestly scored and must not enter the
+    expectancy math. They are kept, not deleted — "we do not know how this row
+    was measured" is a fact worth retaining.
     """
     cols = {r[1] for r in db.execute("PRAGMA table_info(verdicts)")}
-    if "candidate" not in cols:
-        db.execute("ALTER TABLE verdicts "
-                   "ADD COLUMN candidate INTEGER NOT NULL DEFAULT 0")
-    if "unscorable" not in cols:
-        db.execute("ALTER TABLE verdicts "
-                   "ADD COLUMN unscorable INTEGER NOT NULL DEFAULT 0")
+    added = False
+    for name, decl in (
+        ("candidate", "INTEGER NOT NULL DEFAULT 0"),
+        ("unscorable", "INTEGER NOT NULL DEFAULT 0"),
+        ("ref_venue", "TEXT"),
+        ("fill_spread_bps", "REAL"),
+        ("cross_basis_bps", "REAL"),
+        ("price_basis_ok", "INTEGER NOT NULL DEFAULT 1"),
+        ("exit_close_ms", "INTEGER"),
+        ("exit_window_ms", "INTEGER"),
+    ):
+        if name in cols:
+            continue
+        db.execute(f"ALTER TABLE verdicts ADD COLUMN {name} {decl}")
+        added = True
+
+    if added and "price_basis_ok" not in cols:
+        # Pre-fix rows: fill came from a cross-venue weighted mid, exit from a
+        # single venue. Unscorable in principle, so excluded from the math.
+        # `ref_venue IS NULL` already excludes them structurally; this makes the
+        # flag honest for anything reading it directly.
+        db.execute("UPDATE verdicts SET price_basis_ok = 0 WHERE ref_venue IS NULL")
 
 
 # Serializes every DB touch. A scan cycle writes while /health may read.
@@ -139,6 +221,10 @@ def record_verdict(
     score: int = 0,
     bar_closed: bool = True,
     candidate: bool | None = None,
+    ref_venue: str | None = None,
+    fill_spread_bps: float | None = None,
+    cross_basis_bps: float | None = None,
+    price_basis_ok: bool = True,
 ) -> int:
     """Insert one observation. Returns its row id.
 
@@ -147,6 +233,11 @@ def record_verdict(
     `candidate` defaults to "did any rule fire MET". A candidate row carries a
     PROVISIONAL side and enters expectancy math; it cannot suppress, alert or
     gate. That restriction lives in `outcomes.promoted_direction`.
+
+    `ref_venue` names the venue the fill was taken from and MUST be the venue
+    the resolver scores the exit against. `price_basis_ok=False` marks a row
+    whose fill/exit basis is not trustworthy; it is retained but excluded from
+    expectancy, the same treatment `direction = 0` gets.
     """
     if not bar_closed:
         raise ValueError(
@@ -164,15 +255,102 @@ def record_verdict(
             """INSERT INTO verdicts
                  (ts, pair, direction, venues_live, rules_met, rules_unevaluable,
                   score, horizon_bars, fill_price, forward_return, resolved,
-                  bar_closed, candidate)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  bar_closed, candidate, ref_venue, fill_spread_bps,
+                  cross_basis_bps, price_basis_ok)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (ts, pair, int(direction), int(venues_live),
              json.dumps(list(rules_met)), json.dumps(list(rules_unevaluable)),
              int(score), int(horizon_bars), fill_price, forward_return,
-             0, 1, cand),
+             0, 1, cand, ref_venue, fill_spread_bps, cross_basis_bps,
+             1 if price_basis_ok else 0),
         )
         db.commit()
         return int(cur.lastrowid)
+
+
+def upsert_verdict(
+    db: sqlite3.Connection,
+    pair: str,
+    ts: float,
+    direction: int,
+    horizon_bars: int,
+    exit_window_ms: int,
+    fill_price: float | None,
+    venues_live: int,
+    rules_met: list[str],
+    rules_unevaluable: list[str],
+    score: int = 0,
+    ref_venue: str | None = None,
+    fill_spread_bps: float | None = None,
+    cross_basis_bps: float | None = None,
+    price_basis_ok: bool = True,
+    candidate: bool | None = None,
+) -> tuple[int, bool]:
+    """The decision-point ledger's writer: one row per (pair, exit_window_ms).
+
+    The scan loop polls every ~12s, but ~25 consecutive polls share ONE exit
+    window (the first bar close at or after ts+horizon). Recording each poll
+    was 25 rows of nearly the same observation — the overlap the auditor then
+    has to patch with an effective-sample-size correction. This writer keeps
+    the FIRST row born in a window (its `ts` is the decision's birth and never
+    moves) and refreshes the STATE fields on every later poll, so the row the
+    resolver scores carries the freshest reading taken before the exit bar
+    closed.
+
+    Returns (row_id, created). `created=False` means an existing window row
+    was updated. The unique partial index on (pair, exit_window_ms) is the
+    structural guarantee: two rows for one window cannot exist, in this
+    process or after a restart, because the lookup runs in the same locked
+    transaction as the write.
+
+    `exit_window_ms` MUST be computed the same way the resolver picks the exit
+    bar (first bar close >= ts + horizon) — scanner.run_cycle derives it from
+    the pair's bar size, so the dedup key and the realized exit can never
+    disagree.
+    """
+    if direction not in (-1, 0, 1):
+        raise ValueError(f"direction must be -1/0/+1, got {direction!r}")
+    if horizon_bars <= 0:
+        raise ValueError(f"horizon_bars must be > 0, got {horizon_bars}")
+    if not exit_window_ms or int(exit_window_ms) <= 0:
+        raise ValueError(f"exit_window_ms must be a positive epoch-ms bar close, "
+                         f"got {exit_window_ms!r}")
+    cand = 1 if (bool(rules_met) if candidate is None else candidate) else 0
+    with _guard(db):
+        row = db.execute(
+            "SELECT id FROM verdicts WHERE pair=? AND exit_window_ms=?",
+            (pair, int(exit_window_ms)),
+        ).fetchone()
+        if row is not None:
+            rid = int(row[0])
+            db.execute(
+                """UPDATE verdicts SET
+                       direction=?, venues_live=?, rules_met=?, rules_unevaluable=?,
+                       score=?, fill_price=?, ref_venue=?, fill_spread_bps=?,
+                       cross_basis_bps=?, price_basis_ok=?, candidate=?
+                     WHERE id=?""",
+                (int(direction), int(venues_live),
+                 json.dumps(list(rules_met)), json.dumps(list(rules_unevaluable)),
+                 int(score), fill_price, ref_venue, fill_spread_bps,
+                 cross_basis_bps, 1 if price_basis_ok else 0, cand, rid),
+            )
+            db.commit()
+            return rid, False
+        cur = db.execute(
+            """INSERT INTO verdicts
+                 (ts, pair, direction, venues_live, rules_met, rules_unevaluable,
+                  score, horizon_bars, fill_price, forward_return, resolved,
+                  bar_closed, candidate, ref_venue, fill_spread_bps,
+                  cross_basis_bps, price_basis_ok, exit_window_ms)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ts, pair, int(direction), int(venues_live),
+             json.dumps(list(rules_met)), json.dumps(list(rules_unevaluable)),
+             int(score), int(horizon_bars), fill_price, None,
+             0, 1, cand, ref_venue, fill_spread_bps, cross_basis_bps,
+             1 if price_basis_ok else 0, int(exit_window_ms)),
+        )
+        db.commit()
+        return int(cur.lastrowid), True
 
 
 def resolve(db: sqlite3.Connection, ids: list[int],
@@ -224,7 +402,13 @@ def counts(db: sqlite3.Connection) -> dict:
                       MIN(ts), MAX(ts),
                       SUM(CASE WHEN resolved=1 AND direction!=0 AND candidate=1
                            THEN 1 ELSE 0 END),
-                  SUM(CASE WHEN unscorable=1 THEN 1 ELSE 0 END)
+                      SUM(CASE WHEN unscorable=1 THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN NOT (price_basis_ok = 1 AND ref_venue IS NOT NULL)
+                               THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN resolved=1 AND direction!=0
+                                AND price_basis_ok=1 AND ref_venue IS NOT NULL
+                                AND candidate=1
+                           THEN 1 ELSE 0 END)
                  FROM verdicts"""
         ).fetchone()
     total = row[0] or 0
@@ -237,6 +421,9 @@ def counts(db: sqlite3.Connection) -> dict:
         "last_ts": row[5],
         "rows_candidate_resolved": row[6] or 0,
         "rows_unscorable": row[7] or 0,
+        "rows_bad_price_basis": row[8] or 0,
+        # the ONLY population any expectancy number may be computed from
+        "rows_auditable": row[9] or 0,
     }
 
 

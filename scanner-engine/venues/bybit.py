@@ -15,6 +15,7 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking proxy)
+import outcomes as OUT  # noqa: E402  shared exit-bar selection (ceil semantics)
 
 import json
 import urllib.request
@@ -78,7 +79,12 @@ def fetch_depth(pair: str, limit: int = 50):
     )
 
 
-def fetch_trades(pair: str, limit: int = 60) -> list[dict]:
+def fetch_trades(pair: str, limit: int = 1000) -> list[dict]:
+    """Recent trades.
+
+    The limit was 60, which spanned 2.5s on ETH — too short to call a flow
+    measurement over a 60s window. 1000 trades span ~27s on ETH.
+    """
     return parse_trades(
         _get(f"/v5/market/recent-trade?category=linear&symbol={symbol_for(pair)}&limit={limit}")
     )
@@ -104,8 +110,10 @@ BYBIT_INTERVAL = {"1m": "1", "3m": "3", "5m": "5", "15m": "15",
                   "30m": "30", "1h": "60", "4h": "240", "1d": "D"}
 
 
-def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None):
-    """The closed bar covering `at_ms`.
+def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None,
+                     now_ms: int | None = None):
+    """The exit bar for a horizon measured from `at_ms` — ceil semantics, see
+    `outcomes.select_exit_bar`.
 
     Bybit's kline endpoint uses numeric interval codes ("1", "5"), not "1m".
     """
@@ -116,18 +124,15 @@ def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None):
                f"&interval={code}&limit=50")
     if raw.get("retCode") != 0:
         raise ValueError(f"bybit error {raw.get('retCode')}: {raw.get('retMsg')}")
-    best = None
+    candidates = []
     for row in raw["result"]["list"]:          # newest first
         start_ms = int(row[0])
         end_ms = start_ms + BAR_MS[code]
-        if end_ms <= at_ms:
-            if best is None or start_ms > best[0]:
-                best = (start_ms, end_ms, row)
-    if best is None:
-        return None
-    start_ms, end_ms, row = best
-    return {"open_ms": start_ms, "close_ms": end_ms,
-            "close": float(row[4]), "volume": float(row[5])}
+        candidates.append((end_ms, {
+            "open_ms": start_ms, "close_ms": end_ms,
+            "close": float(row[4]), "volume": float(row[5]),
+        }))
+    return OUT.select_exit_bar(candidates, at_ms, now_ms)
 
 
 BAR_MS = {"1": 60_000, "3": 180_000, "5": 300_000, "15": 900_000,

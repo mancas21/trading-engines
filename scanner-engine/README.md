@@ -106,13 +106,109 @@ and fixed — several in this repo's sibling engine.
     for HYPE and ETH in the same run, and both reported 3 venues with no failure
     recorded.
 
+## Measurement integrity (2026-10-11)
+
+An audit of the running engine found that its headline result was an artifact.
+The engine had recorded 4,848 rows over 42 hours and reported:
+
+\RULE 4   n=721  mean=-0.000090  t=-2.13   ->  "a significant loser"
+\
+It was wrong, for three independent reasons. All three are now fixed and pinned
+by \	ests/test_measurement_integrity.py\.
+
+### 1. XAU's "loss" was a venue spread, not a P&L
+
+The fill was depth-weighted across venues. Measured live:
+
+\XAU/USD   okx     depth5 286866  -> 99.99% of the fill weight
+           bybit         16  ->  0.01%
+           binance        7  ->  0.00%
+\
+OKX quotes gold ~30bps above Binance, so the fill was effectively OKX's price
+and the exit was Binance's. Result:
+
+\XAU/USD  n=599   raw mean -0.003029 (-30.3 bps)   sd 0.000165 (1.65 bps)
+                  negative in 599 of 599 rows
+\
+599/599 the same sign with almost no variance is a constant offset, not a
+distribution. XAU was the only pair the auditor graded as a loser (t=-2.80).
+Now the fill is one venue's mid (\pairs.ref_venue\), the row records which venue,
+and the resolver may not fall back to another. Measured after the fix, XAU's
+5-minute return is **-0.01 bps** instead of -30.
+
+### 2. Overlapping rows were counted as independent evidence
+
+The loop polls every ~12s against a 5-minute horizon, so roughly 25 consecutive
+rows share one underlying price move.
+
+\pair       rows  distinct_windows   t_naive   t_effective
+SOL/USD      167               57     -1.59         -1.24
+XAU/USD       54               30     -2.80         -1.65
+TOTAL        721              305     -2.13
+\
+_eff = n * (1 - r1) / (1 + r1)\, and \min_n\ applies to _eff\, not \.
+
+### 3. Everything was quoted gross, with no multiple-comparison correction
+
+Pooled gross mean was **-0.90 bps** against an **11 bps** round trip. Every cell
+in that report sat an order of magnitude below the cost of acting on it. The
+auditor also graded ~20 cells at an uncorrected 1.65 and flagged 6 of them,
+which is the chance rate. The threshold is now Bonferroni-derived from the
+number of cells actually graded, and _tests\ is printed.
+
+### 4. Three of the four rules could never fire
+
+\rule 1  MET?  NO  condition (b) needs history["1"]["cycles"], never populated
+rule 2  MET?  NO  condition (b) was a hard-coded UNEVALUABLE; state forced to UNEVALUABLE
+rule 3  MET?  NO  condition (b) needs history["3"]["depth_median"], never populated
+rule 4  MET?  yes
+\
+\scanner.run_cycle\ called \evaluate()\ with no \history\ argument at all. The
+engine shipped four rules and could measure one. \RuleHistory\ now carries the
+cross-cycle memory, rule 2's price-response leg is measured rather than assumed,
+and the scanner advances history every cycle. Live, rules 1 and 2 now fire.
+
+### 5. A declared threshold no code read
+
+Rule 4 declared \min_coverage_s: 30.0\. \_rule4\ never read it and
+\eatures.compute\ hardcoded 20.0. Enforcing the declared value then exposed a
+second problem: 30s is **unachievable**. Measured, OKX's trades endpoint caps at
+500 trades (~5.8s of a 60s window) and Bybit reaches ~27s at 1000 trades.
+
+A span-only gate is also the wrong gate. Measured on the same pair:
+
+\binance  1000 trades / 41.0s      plenty of data
+okx       500 trades /  5.8s      plenty of data, short span
+kraken      4 trades / 25.1s      four trades, and it spans the window
+\
+Span favours thin venues and penalises busy ones, and a delta_ratio from four
+trades can only be 0, 0.25, 0.5, 0.75 or 1. So the gate is now **both** a span
+floor (5.0s, measured) **and** a trade-count floor (50, from ules.json\).
+
+### What this did to the corpus
+
+Every pre-fix row is marked \price_basis_ok = 0\ and excluded from expectancy.
+The engine re-baselines to **0 auditable rows** and starts collecting clean data.
+That is the correct answer, and it is deliberately the uncomfortable one: 42
+hours of data bought a rule-level conclusion that was never there.
+
+\data/scanner.db.pre-measurement-fix\ is the untouched backup.
+
+---
+
 ## Current state
 
 All four rules in `rules.json` are marked `UNVALIDATED` and `gate_signals` is
 `false`. **No rule may suppress a signal until the auditor has measured it.**
 
-Every recorded verdict therefore carries `direction = 0` and is excluded from the
-expectancy math. That is the designed behaviour, not a defect:
+A row where a rule fired MET carries a **provisional** side from that rule's
+`direction_hint` and enters the expectancy math. It is a hypothesis under test,
+not a prediction: it cannot suppress, alert, gate or rank. Only a rule the
+auditor has promoted to `AUDITED` may contribute a side to the verdict ledger.
+
+The corpus is currently at **zero auditable rows**, because the whole pre-fix
+history is excluded on measurement grounds (see above). That is the designed
+behaviour, not a defect:
 
 ```
 EXPECTANCY AUDIT — INSUFFICIENT DATA
@@ -121,12 +217,17 @@ EXPECTANCY AUDIT — INSUFFICIENT DATA
 ```
 
 The bottleneck is not plumbing. It is that the rules are hypotheses, and until
-enough directed outcomes accumulate there is nothing to decide with.
+enough directed outcomes accumulate on a trustworthy price basis there is
+nothing to decide with.
+
+**Do not lower `min_n`, `min_trades` or the significance level to force a
+conclusion.** Insufficient data is a valid answer, and it is the answer this
+engine gave for the first 42 hours of its life.
 
 ## Tests
 
 ```bash
-python -m pytest tests/ -q          # 143 unit tests
+python -m pytest tests/ -q          # 203 unit tests
 python tests/live_features.py        # cross-venue features, real books
 python tests/live_verdict.py         # features -> rules -> verdict, end to end
 python tests/live_cvd_smoke.py       # CVD from all four venues
@@ -144,13 +245,16 @@ scanner-engine/
   pairs.py          canonical registry; measured symbols, floors, bar intervals
   features.py       cross-venue basis, dispersion, flow divergence, liquidity
   flow.py           CVD normalization to a fixed time window
-  rules_eval.py     MET / UNMET / UNEVALUABLE per subcondition
+  rules_eval.py     MET / UNMET / UNEVALUABLE per subcondition + RuleHistory
   rules.json        4 cross-venue rules, all UNVALIDATED, no-footprint declared
-  recorder.py       raw forward returns, direction=0 excluded, unclosed barred
-  expectancy.py     the auditor; day-one answer is INSUFFICIENT DATA
+  recorder.py       raw forward returns; direction=0 and bad basis excluded
+  outcomes.py       the resolver; horizon bar on the SAME venue as the fill
+  expectancy.py     the auditor: net of cost, overlap-corrected, Bonferroni
+  promotion.py      auditor verdict -> rules.json, measured then written
+  audit_tick.py     change-detected cron surface, versioned measurement basis
   supervisor.py     instance lock, restart only on crash, bounded attempts
   venues/           binance, okx, kraken, bybit
-  docs/             VENUE_FACTS.md (measured), VPS-CHECKLIST.md
+  docs/             VENUE_FACTS.md (measured), VPS-CHECKLIST.md, THE-BLOCKER.md
 ```
 
 See `docs/VENUE_FACTS.md` for every endpoint gotcha measured on 2026-10-08 —

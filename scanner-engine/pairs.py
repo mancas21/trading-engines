@@ -35,6 +35,13 @@ class PairSpec(NamedTuple):
     bar: str                # "1m" or "5m", from measured liquidity
     avg_1m_notional_usd: float
     note: str = ""
+    # The venue the FILL is taken from AND the exit is scored against. A forward
+    # return is a price move on one venue; mixing a cross-venue fill with a
+    # single-venue exit measures the venue spread instead of the signal. See
+    # recorder.py defect 4 for the measured consequence (XAU, -30bps on 599/599
+    # rows). Binance is the default because it lists all eight pairs and carries
+    # a klines endpoint that serves closed bars for every one of them.
+    ref_venue: str = "binance"
 
 
 # avg_1m_notional_usd: Binance USDT-M, mean over 5 x 1m bars, 2026-10-08.
@@ -107,6 +114,15 @@ def min_venues_for(pair: str) -> int:
 
 def bar_for(pair: str) -> str:
     return spec_for(pair).bar
+
+
+def ref_venue_for(pair: str) -> str:
+    """The venue used for BOTH the recorded fill and the exit.
+
+    Raises KeyError for an unconfigured pair — callers that must degrade
+    (the running loop) catch it and fall back rather than crashing the cycle.
+    """
+    return spec_for(pair).ref_venue
 
 
 def all_pairs() -> list[str]:

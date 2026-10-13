@@ -90,7 +90,51 @@ DEFAULT_BATCH = 12
 # A 5-minute forward move is not recoverable an hour later regardless -- the
 # price path in between is unknown -- so these rows are marked unscorable
 # rather than silently retried or zero-filled.
+#
+# Must exceed horizon + ONE EXIT BAR for the largest bar in the registry: the
+# exit bar is the first close AT OR AFTER ts+horizon (see `select_exit_bar`),
+# so a row can wait up to horizon + bar_size before its exit bar exists. With
+# the registry's largest bar at 5m and horizon 5m, 1800s holds with room; a
+# 15m or 1h pair added to `pairs.py` must revisit this number.
 MAX_SCORABLE_AGE_S = 1800.0     # 30 minutes: ~6x the longest horizon
+
+
+def select_exit_bar(candidates, at_ms: int, now_ms: int | None = None):
+    """The exit bar for a horizon measured from `at_ms`: the CLOSED bar whose
+    close is the EARLIEST one at or after `at_ms` (ceil semantics).
+
+    `candidates` is an iterable of (close_ms, bar) pairs; returns the bar or
+    None. A bar whose close is still in the future is not closed and never
+    qualifies.
+
+    WHY CEIL AND NOT "last close <= at_ms" — this choice is load-bearing for
+    the expectancy math. The floor selection returns the bar CONTAINING
+    `at_ms` whenever at_ms falls inside a forming bar. For a 1m pair with a
+    5-minute horizon that is a 60s approximation; for a 5m pair with
+    horizon_bars=1 it returns the bar containing the SIGNAL itself, so the
+    realized horizon was uniform in (0, 300s] with mean ~150s — never the
+    300s the row claims. Ceil guarantees every row spans AT LEAST its intended
+    horizon, for every bar size, so cells remain comparable at the minimum.
+    The residual overshoot (up to one bar) is why the resolver records
+    `exit_close_ms` per row: the realized horizon stays visible to the
+    auditor instead of being silently approximated.
+
+    Measured consequence of the floor version: 5 of 8 registry pairs (HYPE,
+    SUI, XAU, SPCX, NVDA — all 5m) measured an average ~150s move while their
+    rows said 300s, and every expectancy figure for those pairs described a
+    window nobody intended.
+    """
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    best = None
+    for close_ms, bar in candidates:
+        if close_ms is None or close_ms < at_ms:
+            continue
+        if close_ms > now_ms:          # still forming; not an exit bar
+            continue
+        if best is None or close_ms < best[0]:
+            best = (close_ms, bar)
+    return None if best is None else best[1]
 
 
 def pending_rows(db: sqlite3.Connection, limit: int = DEFAULT_BATCH) -> list[tuple]:
@@ -173,6 +217,11 @@ def resolve_pending(db: sqlite3.Connection, fetch_bar, now_ms: int | None = None
 
     Defaults to 60_000 so a caller that only knows about 1m bars (and the unit
     tests) behaves as before, but the live scanner passes the real value.
+
+    The resolved row also records `exit_close_ms` — the close time of the bar
+    that actually served as the exit — so the auditor can report the REALIZED
+    horizon per cell instead of trusting the horizon label. The exit bar itself
+    is chosen by `select_exit_bar` inside each venue's `fetch_closed_bar`.
     """
     if bar_ms_for is None:
         bar_ms_for = lambda _pair: 60_000                       # noqa: E731
@@ -188,10 +237,12 @@ def resolve_pending(db: sqlite3.Connection, fetch_bar, now_ms: int | None = None
         fwd = resolve_row(bar, horizon_bars, now_ms=now_ms, fill=fill)
         if fwd is None:
             continue
+        exit_close_ms = bar.get("close_ms") if isinstance(bar, dict) else None
         with RC_guard(db):
             db.execute(
-                "UPDATE verdicts SET forward_return=?, resolved=1 WHERE id=?",
-                (fwd, rid),
+                "UPDATE verdicts SET forward_return=?, resolved=1, exit_close_ms=? "
+                "WHERE id=?",
+                (fwd, exit_close_ms, rid),
             )
             n += 1
     with RC_guard(db):

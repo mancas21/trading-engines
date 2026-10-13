@@ -23,6 +23,7 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking proxy)
+import outcomes as OUT  # noqa: E402  shared exit-bar selection (ceil semantics)
 
 import json
 import time
@@ -152,26 +153,34 @@ def fetch_kline_cvd(pair: str, interval: str = "1m", limit: int = 5,
     return [cvd_from_klines(row, now_ms) for row in raw]
 
 
-def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None):
-    """The bar covering `at_ms`, or None if it has not closed.
+def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None,
+                     now_ms: int | None = None):
+    """The exit bar for a horizon measured from `at_ms`: the CLOSED bar whose
+    close is the EARLIEST one at or after `at_ms` (ceil semantics).
 
-    Uses /klines and returns the row whose closeTime <= at_ms, taking the most
-    recent such row. A bar still forming is never returned: scoring against a
+    Uses /klines. A bar still forming is never returned: scoring against a
     partially formed bar invents a forward return that did not happen.
+
+    WHY CEIL, not "last close <= at_ms": the floor selection returns the bar
+    CONTAINING `at_ms` whenever at_ms falls inside a forming bar. For a 1m pair
+    that is a 60s approximation; for a 5m pair (horizon_bars=1) it returned the
+    bar containing the SIGNAL itself, so the realized horizon was uniform in
+    (0, 300s] — mean ~150s, never the 300s the row claims. Ceil guarantees the
+    move spans at least the intended horizon for every bar size; the overshoot
+    (up to one bar) is recorded per row as `exit_close_ms` so it stays visible.
+    See `outcomes.select_exit_bar` for the full argument.
     """
     if at_ms is None:
         at_ms = int(time.time() * 1000)
     raw = _get(f"/fapi/v1/klines?symbol={symbol_for(pair)}&interval={bar}&limit=50")
-    best = None
+    candidates = []
     for row in raw:
-        close_ms = int(row[6])
-        if close_ms <= at_ms:
-            best = row
-    if best is None:
-        return None
-    return {"open_ms": int(best[0]), "close_ms": int(best[6]),
-            "close": float(best[4]), "volume": float(best[5]),
-            "taker_buy": float(best[9])}
+        candidates.append((int(row[6]), {
+            "open_ms": int(row[0]), "close_ms": int(row[6]),
+            "close": float(row[4]), "volume": float(row[5]),
+            "taker_buy": float(row[9]),
+        }))
+    return OUT.select_exit_bar(candidates, at_ms, now_ms)
 
 
 def fetch_open_interest(pair: str):

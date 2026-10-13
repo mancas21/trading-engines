@@ -73,13 +73,16 @@ def test_directed_return_is_derived_in_sql_not_at_write(tmp_path):
     now = time.time()
     ra = R.record_verdict(db, pair="A/USD", ts=now, direction=1,
                           forward_return=None, horizon_bars=5, fill_price=1.0,
-                          venues_live=4, rules_met=["1"], rules_unevaluable=[])
+                          venues_live=4, rules_met=["1"], rules_unevaluable=[],
+                          ref_venue="binance")
     rb = R.record_verdict(db, pair="B/USD", ts=now, direction=-1,
                           forward_return=None, horizon_bars=5, fill_price=1.0,
-                          venues_live=4, rules_met=["1"], rules_unevaluable=[])
+                          venues_live=4, rules_met=["1"], rules_unevaluable=[],
+                          ref_venue="binance")
     rc = R.record_verdict(db, pair="C/USD", ts=now, direction=0,
                           forward_return=None, horizon_bars=5, fill_price=1.0,
-                          venues_live=4, rules_met=[], rules_unevaluable=["2"])
+                          venues_live=4, rules_met=[], rules_unevaluable=["2"],
+                          ref_venue="binance")
     R.resolve(db, ids=[ra, rb, rc],
               return_by_pair={"A/USD": 0.02, "B/USD": -0.02, "C/USD": 0.05})
 

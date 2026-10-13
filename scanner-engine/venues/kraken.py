@@ -38,6 +38,7 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking proxy)
+import outcomes as OUT  # noqa: E402  shared exit-bar selection (ceil semantics)
 
 import json
 import urllib.request
@@ -149,8 +150,10 @@ def fetch_trades(pair: str) -> list[dict]:
 KRAKEN_INTERVAL = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}
 
 
-def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None):
-    """The closed bar covering `at_ms`.
+def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None,
+                     now_ms: int | None = None):
+    """The exit bar for a horizon measured from `at_ms` — ceil semantics, see
+    `outcomes.select_exit_bar`.
 
     Kraken's OHLC interval is in MINUTES as an integer, and the response key is
     venue-mapped (XBTUSD -> XXBTZUSD) so it must be discovered, never assumed.
@@ -160,18 +163,16 @@ def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None):
     interval = KRAKEN_INTERVAL.get(bar, 1)
     rows = fetch_ohlc(pair, interval=interval)
     step_ms = interval * 60_000
-    best = None
+    candidates = []
     for c in rows:
         # c: (time, open, high, low, close, vwap, volume, count)
         start_ms = int(c[0]) * 1000
         end_ms = start_ms + step_ms
-        if end_ms <= at_ms and (best is None or start_ms > best[0]):
-            best = (start_ms, end_ms, c)
-    if best is None:
-        return None
-    start_ms, end_ms, c = best
-    return {"open_ms": start_ms, "close_ms": end_ms,
-            "close": float(c[4]), "volume": float(c[6])}
+        candidates.append((end_ms, {
+            "open_ms": start_ms, "close_ms": end_ms,
+            "close": float(c[4]), "volume": float(c[6]),
+        }))
+    return OUT.select_exit_bar(candidates, at_ms, now_ms)
 
 
 def fetch_ohlc(pair: str, interval: int = 1) -> list[dict]:

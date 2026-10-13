@@ -37,6 +37,7 @@ import argparse
 import sqlite3
 import sys
 import time
+from bisect import bisect_left
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -87,21 +88,22 @@ def index_by_close(rows: list[list]) -> list[tuple[int, float]]:
 
 
 def bar_at(idx: list[tuple[int, float]], at_ms: int):
-    """The close price of the most recent bar whose close time is <= at_ms.
+    """The close price of the FIRST bar whose close time is >= at_ms (ceil).
 
-    Mirrors the live fetcher's selection exactly: the most recent CLOSED bar
-    covering the instant, never the forming one.
+    Mirrors the live fetcher's selection exactly (`outcomes.select_exit_bar`):
+    the earliest CLOSED bar whose close is at or after the horizon instant. The
+    previous floor semantics ("last close <= at_ms") returned the bar
+    CONTAINING at_ms whenever at_ms fell inside a forming bar, which for a 5m
+    pair (horizon_bars=1) is the bar containing the signal itself -- a realized
+    horizon uniform in (0, 300s], never the 300s the row claims.
+
+    A backfill that selects bars differently from the live resolver makes
+    backfilled rows incomparable to live ones, which is worse than not
+    backfilling at all.
     """
-    lo, hi = 0, len(idx)
-    best = None
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if idx[mid][0] <= at_ms:
-            best = idx[mid]
-            lo = mid + 1
-        else:
-            hi = mid
-    return best
+    closes = [c for c, _ in idx]
+    i = bisect_left(closes, at_ms)
+    return idx[i] if i < len(idx) else None
 
 
 def main() -> int:
@@ -171,14 +173,26 @@ def main() -> int:
             return 60_000
 
     total_ok = total_miss = total_err = 0
-    updates: list[tuple[float, int]] = []
+    updates: list[tuple[float, int, int]] = []
 
     for pair, rows in sorted(by_pair.items()):
+        # The exit MUST come from the pair's reference venue — the same venue
+        # the fill was recorded from — or the backfill reintroduces the
+        # fill/exit venue mismatch (recorder.py defect 4, the XAU -30bps
+        # artifact). This script only knows how to fetch Binance bars, so a
+        # pair whose registry ref venue is not Binance is SKIPPED loudly, never
+        # silently scored against the wrong venue.
         try:
             import pairs as _P
             bar = _P.bar_for(pair)
+            ref = _P.ref_venue_for(pair)
         except Exception:                                       # noqa: BLE001
-            bar = "1m"
+            bar, ref = "1m", "binance"
+        if ref != "binance":
+            print(f"  {pair:10s} OMITIDO: ref_venue={ref!r} y este script solo "
+                  f"sirve barras de binance")
+            total_err += len(rows)
+            continue
         try:
             hist = fetch_history(pair, bar, start_ms, end_ms)
         except Exception as e:                                  # noqa: BLE001
@@ -203,7 +217,7 @@ def main() -> int:
             if fwd is None:
                 miss += 1
                 continue
-            updates.append((fwd, r["id"]))
+            updates.append((fwd, hit[0], r["id"]))
             ok += 1
 
         total_ok += ok
@@ -222,13 +236,16 @@ def main() -> int:
         return 0
 
     # `unscorable` is cleared because the row now HAS a measured outcome; leaving
-    # it set would keep a scored row out of every expectancy query.
+    # it set would keep a scored row out of every expectancy query. The exit
+    # bar's close time is recorded so the auditor can report the REALIZED
+    # horizon per cell (exit_close_ms/1000 - ts) instead of trusting the label.
     with DB_GUARD(db):
         db.executemany(
-            "UPDATE verdicts SET forward_return=?, unscorable=0, resolved=1 "
-            "WHERE id=?", updates)
+            "UPDATE verdicts SET forward_return=?, exit_close_ms=?, "
+            "unscorable=0, resolved=1 WHERE id=?", updates)
         db.commit()
-    print(f"\n  {len(updates)} filas actualizadas (forward_return + unscorable=0)")
+    print(f"\n  {len(updates)} filas actualizadas "
+          f"(forward_return + exit_close_ms + unscorable=0)")
 
     for label, sql in (
         ("unscorable restantes", "SELECT COUNT(*) FROM verdicts WHERE unscorable=1"),

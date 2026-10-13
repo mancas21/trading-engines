@@ -39,21 +39,60 @@ STATE = HERE / "data" / "audit_state.json"
 MIN_N = E.DEFAULT_MIN_N
 MIN_T = E.DEFAULT_MIN_T
 
+# Bump whenever the POPULATION or the STATISTIC changes. The state file records
+# the version it was written under; a mismatch means every stored verdict was
+# computed on numbers that no longer mean what they meant, so the tick reports
+# a retraction instead of comparing against them.
+#
+# v2 (2026-10-11) — the measurement-integrity pass:
+#   * rows whose fill venue is not the exit venue are excluded (price_basis_ok)
+#   * t is computed on the overlap-corrected effective sample size
+#   * expectancy is net of a round-trip cost
+#   * the threshold is Bonferroni-derived from the number of cells graded
+# The rule-4 verdict stored under v1 ("n=691 t=-1.94 significant: true") was a
+# measurement artifact and must not be carried forward.
+#
+# v3 (2026-10-11) — the horizon-selection pass:
+#   * the exit bar is the first CLOSED bar whose close is AT OR AFTER
+#     ts+horizon (ceil, outcomes.select_exit_bar), not the last close before
+#     it. Under the old floor selection a 5m pair's exit bar was the bar
+#     CONTAINING the signal, so its realized horizon was uniform in (0, 300s]
+#     with mean ~150s — never the 300s the row claimed. Ceil guarantees every
+#     row spans at least its intended horizon.
+#   * rows record exit_close_ms, so the auditor reports the REALIZED horizon
+#     per cell (expectancy: hz_med_s) instead of trusting the label.
+# Every verdict resolved under v2 carries a realized horizon drawn from a
+# different distribution than v3 rows; mixing them in one cell is exactly the
+# incomparability this column exists to prevent.
+#
+# v4 (2026-10-11) — the decision-point ledger:
+#   * the scan loop writes ONE row per (pair, exit window) via
+#     recorder.upsert_verdict, not one per ~12s poll. The ~25x row inflation
+#     that made lag-1 autocorrelation the central statistical patch is gone;
+#     n_eff should now approach n.
+#   * rules 1 and 2 are RETIRED (DROP, measured): they stopped producing
+#     candidates, shrinking the graded cells and tightening Bonferroni.
+# v3 rows carry ~25x the overlapping mass of v4 rows for the same wall-clock;
+# their t-statistics are not comparable and must not be pooled.
+MEASUREMENT_VERSION = 4
+
 
 def fingerprint(audit: dict) -> dict:
     """The parts worth waking a human for."""
     out = {}
     for rid, row in (audit.get("rules") or {}).items():
         t = row.get("t")
+        n_eff = row.get("n_eff", row.get("n", 0))
         out[rid] = {
             "bucket": row.get("bucket"),
             # bucket changes only; n alone is not news
             "n": row.get("n"),
+            "n_eff": n_eff,
             "t": round(t, 2) if t is not None else None,
             "mean": row.get("mean"),
             "hit": row.get("hit_rate"),
-            "significant": bool(row.get("n", 0) >= MIN_N and t is not None
-                                and abs(t) >= abs(MIN_T)),
+            "significant": bool(n_eff >= MIN_N and t is not None
+                                and abs(t) >= audit.get("min_t", abs(MIN_T))),
         }
     return out
 
@@ -113,20 +152,37 @@ def main() -> int:
     prev = load_state()
     fp = fingerprint(audit)
     prev_fp = prev.get("fingerprint", {})
-
     changes = []
+
+    # -- measurement version changed: every stored verdict is stale ----------
+    prev_version = prev.get("measurement_version")
+    if prev_version is not None and prev_version != MEASUREMENT_VERSION:
+        old4 = prev_fp.get("4", {})
+        changes.append(
+            f"MEASUREMENT BASIS CHANGED v{prev_version} -> v{MEASUREMENT_VERSION}. "
+            f"Stored verdicts are retracted and re-derived; the previous "
+            f"rule-4 result (n={old4.get('n')} t={old4.get('t')}) was computed "
+            f"under a retired measurement basis (v1: overlapping samples, gross "
+            f"of costs, wrong fill/exit basis; v2: 5m pairs resolved against "
+            f"the bar containing the signal, realized horizon 0-300s). Do not "
+            f"carry it forward."
+        )
+        prev_fp = {}      # re-baseline: every rule reads as a first measurement
+
     for rid, cur in fp.items():
         old = prev_fp.get(rid)
         if old is None:
-            changes.append(f"rule {rid}: first measurement — {cur['bucket']} "
-                           f"n={cur['n']} t={cur['t']} mean={cur['mean']:+.6f}")
+            changes.append(f"rule {rid}: first measurement - {cur['bucket']} "
+                           f"n={cur['n']} n_eff={cur['n_eff']} t={cur['t']} "
+                           f"net mean={cur['mean']:+.6f}")
             continue
         if cur["bucket"] != old["bucket"]:
             changes.append(f"rule {rid}: bucket {old['bucket']} -> {cur['bucket']} "
-                           f"(n={cur['n']} t={cur['t']})")
+                           f"(n={cur['n']} n_eff={cur['n_eff']} t={cur['t']})")
         elif not old.get("significant") and cur["significant"]:
-            changes.append(f"rule {rid}: now SIGNIFICANT (n={cur['n']} t={cur['t']} "
-                           f"mean={cur['mean']:+.6f} hit={cur['hit']})")
+            changes.append(f"rule {rid}: now SIGNIFICANT (n={cur['n']} "
+                           f"n_eff={cur['n_eff']} t={cur['t']} "
+                           f"net mean={cur['mean']:+.6f} hit={cur['hit']})")
 
     # promotion eligibility
     promo = PROM.promotion_report(db, rules, audit)
@@ -144,11 +200,6 @@ def main() -> int:
         if delta < 0:
             changes.append(f"row count DROPPED by {abs(delta)} "
                            f"({prev['rows_total']} -> {health['rows_total']})")
-
-    save_state({"fingerprint": fp, "eligible": now_elig,
-                "rows_total": health["rows_total"], "ts": time.time()})
-
-    db.close()
 
     # A CONTINUING pipeline problem is not news every 30 minutes. Report each
     # distinct problem once; re-report only if it persists AND the numbers
@@ -175,20 +226,39 @@ def main() -> int:
         to_report.append("still open (progressing): " + "; ".join(sorted(still_open)))
 
     save_state({"fingerprint": fp, "eligible": now_elig,
+                "measurement_version": MEASUREMENT_VERSION,
                 "rows_total": health["rows_total"],
                 "rows_resolved": health["rows_resolved"],
                 "problems": sorted(now_problems),
                 "ts": time.time()})
     db.close()
 
-    if not changes and not to_report:
-        return 0                       # silence: nothing changed
+    # ── the ATAS ledger runs on the SAME scheduled task, same delivery ──
+    # Two ledgers, two auditors, one cron, one chat. A reader failure must
+    # never take the scanner tick down, so it is fenced.
+    atas_lines: list[str] = []
+    try:
+        _reader_dir = str(HERE.parent / "reader")
+        if _reader_dir not in sys.path:
+            sys.path.insert(0, _reader_dir)
+        import audit_atas as _ATAS                    # noqa: E402
+        _atas_changes = _ATAS.tick()
+        if _atas_changes:
+            atas_lines.append("ATAS (reader.db):")
+            atas_lines += [f"  * {c}" for c in _atas_changes]
+    except Exception as e:                            # noqa: BLE001
+        atas_lines.append(f"ATAS tick failed: {type(e).__name__}: {str(e)[:90]}")
+
+    if not changes and not to_report and not atas_lines:
+        return 0                       # silence: nothing changed anywhere
 
     lines = ["scanner-engine: audit update", ""]
     lines.append(f"  rows {health['rows_total']}  resolved {health['rows_resolved']}  "
+                 f"auditable {c.get('rows_auditable', 0)}  "
                  f"candidate {health['candidate_resolved']}  "
                  f"directed {health['directed_resolved']}  "
-                 f"pending {pending_now}  retired {health['unscorable']}")
+                 f"pending {pending_now}  retired {health['unscorable']}  "
+                 f"bad-basis {c.get('rows_bad_price_basis', 0)}")
     lines.append("")
     if to_report:
         lines.append("STATUS:")
@@ -205,8 +275,73 @@ def main() -> int:
             t = f"{p['t']:+.2f}" if p.get("t") is not None else "n/a"
             lines.append(f"    rule {p['rule']:2} {p['state']:8} n={p.get('n')} "
                          f"t={t}  {p['detail']}")
-    print("\n".join(lines))
+
+    if atas_lines:
+        lines.append("")
+        lines += atas_lines
+
+    text = "\n".join(lines)
+    _deliver(text)
+    print(text)
     return 0
+
+
+def _load_env() -> dict:
+    """The SAME .env candidates the verdict notifier reads, in the same order.
+
+    The credentials live in atas-bridge/.env (the bridge is who notifies);
+    reading only reader/.env made the first delivery attempt skip with "sin
+    credenciales". mirroring verdict_notify._ENV_CANDIDATES keeps one source
+    of truth for where the bot token lives. The chat can be overridden with
+    AUDIT_TG_CHAT_ID if the audit ever wants its own destination.
+    """
+    root = HERE.parent
+    candidates = (
+        root / "atas-bridge" / ".env",
+        root / "reader" / ".env",
+        root / "quant-alert-engine" / ".env",
+    )
+    out: dict[str, str] = {}
+    for env_path in candidates:
+        if not env_path.exists():
+            continue
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip().strip("'\"")
+        if out.get("TELEGRAM_TOKEN") or out.get("TELEGRAM__TOKEN"):
+            break
+    return out
+
+
+def _deliver(text: str) -> None:
+    """Push the tick output to Telegram. Failures are printed, never raised —
+    a dead chat must not turn a healthy audit into a cron error."""
+    import urllib.request
+
+    env = _load_env()
+    tok = env.get("TELEGRAM__TOKEN") or env.get("TELEGRAM_TOKEN") or ""
+    chat = (env.get("AUDIT_TG_CHAT_ID")
+            or env.get("TELEGRAM__CHAT_ID") or env.get("TELEGRAM_CHAT_ID") or "")
+    if not tok or not chat:
+        print("[audit_tick] entrega Telegram omitida: sin credenciales en "
+              "reader/.env (el informe quedó arriba)")
+        return
+    url = f"https://api.telegram.org/bot{tok}/sendMessage"
+    body = json.dumps({"chat_id": chat, "text": text,
+                       "disable_web_page_preview": True}).encode()
+    try:
+        req = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            resp = json.loads(r.read().decode())
+        if not resp.get("ok"):
+            print(f"[audit_tick] Telegram rechazó el envío: {resp}")
+    except Exception as e:                            # noqa: BLE001
+        print(f"[audit_tick] entrega Telegram falló: {type(e).__name__}: "
+              f"{str(e)[:90]} (el informe quedó arriba)")
 
 
 if __name__ == "__main__":

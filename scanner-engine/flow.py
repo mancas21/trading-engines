@@ -51,6 +51,8 @@ class WindowCVD:
     n_trades: int
     coverage_s: float          # real span of trade activity in the window
     requested_window_s: float  # what the caller asked for
+    first_price: float | None = None   # oldest trade in the window
+    last_price: float | None = None    # newest trade in the window
 
     @property
     def total(self) -> float:
@@ -64,6 +66,19 @@ class WindowCVD:
         if t <= 0:
             return None
         return self.buy / t
+
+    @property
+    def price_delta_bps(self) -> float | None:
+        """Price move across the window, in bps. None when unknowable.
+
+        This is the EFFORT-vs-RESULT leg: rule 2 claims a venue showing large
+        buying whose price does NOT respond is absorbing rather than leading.
+        Without this the claim cannot be asked at all, and rule 2 reported
+        UNEVALUABLE forever — one of four rules permanently unfirable.
+        """
+        if not self.first_price or not self.last_price or self.first_price <= 0:
+            return None
+        return (self.last_price - self.first_price) / self.first_price * 10_000.0
 
 
 @dataclass(frozen=True)
@@ -106,6 +121,8 @@ def window_cvd(
     buy = sell = 0.0
     newest = oldest = None
     n = 0
+    first_price = last_price = None
+    oldest_price = newest_price = None
 
     for t in trades:
         ts = t["ts"]
@@ -119,10 +136,18 @@ def window_cvd(
         else:
             sell += size
         n += 1
+        price = t.get("price")
         if newest is None or ts > newest:
             newest = ts
+            if price is not None:
+                newest_price = float(price)
         if oldest is None or ts < oldest:
             oldest = ts
+            if price is not None:
+                oldest_price = float(price)
+        if first_price is None:
+            first_price = price
+        last_price = price
 
     if n == 0:
         return None
@@ -136,20 +161,21 @@ def window_cvd(
         n_trades=n,
         coverage_s=coverage,
         requested_window_s=window_s,
+        # OLDEST -> NEWEST, so the sign of the price move matches the sign of
+        # the elapsed time and not the order the venue happened to list them.
+        first_price=oldest_price,
+        last_price=newest_price,
     )
 
 
-def is_fresh(res: WindowCVD | None, max_age_s: float, now: float | None = None) -> bool:
-    """A reading is usable only if it actually covered recent activity.
-
-    A CVD built from 2 seconds of trades 40 seconds ago is stale no matter
-    how confident the numbers look.
-    """
-    if res is None or res.n_trades == 0:
-        return False
-    if now is None:
-        now = time.time()
-    return res.coverage_s > 0 and (res.requested_window_s <= max_age_s)
+# NOTE: there is deliberately no `is_fresh` here. A previous version carried a
+# function by that name whose body checked coverage and window size but never
+# the age of the data — it could not detect staleness, and it was called by
+# nothing. Staleness IS enforced, one level up: `poller.live_pairs` drops any
+# venue snapshot older than max_age_s before features ever see it, and
+# `window_cvd` drops trades outside the window at build time. A freshness
+# concern belongs at those two points; a third check that reads like a fourth
+# guarantee is how a stale reading gets trusted.
 
 
 def normalize_to_window(

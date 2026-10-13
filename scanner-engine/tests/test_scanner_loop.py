@@ -229,13 +229,46 @@ def test_audited_rules_is_empty_while_every_rule_is_unvalidated(tmp_path):
     'UNVALIDATED - no recorded outcomes yet...'. An exact `!= "UNVALIDATED"`
     check reported rule 1 as AUDITED, which is the one condition that would let
     an unmeasured rule contribute a direction."""
-    sc = SC.Scanner(pairs=["ETH/USD"], db_path=":memory:", rules=RE.load_rules())
+    rules = RE.load_rules()
+    # Pin the PREFIX contract, not today's file contents: rules 1/2 now carry
+    # measured DROP statuses, so force every rule to an UNVALIDATED string and
+    # assert none leaks into audited_rules. DROP statuses are audited-by-design
+    # (they are measurements); the regression this test guards is the
+    # descriptive-suffix leak.
+    for spec in rules["rules"].values():
+        spec["audit_status"] = "UNVALIDATED - no recorded outcomes yet."
+    sc = SC.Scanner(pairs=["ETH/USD"], db_path=":memory:", rules=rules)
     sc.inject_fetchers({
         v: (lambda p: (Book(bid=100.0, bids=[(100.0, 1.0)], asks=[(100.1, 1.0)]), None))
         for v in ("binance", "okx", "kraken", "bybit")
     })
     sc.run_cycle()
     assert sc.health()["audited_rules"] == []
+
+
+def test_retired_rules_stop_producing_candidates(tmp_path):
+    """REGRESSION (2026-10-11). A rule measured into DROP must keep firing as
+    an OBSERVATION (rules_met stays truthful) but must stop producing
+    candidate rows — that is the loop-closing half of promotion: the auditor
+    can take hypotheses out, not only grant sides. Without this filter, a
+    retired rule keeps consuming batch slots and Bonferroni cells forever."""
+    rules = RE.load_rules()
+    for spec in rules["rules"].values():
+        spec["audit_status"] = "DROP refuted n=1 t=-9.0 mean=-0.01"
+    sc = SC.Scanner(pairs=["ETH/USD"], db_path=":memory:", rules=rules)
+    sc.inject_fetchers({
+        v: (lambda p: (Book(bid=100.0, bids=[(100.0, 1.0)], asks=[(100.1, 1.0)]), None))
+        for v in ("binance", "okx", "kraken", "bybit")
+    })
+    sc.run_cycle()
+    assert sc.health()["retired_rules"] == sorted(rules["rules"].keys())
+    # Even if a retired rule fired MET here (this fixture's tape=None makes
+    # every rule UNEVALUABLE/UNMET, so rules_met is empty), the candidate flag
+    # and the direction can only come from NON-retired rules. Assert the
+    # ledger-level guarantee on the rows actually written.
+    rows = sc.db.execute("SELECT candidate, direction FROM verdicts").fetchall()
+    assert rows, "el ciclo grabo filas"
+    assert all(r[0] == 0 and r[1] == 0 for r in rows),         "con TODAS las reglas retiradas, ninguna fila puede ser candidato"
 
 
 def test_horizon_holds_wall_clock_constant_across_bar_sizes(tmp_path):

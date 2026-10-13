@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import pathlib
 from dataclasses import dataclass, field
+from statistics import median, stdev
 
 MET = "MET"
 UNMET = "UNMET"
@@ -43,6 +44,49 @@ def load_rules(path: pathlib.Path | str | None = None) -> dict:
     p = pathlib.Path(path) if path else pathlib.Path(__file__).with_name("rules.json")
     with open(p, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+# Floor used when no rule declares one. Both defaults are measured against what
+# the venue APIs can actually deliver -- see `features.compute` for the table
+# that motivated gating on trade count as well as span.
+DEFAULT_MIN_COVERAGE_S = 5.0
+DEFAULT_MIN_TRADES = 50
+
+
+def coverage_floor(rules: dict) -> float:
+    """The tape-coverage floor implied by rules.json, applied GLOBALLY.
+
+    Rule 4 declares `min_coverage_s`. `features.compute` hardcoded 20.0 and
+    `_rule4` never read its own declared value, so the config entry was
+    decorative -- the exact failure this repo documents for thresholds that do
+    not change behaviour.
+
+    Taking the MAXIMUM declared value and applying it once in `compute` is the
+    conservative reading: no rule can ever be handed a venue thinner than its
+    own spec permits. Taking the minimum instead would silently relax rule 4;
+    taking each rule's own value would require computing flow four times.
+    """
+    declared = []
+    for spec in (rules.get("rules") or {}).values():
+        v = (spec.get("thresholds") or {}).get("min_coverage_s")
+        if isinstance(v, (int, float)):
+            declared.append(float(v))
+    return max(declared) if declared else DEFAULT_MIN_COVERAGE_S
+
+
+def trade_floor(rules: dict) -> int:
+    """The minimum trade count a venue's tape must carry, from rules.json.
+
+    This is the gate that actually protects the delta_ratio's precision. A
+    coverage floor alone cannot: Kraken returns four trades spanning 25s and
+    would pass it, while a ratio from four trades is a coin-flip.
+    """
+    declared = []
+    for spec in (rules.get("rules") or {}).values():
+        v = (spec.get("thresholds") or {}).get("min_trades")
+        if isinstance(v, int) and v > 0:
+            declared.append(v)
+    return max(declared) if declared else DEFAULT_MIN_TRADES
 
 
 @dataclass
@@ -109,6 +153,31 @@ class Verdict:
 
 # ── individual rules ───────────────────────────────────────────────────────
 
+def _rule_state(sub_a: Sub, sub_b: Sub) -> str:
+    """Fold two subconditions into one rule state, correctly.
+
+    The ordering carries the meaning and is not interchangeable:
+
+      * a UNMET primary means the rule is false. There is nothing left to ask,
+        so the rule is UNMET even if the secondary could not be evaluated.
+      * a UNMET secondary over a MET primary is a genuine UNMET — we asked and
+        the answer was no.
+      * an UNEVALUABLE subcondition makes the whole rule UNEVALUABLE. "We could
+        not check" must never be reported as "no".
+
+    Getting this wrong in the permissive direction is how a rule that was never
+    asked gets graded; getting it wrong in the strict direction is how a real
+    signal is suppressed by a missing feed.
+    """
+    if sub_a.state == UNMET:
+        return UNMET
+    if sub_b.state == UNEVALUABLE:
+        return UNEVALUABLE
+    if sub_a.state == MET and sub_b.state == MET:
+        return MET
+    return UNMET
+
+
 def _rule1(spec, f, history) -> RuleResult:
     """Cross-venue basis dislocation.
 
@@ -128,10 +197,10 @@ def _rule1(spec, f, history) -> RuleResult:
 
     h = (history or {}).get("1", {})
     cycles = h.get("cycles", 0)
-    was_big = abs(h.get("z_max", 0.0)) >= thr
+    was_big = abs(h.get("z_max") or 0.0) >= thr
     sub_b = (Sub("b", MET, f"{cycles} consecutive cycles >= threshold")
              if was_big and cycles >= need else
-             Sub("b", UNMET, f"{cycles} cycles, need {need}; prev z={h.get('z_max', 0.0):.2f}"))
+             Sub("b", UNMET, f"{cycles} cycles, need {need}; prev z={h.get('z_max') or 0.0:.2f}"))
 
     state = MET if (sub_a.state == MET and sub_b.state == MET) else UNMET
     return RuleResult("1", spec["name"], state, spec["requires_venues"],
@@ -143,8 +212,19 @@ def _rule2(spec, f, history) -> RuleResult:
 
     (a) one venue's flow ratio deviates from the cross-venue median
     (b) price did NOT respond — absorption
+
+    Condition (b) was previously a hard-coded `UNEVALUABLE` with the note
+    "price-response window not recorded yet", and the rule then returned
+    `state = UNEVALUABLE` unconditionally. That made rule 2 STRUCTURALLY
+    impossible to fire: the engine shipped four rules and could measure one.
+    The response is now measured — `features.price_move_bps` carries the move
+    over each venue's own flow window — so the condition can be asked.
     """
     thr = spec["thresholds"]["flow_gap"]
+    # How far the deviating venue's price may move and still count as "not
+    # responding". Read from the spec so the rule is tunable from rules.json;
+    # it used to be hard-coded, which is how a config value ends up decorative.
+    resp = spec["thresholds"].get("max_price_response_bps", 5.0)
 
     if f.n_venues_with_tape < 2:
         return RuleResult("2", spec["name"], UNEVALUABLE, spec["requires_venues"],
@@ -153,24 +233,37 @@ def _rule2(spec, f, history) -> RuleResult:
         return RuleResult("2", spec["name"], UNEVALUABLE, spec["requires_venues"],
                           reason="no flow median")
 
-    worst_v, worst_dev = None, 0.0
-    for v, r in f.flow_by_venue.items():
-        dev = abs(r - f.flow_median)
-        if dev > worst_dev:
-            worst_v, worst_dev = v, dev
+    # `features.compute` precomputes the deviating venue, but the rule derives
+    # it if absent rather than trusting an optional convenience field. A rule
+    # that silently reads None as 0.0 would report "no venue deviated" for a
+    # snapshot that plainly shows one at 0.95 vs a 0.865 median.
+    worst_v = f.flow_deviator
+    worst_dev = f.flow_deviation
+    if worst_dev is None or worst_v is None:
+        worst_v, worst_dev = None, 0.0
+        for v, r in (f.flow_by_venue or {}).items():
+            dev = abs(r - f.flow_median)
+            if dev > worst_dev:
+                worst_v, worst_dev = v, dev
 
     sub_a = Sub("a", MET if worst_dev >= thr else UNMET,
                 f"{worst_v} deviates {worst_dev:.3f} from median {f.flow_median:.3f} "
                 f"(threshold {thr})")
 
-    # (b) needs the deviation venue's own price move over the window, which the
-    # current snapshot does not carry. Reported UNEVALUABLE, never assumed.
-    sub_b = Sub("b", UNEVALUABLE, "price-response window not recorded yet")
+    moved = f.price_move_bps.get(worst_v) if worst_v else None
+    if moved is None:
+        # No price alongside this venue's flow. That is "we could not check",
+        # which is UNEVALUABLE and must not be folded into UNMET.
+        sub_b = Sub("b", UNEVALUABLE,
+                    f"no price response recorded for {worst_v!r}")
+    else:
+        sub_b = Sub("b", MET if abs(moved) < resp else UNMET,
+                    f"{worst_v} price moved {moved:+.2f}bps over the window; "
+                    f"abs must stay under {resp}bps for absorption")
 
-    state = UNEVALUABLE      # a required subcondition cannot be asked
+    state = _rule_state(sub_a, sub_b)
     return RuleResult("2", spec["name"], state, spec["requires_venues"],
-                      {"a": sub_a, "b": sub_b},
-                      reason="condition (b) requires a recorded price-response window")
+                      {"a": sub_a, "b": sub_b})
 
 
 def _rule3(spec, f, history) -> RuleResult:
@@ -195,13 +288,35 @@ def _rule3(spec, f, history) -> RuleResult:
                 f"buy={side_buy} sell={side_sell} of {len(usable)}")
 
     h = (history or {}).get("3", {})
-    if not h.get("depth_median"):
-        sub_b = Sub("b", UNEVALUABLE, "no trailing depth median recorded for this pair")
-    else:
-        sub_b = Sub("b", UNEVALUABLE, "depth z-score needs multiple cycles of history")
+    med = h.get("depth_median")
+    hist = h.get("depth_history") or []
 
-    state = MET if (sub_a.state == MET and sub_b.state == MET) else (
-        UNMET if sub_a.state == UNMET else UNEVALUABLE)
+    # The comparison is TODAY's depth against the trailing baseline of PRIOR
+    # cycles. Reading the current value out of `history` instead would compare
+    # the last observation against a median that already contains it, which
+    # always leans positive and can never detect a departure.
+    now = sum(f.depth_total.values()) if f.depth_total else None
+
+    if not med:
+        sub_b = Sub("b", UNEVALUABLE, "no trailing depth median recorded for this pair")
+    elif now is None:
+        sub_b = Sub("b", UNEVALUABLE, "current cycle carries no depth to compare")
+    elif len(hist) < MIN_DEPTH_POINTS:
+        sub_b = Sub("b", UNEVALUABLE,
+                    f"only {len(hist)} of {MIN_DEPTH_POINTS} cycles of depth "
+                    f"history — a trailing median needs a usable dispersion")
+    else:
+        sd = stdev(hist)
+        z = (now - med) / sd if sd > 0 else None
+        need_z = spec["thresholds"].get("depth_z", -1.5)
+        if z is None:
+            sub_b = Sub("b", UNEVALUABLE, "depth distribution is degenerate")
+        else:
+            sub_b = Sub("b", MET if z <= need_z else UNMET,
+                        f"depth z={z:.2f} vs this pair's own trailing median "
+                        f"(needs <= {need_z})")
+
+    state = _rule_state(sub_a, sub_b)
     return RuleResult("3", spec["name"], state, spec["requires_venues"],
                       {"a": sub_a, "b": sub_b})
 
@@ -233,6 +348,11 @@ def _rule4(spec, f, history) -> RuleResult:
     else:
         sub_a = Sub("a", MET, f"{len(major)} venue(s) agree")
 
+    # Upper-middle element, not an interpolated median — the SAME convention
+    # features.compute uses for its median centre (see the CONVENTION note
+    # there). Consistency matters: flow_strength in rules.json is calibrated
+    # against this reading, and scanner._flow_by_rule derives the provisional
+    # side from the same shape of statistic.
     med = sorted(major)[len(major) // 2]
     sub_b = Sub("b", MET if abs(med - 0.5) >= strength else UNMET,
                 f"median ratio {med:.3f}, needs |x-0.5| >= {strength}")
@@ -243,6 +363,117 @@ def _rule4(spec, f, history) -> RuleResult:
 
 
 _DISPATCH = {"1": _rule1, "2": _rule2, "3": _rule3, "4": _rule4}
+
+
+# ── cross-cycle memory ──────────────────────────────────────────────────────
+
+# A trailing median over fewer points than this is not a baseline: the spread
+# is too small to be meaningful, and a z-score against it would be dominated
+# by rounding noise.
+MIN_DEPTH_POINTS = 20
+
+
+class RuleHistory:
+    """Per-pair memory the rule evaluators need but a snapshot cannot carry.
+
+    THREE OF THE FOUR RULES WERE PERMANENTLY UNFIRABLE WITHOUT THIS, and the
+    engine did not say so: it reported "insufficient data" while actually
+    having no code path to MET.
+
+      rule 1  condition (b) asks whether a dislocation PERSISTED for N cycles.
+      rule 3  condition (b) asks whether depth FELL BELOW ITS OWN trailing
+              median for this pair.
+      rule 2  condition (b) asks whether price did NOT RESPOND to the flow.
+
+    `evaluate()` stays a pure function of (features, history) so it remains
+    testable; this object owns the state and the loop advances it.
+
+    THE ORDER MATTERS and is enforced by the call sequence in the scanner:
+
+        snap = history.snapshot(pair)   # state as of the END of last cycle
+        verdict = evaluate(feat, pair, min_venues, rules, history=snap)
+        history.observe(pair, feat)     # advance memory with THIS cycle
+
+    `snapshot()` must be taken BEFORE `observe()`, because condition (b) of
+    rule 1 is about what happened on the PREVIOUS cycle. Observing first would
+    make every rule fire one cycle early.
+    """
+
+    def __init__(self, depth_window: int = 60):
+        self.depth_window = depth_window
+        # pair -> list[float] of total top-N depth, most recent last
+        self._depths: dict[str, list[float]] = {}
+        # (pair, z_threshold) -> consecutive cycles at or over the threshold
+        self._z_streak: dict[tuple, int] = {}
+        # pair -> last observed z_max, used by rule 1's persistence test
+        self._last_z: dict[str, float] = {}
+        # pair -> {"z_max": float|None, "cycles": int}
+        self._state: dict[str, dict] = {}
+
+    def snapshot(self, pair: str) -> dict:
+        """The `history` argument for `evaluate()`, as of the last cycle."""
+        return self._state.get(pair, {})
+
+    def observe(self, pair: str, feat, z_threshold: float = 6.0) -> None:
+        """Fold this cycle's features into the running state."""
+        z = feat.z_max()
+        key = (pair, z_threshold)
+        if z is not None and abs(z) >= z_threshold:
+            self._z_streak[key] = self._z_streak.get(key, 0) + 1
+        else:
+            self._z_streak[key] = 0
+
+        depths = self._depths.setdefault(pair, [])
+        if feat.depth_total:
+            # Sum across venues: rule 3 asks whether the PAIR's liquidity left,
+            # not whether one venue's book shrank while another's grew.
+            depths.append(sum(feat.depth_total.values()))
+            if len(depths) > self.depth_window:
+                del depths[:-self.depth_window]
+
+        self._last_z[pair] = z
+        self._state[pair] = {
+            "1": {"z_max": z, "cycles": self._z_streak.get(key, 0)},
+            "3": {
+                "depth_median": median(depths) if depths else None,
+                "depth_now": depths[-1] if depths else None,
+                "depth_history": list(depths),
+                "depth_n": len(depths),
+            },
+        }
+
+    def depth_median(self, pair: str) -> float | None:
+        """This pair's trailing median top-N depth, or None before any cycle."""
+        st = self._state.get(pair, {}).get("3")
+        return st.get("depth_median") if st else None
+
+    def depth_z(self, pair: str, current: float | None = None) -> float | None:
+        """`current` depth vs this pair's own trailing distribution.
+
+        `current` is supplied by the caller because the comparison must be
+        against a baseline of PRIOR cycles. Reading it back out of the stored
+        state would put the current observation inside its own median.
+
+        None until there is enough history for the spread to mean anything.
+        Fewer than `MIN_DEPTH_POINTS` observations has no usable dispersion, and
+        dividing by a near-zero stdev would manufacture an enormous z from
+        rounding noise.
+        """
+        st = self._state.get(pair, {}).get("3")
+        if not st or not st.get("depth_history"):
+            return None
+        hist = st["depth_history"]
+        if len(hist) < MIN_DEPTH_POINTS:
+            return None
+        if current is None:
+            current = st.get("depth_now")
+        if current is None:
+            return None
+        med = st.get("depth_median")
+        sd = stdev(hist)
+        if not med or sd <= 0:
+            return None
+        return (current - med) / sd
 
 
 # ── the evaluator ──────────────────────────────────────────────────────────

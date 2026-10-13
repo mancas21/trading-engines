@@ -20,6 +20,7 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking proxy)
+import outcomes as OUT  # noqa: E402  shared exit-bar selection (ceil semantics)
 
 import json
 import time
@@ -113,7 +114,14 @@ def fetch_ticker_book(pair: str):
     return parse_ticker(_get(f"/api/v5/market/ticker?instId={symbol_for(pair)}"))
 
 
-def fetch_trades(pair: str, limit: int = 100) -> list[dict]:
+def fetch_trades(pair: str, limit: int = 500) -> list[dict]:
+    """Recent trades, newest page the API will serve.
+
+    The limit was 100. Measured on ETH 2026-10-11: 100 trades span 1.0s,
+    which is not a flow measurement over any useful window. 500 is the API
+    cap for this endpoint and spans ~5s. Going higher silently returns the
+    same 500, so 500 is the whole available sample.
+    """
     return parse_trades(_get(f"/api/v5/market/trades?instId={symbol_for(pair)}&limit={limit}"))
 
 
@@ -123,8 +131,19 @@ def fetch_candles(pair: str, bar: str = "1m", limit: int = 5) -> list[dict]:
     )
 
 
-def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None):
-    """The closed bar covering `at_ms`.
+# OKX bar strings are the same "1m"/"5m" shape; the candle's ts_ms is the OPEN
+# time, so the close needs the bar's own length. (The close_ms used to be
+# recorded as the open time — harmless while OKX was never a ref venue, wrong
+# the moment it became one.)
+OKX_BAR_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+              "30m": 1_800_000, "1H": 3_600_000, "4H": 14_400_000, "1D": 86_400_000}
+
+
+def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None,
+                     now_ms: int | None = None):
+    """The exit bar for a horizon measured from `at_ms` — see
+    `outcomes.select_exit_bar` for why the selection is CEIL (first closed bar
+    whose close is at or after at_ms), not floor.
 
     OKX candles carry an explicit trailing `confirm` flag (1 = closed), so this
     uses that rather than inferring closure from the timestamp alone.
@@ -132,16 +151,17 @@ def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None):
     if at_ms is None:
         at_ms = int(time.time() * 1000)
     rows = fetch_candles(pair, bar=bar, limit=50)
-    best = None
+    step = OKX_BAR_MS.get(bar, 60_000)
+    candidates = []
     for row in rows:
         if not row["closed"]:
             continue
-        if row["ts_ms"] <= at_ms:
-            best = row
-    if best is None:
-        return None
-    return {"open_ms": best["ts_ms"], "close_ms": best["ts_ms"],
-            "close": best["close"], "volume": best["volume"]}
+        close_ms = int(row["ts_ms"]) + step          # ts_ms is the OPEN time
+        candidates.append((close_ms, {
+            "open_ms": int(row["ts_ms"]), "close_ms": close_ms,
+            "close": row["close"], "volume": row["volume"],
+        }))
+    return OUT.select_exit_bar(candidates, at_ms, now_ms)
 
 
 def fetch_open_interest(pair: str):
