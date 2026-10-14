@@ -75,6 +75,89 @@ def get(path: str, timeout: float = 25.0):
         return {"_error": f"{type(e).__name__}: {str(e)[:70]}"}
 
 
+# ── IDENTIDAD DE BARRA (fix 2026-10-13) ──────────────────────────────────────
+# POR QUE: bar_index es el indice POSICIONAL de ATAS sobre la serie del chart.
+# Se reinicia desde 0 cuando el chart recarga o cambia de timeframe, asi que el
+# MISMO numero vuelve a aparecer en dias distintos. Medido en reader.db: 109 de
+# 127 indices aparecian en mas de un dia; bar#1163 cubria 7 dias con 27 filas.
+# Medido ademas: los PRECIOS de esas filas son correctos (400/400 dentro del
+# rango 5m real de Binance) — el fallo es de IDENTIDAD, no de precio. Por eso
+# forward_return (que resuelve por TIEMPO) no estaba sesgado; lo que estaba roto
+# era cualquier agrupacion por barra.
+#
+# QUE HACE: una clave de barra UNICA. La ancla es la ETIQUETA DE BARRA que
+# publica ATAS (bar_time = "HH:mm:ss" del open de la vela), NO el segundo de
+# lectura: todas las lecturas de la misma vela deben colapsar en la misma clave.
+#
+# TRES CASOS QUE LA CLAVE TIENE QUE SEPARAR (los tres existen en produccion):
+#
+#  1) manyadas de lecturas de la MISMA vela  -> misma clave.
+#     Ancla en la etiqueta de barra, no en el reloj.
+#
+#  2) la misma etiqueta HH:mm:ss en OTRO dia
+#     -> clave distinta. De aqui el ancla en epoch: floor(ts/86400).
+#
+#  3) un RELOAD que hace retroceder el reloj de ATAS
+#     -> clave distinta aunque coincida etiqueta y dia. De aqui el segmento:
+#     cuenta cada retroceso MONOTONO, con la etiqueta del salto congelada para
+#     que dos retrocesos consecutivos no colapsen en el mismo segmento.
+#
+# La clave NO cambia el sesgo ni el resolver: solo da una identidad fiable para
+# agrupar y para las condiciones "2+ barras consecutivas".
+_BAR_SEGMENT = 0          # segmentos consumidos; NUNCA decrece
+_last_bar_key = None      # clave emitida en la ultima lectura
+_last_tag = None          # etiqueta de la ultima vela
+_last_day = None          # dia (epoch//86400) de la ultima vela
+
+
+def bar_key(bar_time: str | None, wall_ts: float) -> tuple:
+    """Clave de barra estable: (dia, etiqueta_HHMMSS, segmento).
+
+    - dia:        epoch//86400. Separa el mismo reloj de otro dia.
+    - etiqueta:   open de la vela en HH:mm:ss. Identifica la vela DENTRO del dia
+                  y colapsa las muchas lecturas que caen en ella.
+    - segmento:   contador monotono de reinicios. Separa dos velas con la misma
+                  etiqueta y el mismo dia, que solo puede pasar tras un reload.
+
+    Devuelve una tupla; el llamante la serializa como texto para la columna.
+    """
+    global _BAR_SEGMENT, _last_bar_key, _last_tag, _last_day
+
+    tag = (bar_time or "").strip() or "?"
+    day = int(wall_ts) // 86400
+
+    # Retroceso = la vela va hacia atras respecto de la ultima observada.
+    # Puede venir por cambio de dia (nuevo dia, misma etiqueta) o por reload
+    # (retroceso real dentro del mismo dia). Ambos son un reinicio de la serie
+    # de ATAS, y ambos necesitan un segmento nuevo.
+    retrocede = False
+    if _last_tag is not None:
+        if day != _last_day:
+            retrocede = True              # rollover de dia: el reloj de ATAS
+        elif tag < _last_tag:             # retrocede a una vela anterior
+            retrocede = True
+
+    if retrocede:
+        _BAR_SEGMENT += 1
+    elif _last_bar_key is None:
+        _BAR_SEGMENT = 0                  # primera lectura de la sesion
+
+    key = (day, tag, _BAR_SEGMENT)
+    _last_tag = tag
+    _last_day = day
+    _last_bar_key = key
+    return key
+
+
+def bar_key_str(key: tuple) -> str:
+    """Serializa la clave de barra para la columna TEXT.
+
+    Separador '|': la etiqueta de ATAS ya contiene ':' ("01:00:00"), asi que
+    un separador de dos puntos haria la clave ambigua al partirla.
+    """
+    return "|".join(str(x) for x in key)
+
+
 def ema(vals):
     return vals[-1] if vals else None
 
@@ -226,11 +309,18 @@ def read_live():
     # Esto no cambia ningun veredicto, quita un numero que no significaba nada.
     score, parts = None, None
 
+    # Clave de barra estable. Se calcula ANTES del dict para que ts y key
+    # provengan del mismo instante leido.
+    _wall = time.time()
+    _bk = bar_key(i.get("time"), _wall)
+
     rec = {
-        "ts": time.time(),
+        "ts": _wall,
         "symbol": str(i.get("ticker")).upper(),
         "bar_index": i.get("bar_index"),
         "bar_time": i.get("time"),
+        "bar_key": bar_key_str(_bk),
+        "bar_seg": _bk[2],
         "src_age_s": round(age, 1),
         "price_last": price.get("last"),
         "poc": fp.get("poc"),
@@ -294,11 +384,37 @@ CREATE TABLE IF NOT EXISTS recorder_meta (
 );
 """
 
+# Fix 2026-10-13: identidad de barra estable. Se anade por MIGRACION, no en
+# CREATE TABLE: reader.db ya existe con su historico y CREATE TABLE IF NOT
+# EXISTS no alteraria el esquema de una tabla viva.
+_MIGRATIONS = [
+    # bar_key: la clave estable que sustituye a bar_index como identidad.
+    ("verdicts", "bar_key", "TEXT"),
+    # bar_seg: segmento de reloj (0 = sesion normal, >0 tras un reinicio).
+    ("verdicts", "bar_seg", "INTEGER"),
+]
+
+
+def _migrate(c):
+    """Anade columnas nuevas sin perder historico.
+
+    CREATE TABLE IF NOT EXISTS no toca una tabla que ya existe, asi que anadir
+    columnas tiene que ser un ALTER TABLE explicito e idempotente.
+    """
+    for tabla, col, tipo in _MIGRATIONS:
+        cols = {r[1] for r in c.execute(f"PRAGMA table_info({tabla})")}
+        if col not in cols:
+            c.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_verdicts_barkey "
+              "ON verdicts(bar_key)")
+
 
 def db():
     DB.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB, timeout=20)
     c.executescript(SCHEMA)
+    _migrate(c)
+    c.commit()
     return c
 
 
@@ -307,20 +423,26 @@ def do_record(c) -> int:
     if rec is None:
         print(f"  SKIP: {err}")
         return 0
-    cols = ("ts,symbol,bar_index,bar_time,src_age_s,price_last,poc,value_area_low,"
-            "value_area_high,levels,thin_levels,footprint_sell_heavy,"
+    cols = ("ts,symbol,bar_index,bar_time,bar_key,bar_seg,src_age_s,price_last,"
+            "poc,value_area_low,value_area_high,levels,thin_levels,"
+            "footprint_sell_heavy,"
             "footprint_buy_heavy,imbalance_pct,imbalance_pct_ema,imbalance_ema_n,"
             "tape_buy_pct,volume_ratio,cvd,cvd_bars,cvd_streak_up,cvd_streak_down,"
             "r6_a,r6_b,r6_c,r6_met,r7_a,r7_b,r7_c,r7_met,bias,score,score_parts,"
-            "horizon_bars")
+            "horizon_bars,resolved")
+    # `resolved` se escribe EXPLICITO a 0. La tabla real de reader.db no tiene
+    # DEFAULT en esa columna (el CREATE TABLE solo aplica a bases nuevas), asi
+    # que omitirla deja NULL y el filtro `resolved=0` del resolver NUNCA la
+    # encuentra: la fila se grababa pero no se resolvia jamais, en silencio.
     vals = tuple(rec[k] for k in (
-        "ts", "symbol", "bar_index", "bar_time", "src_age_s", "price_last", "poc",
+        "ts", "symbol", "bar_index", "bar_time", "bar_key", "bar_seg",
+        "src_age_s", "price_last", "poc",
         "value_area_low", "value_area_high", "levels", "thin_levels",
         "footprint_sell_heavy", "footprint_buy_heavy", "imbalance_pct",
         "imbalance_pct_ema", "imbalance_ema_n", "tape_buy_pct", "volume_ratio",
         "cvd", "cvd_bars", "cvd_streak_up", "cvd_streak_down",
         "r6_a", "r6_b", "r6_c", "r6_met", "r7_a", "r7_b", "r7_c", "r7_met",
-        "bias", "score", "score_parts", "horizon_bars"))
+        "bias", "score", "score_parts", "horizon_bars")) + (0,)
     c.execute(f"INSERT INTO verdicts ({cols}) VALUES ({','.join('?' * len(vals))})", vals)
     c.execute("INSERT OR REPLACE INTO recorder_meta VALUES ('last_record_ts', ?)",
               (str(rec["ts"]),))
@@ -343,9 +465,15 @@ def do_resolve(c) -> int:
             print("  no hay verdicts que resolver")
             return 0
         sym = (row[0],)
+    # Una fila es resoluble si tiene identidad de barra: bar_key (la clave estable,
+    # fix 2026-10-13) o, para el historico previo al fix, bar_index. El filtro
+    # anterior exigia bar_index IS NOT NULL, lo que ya no describe la realidad:
+    # la identidad estable manda, y bar_index es solo el respaldo legacy.
     pending = c.execute(
         "SELECT id,symbol,bar_index,horizon_bars,bias FROM verdicts "
-        "WHERE resolved=0 AND bar_index IS NOT NULL ORDER BY id").fetchall()
+        "WHERE COALESCE(resolved,0)=0 "
+        "AND (bar_key IS NOT NULL OR bar_index IS NOT NULL) "
+        "ORDER BY id").fetchall()
     if not pending:
         print("  nada pendiente")
         return 0
