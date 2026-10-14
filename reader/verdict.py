@@ -499,13 +499,33 @@ def cvd_integrity(cvd_state: dict, need_bars: int = CVD_INTEGRITY_MIN_BARS,
         out.update(ok=False, reason=f"continuity={cvd_state.get('continuity')}")
         return out
     # Cuantas barras limpias hay DESDE el ultimo hueco. El puente lo publica como
-    # bars_since_gap; si no lo publica, no se puede afirmar nada y se dice.
+    # bars_since_gap.
+    #
+    # 2026-10-14 — BUG ARREGLADO: `None` significaba DOS cosas a la vez.
+    # bridge_server.py inicializa bars_since_gap=None y lo documenta como "nunca
+    # hubo hueco" (L772), y su PROPIO payload lo traduce a continuity="clean"
+    # (L1074-1078). Este lector interpretaba ese mismo None como "el campo no
+    # viene" y devolvia ok=False. Consecuencia medida: la serie MAS sana posible
+    # (gaps=0, missing_bars=0, continuity clean) se declaraba no verificable,
+    # (a) quedaba UNEVALUABLE y las reglas 6/7 — las unicas direccionales, la 4
+    # esta deshabilitada — no podian dispararse tras un reinicio del puente.
+    # Peor aun: el incremento del puente (L996) esta guardado con `is not None`,
+    # asi que None se quedaba None hasta que ocurriera un hueco por accidente.
+    # Un centinela con dos significados, y el lector elegia el malo.
+    #
+    # Distincion ahora explicita: el campo realmente ausente va SIN continuity
+    # (quien no calcula bars_since_gap tampoco calcula esa continuidad). Si
+    # continuity viene, None es "nunca hueco" y TODAS las barras que hay son
+    # contiguas por definicion.
     since = cvd_state.get("bars_since_gap")
     if since is None:
-        out.update(ok=False,
-                   reason="el puente no publica bars_since_gap; no se puede "
-                          "confirmar que las barras usadas sean contiguas")
-        return out
+        if cvd_state.get("continuity") is None:
+            out.update(ok=False,
+                       reason="el puente no publica bars_since_gap ni continuity; "
+                              "no se puede confirmar que las barras usadas sean "
+                              "contiguas")
+            return out
+        since = len(bd)          # nunca hueco: todas las barras son contiguas
     # La ventana son las ultimas `window` barras. Si el hueco esta mas lejos, las
     # barras que mira la regla son limpias; si esta dentro, no.
     if since < min(window, len(bd)):
