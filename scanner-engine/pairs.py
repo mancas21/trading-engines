@@ -92,6 +92,17 @@ _PAIRS_RAW: dict[str, PairSpec] = {
         min_venues=3, bar="5m", avg_1m_notional_usd=18_000.0,
         note="Kraken does not list it; OKX askSz was 0.55 vs bidSz 41.96 at the touch",
     ),
+    "JUP/USD": PairSpec(
+        symbols={"binance": "JUPUSDT", "okx": "JUP-USDT-SWAP",
+                 "kraken": "JUPUSD", "bybit": "JUPUSDT"},
+        min_venues=4, bar="5m", avg_1m_notional_usd=6_792.0,
+        note=("THINNEST pair in this registry. All four venues list it and all "
+              "four answer depth/trades, so the floor is 4. Measured 2026-10-14, "
+              "60 x 1m bars: binance 6,792 USD/min (median 4,935) -- below SPCX. "
+              "Kraken is effectively dead here: median 5 USD/min. 5m is not a "
+              "judgement call, it is the only defensible interval at this size. "
+              "Binance is PERPETUAL, not TRADIFI."),
+    ),
 }
 
 PAIRS: dict[str, PairSpec] = _PAIRS_RAW

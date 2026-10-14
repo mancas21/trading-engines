@@ -69,3 +69,26 @@ def test_bar_interval_is_set_per_pair_from_measured_liquidity():
 def test_all_pairs_declare_a_verified_liquidity_figure():
     for pair, spec in pairs.PAIRS.items():
         assert spec.avg_1m_notional_usd > 0, f"{pair} missing measured liquidity"
+
+
+def test_jup_is_registered_with_its_measured_facts():
+    """JUP was added from live measurement, not from the symbol convention.
+
+    All four venues list it and all four answer depth AND trades, so the
+    evidence floor is 4. Its measured liquidity is the lowest in the registry,
+    which forces the 5m interval -- asserting the bar here is the point: a
+    pair this thin on 1m would produce verdicts on noise.
+    """
+    spec = pairs.PAIRS["JUP/USD"]
+    assert spec.bar == "5m", "JUP is the thinnest pair; 1m is not defensible"
+    assert spec.min_venues == 4, "all four venues list it"
+    assert pairs.venues_for("JUP/USD") == ["binance", "okx", "kraken", "bybit"]
+    assert spec.symbols == {"binance": "JUPUSDT", "okx": "JUP-USDT-SWAP",
+                            "kraken": "JUPUSD", "bybit": "JUPUSDT"}
+    assert spec.ref_venue == "binance"
+    # thinnest in the registry -- if another pair ever drops below this, the
+    # claim in the note became false and someone should look.
+    others = [p.avg_1m_notional_usd for k, p in pairs.PAIRS.items()
+              if k != "JUP/USD"]
+    assert spec.avg_1m_notional_usd <= min(others), \
+        "JUP is no longer the thinnest pair; its note needs updating"

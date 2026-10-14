@@ -41,6 +41,7 @@ import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking 
 import outcomes as OUT  # noqa: E402  shared exit-bar selection (ceil semantics)
 
 import json
+import time
 import urllib.request
 
 KRAKEN = "https://api.kraken.com"
@@ -164,13 +165,19 @@ def fetch_closed_bar(pair: str, bar: str = "1m", at_ms: int | None = None,
     rows = fetch_ohlc(pair, interval=interval)
     step_ms = interval * 60_000
     candidates = []
-    for c in rows:
-        # c: (time, open, high, low, close, vwap, volume, count)
-        start_ms = int(c[0]) * 1000
+    for r in rows:
+        # `fetch_ohlc` returns DICTS (`ts/open/high/low/close/volume/trades`),
+        # not the raw Kraken tuples. This loop indexed it positionally -- r[0],
+        # r[4], r[6] -- so every call raised `KeyError: 0` and Kraken could
+        # never supply an exit bar for ANY pair. It stayed hidden because the
+        # resolver only consults a pair's REFERENCE venue (Binance), so this
+        # path is never taken in production; it surfaced only when probing a
+        # new pair's venues directly.
+        start_ms = int(r["ts"]) * 1000
         end_ms = start_ms + step_ms
         candidates.append((end_ms, {
             "open_ms": start_ms, "close_ms": end_ms,
-            "close": float(c[4]), "volume": float(c[6]),
+            "close": float(r["close"]), "volume": float(r["volume"]),
         }))
     return OUT.select_exit_bar(candidates, at_ms, now_ms)
 

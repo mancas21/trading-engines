@@ -18,6 +18,7 @@ import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking 
 import outcomes as OUT  # noqa: E402  shared exit-bar selection (ceil semantics)
 
 import json
+import time
 import urllib.request
 
 BYBIT = "https://api.bybit.com"

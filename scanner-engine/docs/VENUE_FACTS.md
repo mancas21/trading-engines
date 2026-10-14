@@ -10,6 +10,11 @@ from `C:\Users\Lenovo`. Anything not listed here was **not** measured.
 | Binance `takerlongshortRatio` | **No 1m period** — returns `[]`. Periods 5m/15m/30m/1h/4h resolve. Never use it for a 1m/5m scanner. |
 | Binance per-bar CVD source | `/fapi/v1/klines` idx 5 = base volume, idx 9 = `takerBuyBaseVolume`. `delta = takerBuy − (vol − takerBuy)`. |
 | Binance aggTrades `m` flag | `m=True` means **the buyer was the maker**, so the aggressor **SOLD**. Inverted reading = perfectly inverted CVD. |
+| **JUP listings** | Added 2026-10-14. All four venues list it and all four answer depth/trades: Binance `JUPUSDT` (PERPETUAL, not TRADIFI), OKX `JUP-USDT-SWAP`, Bybit `JUPUSDT` (LinearPerpetual), Kraken `JUPUSD`. |
+| **JUP liquidity** | Measured over 60 x 1m bars: Binance **6,792 USD/min** (median 4,935, max 56,126), OKX 1,372, Bybit 3,013, Kraken **811 (median 5)**. Thinnest pair in the registry -> `bar=5m`. |
+| **JUP tape vs the flow floor** | In a 60s window: Binance 23 trades, OKX 8, Bybit 10, Kraken 0. The rules' `trade_floor` is 50, so **no venue contributes `flow_by_venue`** for JUP. `book_imb_5` is unaffected (it reads the book, not the tape), so rule 7(c) stays evaluable. Do NOT lower the floor to make JUP produce flow -- an 8-trade delta-ratio is noise. |
+| **Kraken `fetch_closed_bar`** | Was dead for EVERY pair: it indexed `fetch_ohlc`'s dicts positionally (`c[0]`, `c[4]`) raising `KeyError: 0`. Hidden because the resolver only consults a pair's REFERENCE venue (Binance). Fixed 2026-10-14. |
+| **Bybit / Kraken `import time`** | Both were missing it, so `fetch_closed_bar(..., at_ms=None)` raised `NameError`. Latent for the same reason. Fixed 2026-10-14. |
 | OKX `market/tickers` (plural) | HTTP 400 `{"code":"50014","msg":"Parameter instType can not be empty."}`. Use singular `/market/ticker`. |
 | OKX `market/candles` | 9 fields, **no taker-buy volume** → per-bar CVD is impossible on OKX. Trade-side only. |
 | OKX trade side | `side` field on `/market/trades` is the taker side. |
