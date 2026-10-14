@@ -327,6 +327,9 @@ def _loop_body(interval: float, dry_run: bool = False) -> int:
     fails = 0
     attempts = 0
     paused_was = False
+    # Una sola vez por proceso: se usa para limpiar el gave_up viejo al primer
+    # ciclo correcto (ver comentario dentro del bucle).
+    _cleared_gave_up = [False]
     while True:
         t0 = time.time()
         try:
@@ -345,6 +348,27 @@ def _loop_body(interval: float, dry_run: bool = False) -> int:
         except Exception:
             pass
         st["consecutive_failures"] = fails
+
+        # gave_up es un flag que ESCRIBE UN PROCESO AL MORIR y que nadie limpia
+        # despues. Medido 2026-10-14: el supervisor del 14-oct agoto 20
+        # reintentos a las 11:45 y dejo gave_up=true al salir; al relanzarlo,
+        # el proceso nuevo ciclaba con exito (recorder/resolve/notify rc=0) pero
+        # el archivo seguia diciendo gave_up=true. Cualquiera que leyera el
+        # status —un monitor, un humano— veia "servicio muerto" con el servicio
+        # vivo y grabando.
+        #
+        # La rama de recuperacion de abajo NO lo arregla: exige paused_was, que
+        # a su vez exige attempts>0, y en un proceso recien arrancado attempts
+        # arranca en 0. Solo el primer ciclo correcto de ESTE proceso puede
+        # decir que el gave_up anterior ya no describe la realidad.
+        if ok and not _cleared_gave_up[0]:
+            _cleared_gave_up[0] = True
+            if st.get("gave_up"):
+                st["gave_up"] = False
+                st["gave_up_cleared_at"] = datetime.now().isoformat()
+                log("gave_up del proceso anterior ya no aplica: este proceso "
+                    f"cicla bien. limpiado a las {st['gave_up_cleared_at']}")
+
         write_status(st)
         if fails >= MAX_FAST_FAILS:
             # OPCION A (2026-10-07): PAUSAR y reintentar, en vez de morir.
