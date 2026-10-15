@@ -140,6 +140,18 @@ RULE7 = {"streak": int(_R7.get("cvd_consecutive_up_min", 2)),
 # acumulación pide bids descansando bajo el precio; la distribución, asks encima.
 RULE6_SIDE, RULE7_SIDE = "sell", "buy"
 
+_UNEVALUABLE = "UNEVALUABLE"
+
+# 2026-10-15 — VENTANA DE PERSISTENCIA de las condiciones, declarada en
+# rules.json (`condition_window_s`). 0 = conjunción estricta en el mismo tick,
+# que es el comportamiento historico. Ver el bloque de condition_window_eval()
+# para la medicion que justifica el valor.
+COND_WINDOW_S = float(_R6.get("condition_window_s", 0) or 0)
+if float(_R7.get("condition_window_s", 0) or 0) != COND_WINDOW_S:
+    print(f"[verdict] AVISO: la regla 6 declara condition_window_s="
+          f"{COND_WINDOW_S:g} y la 7 {_R7.get('condition_window_s')!r}; "
+          f"se usa la de la 6.")
+
 # ── Condición (c) multi-venue: consenso de libro N-de-M del scanner ─────────
 # La fuente es scanner-engine (poller continuo, 4 venues, UNEVALUABLE declarado
 # cuando falta dato — nunca el libro de una GUI). La persistencia vive en un
@@ -320,6 +332,84 @@ def dom_vac_eval(symbol: str, observe: bool = True) -> dict:
             out[side] = {"state": "MET",
                          "detail": f"{count} venues del lado {side}, racha {streak}>= {R['vac_polls']}"}
     return out
+
+
+# ── VENTANA DE PERSISTENCIA DE LAS CONDICIONES (reglas 6 y 7) ───────────────
+#
+# 2026-10-15 — MEDIDO, y es la causa de que el motor fuera MUDO.
+#
+# Durante el rally de JUP (08:54 0.2903 -> 10:17 0.3151, +8,55%) el motor emitio
+# 86 NEUTRAL y 1 solo BULLISH, a las 10:06 con el rally ya hecho (+8%).
+#
+# No faltaba evidencia: en esa ventana (a) estuvo MET 34 veces, (b) 41 veces y
+# (c) 10 veces. Lo que fallaba es que la regla exige las TRES en la MISMA
+# lectura de 30 s, y son tres sensores que no conmutan a la vez. En la linea
+# temporal se ve el near-miss: a las 09:37 (a)=MET (b)=MET (c)=FAIL, y (c)
+# habia estado MET dos minutos antes, a las 09:35. La evidencia estaba y se
+# descartaba por el desfase de muestreo.
+#
+# Medido sobre las 3.339 filas del ledger:
+#   R7 (a)Y(b)Y(c) en el mismo tick -> 14 filas (0,42%)   primer disparo 10:06
+#   R7 cada una vista en 60 s       -> primer disparo 09:35 @ 0.3022
+#
+# La ventana NO anade evidencia: impide tirar la que ya habia. Y el parametro NO
+# esta optimizado: la hora del primer disparo es IDENTICA a 60, 180, 300 y 600 s,
+# asi que 60 s es la intervencion minima suficiente, no un ajuste fino. (Misma
+# prueba que exige quant-research: una meseta, no un pico rodeado de vecinos
+# malos.)
+#
+# NO VALIDADO COMO EDGE. Que dispare antes es medible y esta medido. Que esos
+# disparos GANEN no lo esta, y no se puede medir con lo que hay: 209 h de
+# registro al 13% de cobertura dejan ~35 observaciones independientes a 60 min
+# tras deduplicar. Se trata como regla NO validada, igual que la 7 ya estaba.
+_COND_KEYS = ("r6_a", "r6_b", "r6_c", "r7_a", "r7_b", "r7_c")
+
+
+def _cond_state_path():
+    return HERE / "condition_window_state.json"
+
+
+def condition_window_eval(symbol: str, states: dict, window_s: float,
+                          observe: bool = True) -> dict:
+    """Eleva a MET las condiciones que estuvieron MET dentro de la ventana.
+
+    Solo puede elevar FAIL -> MET, nunca tocar un UNEVALUABLE actual: la falta
+    de dato sigue bloqueando, que es el contrato de la regla.
+
+    Y solo OBSERVA la lectura del grabador (el ciclo real del reader); la puerta
+    LEE. Contarlo dos veces por ciclo es exactamente el fallo que ya se arreglo
+    en la condicion (c).
+    """
+    if window_s <= 0:
+        return states
+    now = time.time()
+    st = {}
+    try:
+        if _cond_state_path().exists():
+            st = json.loads(_cond_state_path().read_text(encoding="utf-8")) or {}
+    except Exception:                               # noqa: BLE001
+        st = {}
+    hist = st.get(symbol) or []
+    if observe:
+        hist.append([now] + [states.get(k) for k in _COND_KEYS])
+    cutoff = now - window_s
+    hist = [h for h in hist if h and h[0] >= cutoff]
+    st[symbol] = hist
+    if observe:
+        try:
+            tmp = _cond_state_path().with_suffix(".tmp")
+            tmp.write_text(json.dumps(st, indent=1), encoding="utf-8")
+            tmp.replace(_cond_state_path())
+        except Exception:                           # noqa: BLE001
+            pass                                    # degrada, no truena
+    out = dict(states)
+    for i, k in enumerate(_COND_KEYS):
+        if out.get(k) in (_UNEVALUABLE, "MET"):
+            continue
+        if any(len(h) > i + 1 and h[i + 1] == "MET" for h in hist):
+            out[k] = "MET"
+    return out
+
 
 # ── COBERTURA DE REGLAS ────────────────────────────────────────────────────
 # Que reglas declara rules.json y cuales implementa REALMENTE este modulo.
@@ -942,6 +1032,23 @@ def build_verdict() -> dict:
     gate = dom_vac_eval(v["symbol"], observe=False)   # la observación es del
     c6 = gate[RULE6_SIDE]["state"]                    # grabador, no de aquí
     c7 = gate[RULE7_SIDE]["state"]
+
+    # Ventana de persistencia: (a), (b) y (c) deben coincidir DENTRO de la
+    # ventana, no en el mismo tick de 30 s. Ver condition_window_eval().
+    # observe=False: el grabador es quien anota; aquí solo se lee.
+    _eff = condition_window_eval(
+        v["symbol"],
+        {k: s for k, s in zip(_COND_KEYS, (a6, b6, c6, a7, b7, c7))},
+        COND_WINDOW_S, observe=False)
+    a6, b6, c6 = _eff["r6_a"], _eff["r6_b"], _eff["r6_c"]
+    a7, b7, c7 = _eff["r7_a"], _eff["r7_b"], _eff["r7_c"]
+
+    v["persistence"] = {
+        "window_s": COND_WINDOW_S,
+        "note": ("las condiciones valen MET si lo estuvieron en los ultimos "
+                 f"{COND_WINDOW_S:g}s; la ventana NO anade evidencia, solo deja "
+                 "de descartar la que ya habia"),
+    }
     v["dom_vac"] = {
         "symbol": v["symbol"],
         # Cada lado con LOS SUYOS: antes ambos reportaban los de la regla 7

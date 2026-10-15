@@ -54,7 +54,9 @@
         "dom_source": "scanner_multi_venue",
         "dom_vac_venues_min": 3,
         "dom_vac_polls_min": 2,
-        "dom_vac_thr": 0.25
+        "dom_vac_thr": 0.25,
+        "condition_window_s": 60,
+        "condition_window_note": "2026-10-15. Las condiciones (a)/(b)/(c) deben coincidir DENTRO de esta ventana, no en la misma lectura de 30s del reader. MEDIDO durante el rally de JUP (08:54 0.2903 -> 10:17 0.3151, +8.55%): el motor emitio 86 NEUTRAL y 1 solo BULLISH, a las 10:06 con el rally ya hecho. No faltaba evidencia -- (a) estuvo MET 34 veces, (b) 41 y (c) 10 en esa ventana -- pero exigirlas en el MISMO tick descartaba los near-miss: a las 09:37 (a)=MET (b)=MET (c)=FAIL, y (c) habia estado MET a las 09:35. Con 60s el primer disparo es 09:35 @ 0.3022 (31 min antes, +4.3% de recorrido por delante en vez de +1.2%). El valor NO esta optimizado: la hora del primer disparo es IDENTICA a 60/180/300/600s, o sea 60s es la intervencion minima suficiente, no un ajuste fino. La ventana NO anade evidencia, solo deja de descartar la que ya habia, y nunca eleva un UNEVALUABLE. NO VALIDADO COMO EDGE: que dispare antes esta medido; que esos disparos ganen NO, y no se puede medir con 209h de registro al 13% de cobertura (~35 observaciones independientes a 60 min)."
       },
       "condition_c_note": "2026-10-11 Fix 2-A (docs/FIXES-gate-DOM.md): la condicion (c) deja de leer imbalance_pct_ema (libro Binance WS top-15, std 7.5, 19-23 cambios de estado/dia) y pasa a consenso multi-venue del scanner: N venues con book_imb_5 del lado sell mas alla de la banda, sostenido dom_vac_polls_min lecturas del reader. polls = lecturas del reader (~30s), no ciclos del scanner. UNEVALUABLE si el scanner no responde o hay menos de dom_vac_venues_min venues vivos.",
       "dom_vac_calibration": {
@@ -79,7 +81,9 @@
         "dom_source": "scanner_multi_venue",
         "dom_vac_venues_min": 3,
         "dom_vac_polls_min": 2,
-        "dom_vac_thr": 0.25
+        "dom_vac_thr": 0.25,
+        "condition_window_s": 60,
+        "condition_window_note": "2026-10-15. Las condiciones (a)/(b)/(c) deben coincidir DENTRO de esta ventana, no en la misma lectura de 30s del reader. MEDIDO durante el rally de JUP (08:54 0.2903 -> 10:17 0.3151, +8.55%): el motor emitio 86 NEUTRAL y 1 solo BULLISH, a las 10:06 con el rally ya hecho. No faltaba evidencia -- (a) estuvo MET 34 veces, (b) 41 y (c) 10 en esa ventana -- pero exigirlas en el MISMO tick descartaba los near-miss: a las 09:37 (a)=MET (b)=MET (c)=FAIL, y (c) habia estado MET a las 09:35. Con 60s el primer disparo es 09:35 @ 0.3022 (31 min antes, +4.3% de recorrido por delante en vez de +1.2%). El valor NO esta optimizado: la hora del primer disparo es IDENTICA a 60/180/300/600s, o sea 60s es la intervencion minima suficiente, no un ajuste fino. La ventana NO anade evidencia, solo deja de descartar la que ya habia, y nunca eleva un UNEVALUABLE. NO VALIDADO COMO EDGE: que dispare antes esta medido; que esos disparos ganen NO, y no se puede medir con 209h de registro al 13% de cobertura (~35 observaciones independientes a 60 min)."
       },
       "condition_c_note": "2026-10-11 Fix 2-A (docs/FIXES-gate-DOM.md): la condicion (c) deja de leer imbalance_pct_ema (libro Binance WS top-15, std 7.5, 19-23 cambios de estado/dia) y pasa a consenso multi-venue del scanner: N venues con book_imb_5 del lado buy mas alla de la banda, sostenido dom_vac_polls_min lecturas del reader. polls = lecturas del reader (~30s), no ciclos del scanner. UNEVALUABLE si el scanner no responde o hay menos de dom_vac_venues_min venues vivos.",
       "dom_vac_calibration": {

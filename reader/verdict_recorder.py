@@ -281,6 +281,18 @@ def read_live():
     cond_c6 = _gate["sell"]["state"]     # distribucion = lado vendedor del libro
     cond_c7 = _gate["buy"]["state"]      # acumulacion = lado comprador del libro
 
+    # 2026-10-15 — VENTANA DE PERSISTENCIA (rules.json -> condition_window_s).
+    # El grabador es el OBSERVADOR: es SU lectura del ciclo la que se anota, y
+    # la puerta solo lee. Contar la misma lectura dos veces por ciclo es el
+    # fallo que ya se arreglo en la condicion (c).
+    _eff = verdict.condition_window_eval(
+        str(i.get("ticker")).upper(),
+        {"r6_a": cond_a6, "r6_b": cond_b6, "r6_c": cond_c6,
+         "r7_a": cond_a7, "r7_b": cond_b7, "r7_c": cond_c7},
+        verdict.COND_WINDOW_S, observe=True)
+    cond_a6, cond_b6, cond_c6 = _eff["r6_a"], _eff["r6_b"], _eff["r6_c"]
+    cond_a7, cond_b7, cond_c7 = _eff["r7_a"], _eff["r7_b"], _eff["r7_c"]
+
     r6 = [cond_a6, cond_b6, cond_c6]
     r7 = [cond_a7, cond_b7, cond_c7]
     r6_ok = all(x == "MET" for x in r6)
