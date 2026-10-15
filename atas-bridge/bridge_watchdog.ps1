@@ -133,5 +133,19 @@ if ($fails -lt 2) {
   exit 0
 }
 
-Set-FailCount 0
-if (Restart-Bridge) { Write-Log "Watchdog run finished: recovered"; exit 0 } else { Write-Log "Watchdog run finished: STILL DEAD"; exit 1 }
+# 2026-10-15 — El contador se resetea SOLO SI el reinicio funciono.
+#
+# Antes: `Set-FailCount 0` iba inmediatamente antes de Restart-Bridge(), o sea
+# se ponia a cero ANTES de saber el resultado. Un reinicio FALLIDO dejaba el
+# contador a 0, asi que las dos ejecuciones siguientes se gastaban otra vez en
+# el flap guard ("Waiting one more cycle"): cada intento fallido costaba dos
+# ciclos EXTRA de puente caido. Ahora el exito limpia y el fallo mantiene el
+# contador, asi que el siguiente ciclo reintenta de inmediato.
+if (Restart-Bridge) {
+  Set-FailCount 0
+  Write-Log "Watchdog run finished: recovered"
+  exit 0
+} else {
+  Write-Log "Watchdog run finished: STILL DEAD"
+  exit 1
+}

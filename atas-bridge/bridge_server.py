@@ -138,11 +138,34 @@ BINANCE_DEPTH_REST_URL = "https://fapi.binance.com/fapi/v1/depth?symbol={symbol}
 _ws_retry: dict[str, int] = {}
 
 
+# 2026-10-15 — CONTEXTO SSL CACHEADO.
+#
+# MEDIDO con py-spy sobre el puente vivo: ~11% de un core en
+# `ssl._load_windows_store_certs` dentro de `create_default_context()`. La causa
+# es que `websockets.connect("wss://...")` construye un contexto por defecto
+# NUEVO —y con `load_default_certs()` RELEE el almacen de certificados de
+# Windows— en CADA conexion. Con 10 simbolos (x2 sockets) y reconexiones, eso es
+# una lectura del almacen del sistema por reconexion, gratis y evitable.
+#
+# Un SSLContext es seguro de compartir entre conexiones: cada `wrap_socket`
+# crea su propia sesion TLS.
+_WS_SSL_CTX = None
+
+
+def _ws_ssl():
+    """SSLContext unico para todos los WebSockets (wss)."""
+    global _WS_SSL_CTX
+    if _WS_SSL_CTX is None:
+        import ssl as _ssl
+        _WS_SSL_CTX = _ssl.create_default_context()
+    return _WS_SSL_CTX
+
+
 async def _dom_feeds():
     """Background task: maintain live DOM snapshots + trade flow."""
     if not HAS_WEBSOCKETS:
         return
-    symbols = ["solusdt", "suiusdt", "hypeusdt", "xrpusdt", "btcusdt", "ethusdt", "spcxusdt", "nvdausdt", "xauusdt"]
+    symbols = ["solusdt", "suiusdt", "hypeusdt", "xrpusdt", "jupusdt", "btcusdt", "ethusdt", "spcxusdt", "nvdausdt", "xauusdt"]
     # P6: DOM persistence tracking — require wall to persist across consecutive reads
     dom_persist: dict[str, dict] = {}
     DOM_PERSIST_REQUIRED = 3
@@ -230,15 +253,18 @@ async def _dom_feeds():
                 # loop cannot service pings that fast, so every socket decided it
                 # was dead and the feeds reconnected in a loop -- which starved
                 # the HTTP server until it stopped accepting connections while the
-                # process stayed alive. Now: one combined socket per symbol (see
-                # _SYMBOL_STREAMS), generous pings, and a bounded reconnect.
+                # process stayed alive. Now: generous pings on BOTH sockets per
+                # symbol (depth + trade; 18 sockets for 9 symbols) and a bounded,
+                # jittered reconnect.
                 async with websockets.connect(depth_url, ping_interval=20,
                                               ping_timeout=60,
                                               close_timeout=5,
+                                              ssl=_ws_ssl(),
                                               max_queue=1024) as d_ws, \
                            websockets.connect(trade_url, ping_interval=20,
                                               ping_timeout=60,
                                               close_timeout=5,
+                                              ssl=_ws_ssl(),
                                               max_queue=1024) as t_ws:
                     _ws_retry[sym] = 0
                     log.info("DOM+Trade feed connected for %s", sym)
@@ -1099,7 +1125,27 @@ def _taker_cvd_new_state() -> dict:
         "low_cvd_usd": 0.0,
         "bars": 0,              # trade count
         "started_ts": 0.0,      # first-trade ts of THIS accumulator run
-        "flow_win": [],         # [[ts, delta_usd], ...] trailing window for cvd_usd_1m/5m
+        # 2026-10-15 — BUCKETS POR SEGUNDO, no una entrada por trade.
+        #
+        # Antes era una lista [[ts, delta_usd], ...] con tope de 4096 entradas y
+        # un rebuild COMPLETO de la lista en CADA trade
+        # (`st["flow_win"] = [e for e in win if e[0] >= cutoff]`). Con la
+        # ventana en 300s y decenas de trades por segundo, la lista estaba
+        # SIEMPRE en el tope, asi que cada trade pagaba O(4096). MEDIDO con
+        # py-spy: el 61% de un core se iba en esa unica linea, y como
+        # `_process_trades` no cede el control mientras drena el WebSocket, el
+        # event loop no llegaba a atender el HTTP — el puerto escuchaba, las
+        # sondas agotaban el tiempo de espera, y todos los WS morian con
+        # "no close frame" porque sus tareas no corrian. Eso es lo que el
+        # watchdog llevaba toda la manana "arreglando" con reinicios.
+        #
+        # Y el tope de 4096 ADEMAS mentia en el numero publicado: el consumidor
+        # pide `cvd_usd_5m` (300s), pero 4096 trades a alta frecuencia son ~74s,
+        # asi que la ventana "5m" medía menos de la mitad sin avisar.
+        #
+        # Con buckets de 1 segundo: <=302 entradas por simbolo, append+evict
+        # O(1) amortizado, y la ventana es EXACTAMENTE la declarada.
+        "flow_win": deque(),    # deque[[segundo_entero, delta_usd], ...]
         "updated_ts": 0.0,
     }
 
@@ -1114,6 +1160,11 @@ def _taker_cvd_load() -> None:
                 continue
             merged = _taker_cvd_new_state()
             merged.update(st)
+            # json guarda `flow_win` como lista; el productor lo necesita como
+            # deque para poder evacuar en O(1). Se convierte ya al cargar (y el
+            # productor lo vuelve a comprobar, porque un fichero de estado
+            # viejo sigue siendo un fichero de estado viejo).
+            merged["flow_win"] = deque(merged.get("flow_win") or [])
             if not merged.get("started_ts"):
                 # Legacy/older state file: cvd_usd carries over from a previous run but the
                 # accumulator's true start is unknown, so its age (and any per-minute rate
@@ -1128,7 +1179,11 @@ def _taker_cvd_save_sync() -> None:
     global _taker_cvd_dirty
     try:
         with _TAKER_CVD_LOCK:
-            payload = _json.dumps(_taker_cvd_state)
+            # default=list: `flow_win` es un deque (para evacuar en O(1)) y el
+            # deque no es serializable por defecto. Sin esto, el guardado
+            # fallaba EN SILENCIO dentro del `except` y el estado en disco
+            # dejaba de actualizarse.
+            payload = _json.dumps(_taker_cvd_state, default=list)
             _taker_cvd_dirty = False
         tmp = _TAKER_CVD_STATE_PATH + ".tmp"
         with open(tmp, "w") as f:
@@ -1200,11 +1255,20 @@ def _taker_cvd_update(symbol: str, delta_qty: float, delta_usd: float) -> None:
         st["low_cvd_usd"] = min(st["low_cvd_usd"], st["cvd_usd"])
         # Rolling window: a cumulative sum is not comparable across symbols (stream ages
         # differ by ~19x), so also keep the trailing net flow per symbol.
-        win = st.setdefault("flow_win", [])
-        win.append([now, delta_usd])
-        cutoff = now - _TAKER_FLOW_WINDOW_S
-        if len(win) > 4096 or (win and win[0][0] < cutoff):
-            st["flow_win"] = [e for e in win if e[0] >= cutoff]
+        win = st.get("flow_win")
+        if not isinstance(win, deque):
+            # Estado cargado de disco (json lo guarda como lista) o de una
+            # version anterior: se convierte aqui para poder evacuar en O(1).
+            win = deque(win or [])
+            st["flow_win"] = win
+        bucket = int(now)
+        if win and win[-1][0] == bucket:
+            win[-1][1] += delta_usd          # mismo segundo: se acumula
+        else:
+            win.append([bucket, delta_usd])
+        cutoff = bucket - int(_TAKER_FLOW_WINDOW_S)
+        while win and win[0][0] < cutoff:
+            win.popleft()                    # O(1) amortizado, no O(n) por trade
         st["updated_ts"] = now
         _taker_cvd_dirty = True
 
@@ -1264,7 +1328,7 @@ def _derivatives_fetch_sync(symbol: str) -> dict | None:
     return {"symbol": sym, "openInterest": oi, "fundingRate": funding, "longShortRatio": ls_ratio, "updated_ts": time.time()}
 
 async def _derivatives_feed():
-    symbols = ["SOLUSDT", "SUIUSDT", "HYPEUSDT", "XRPUSDT", "BTCUSDT", "ETHUSDT", "SPCXUSDT", "NVDAUSDT", "XAUUSDT"]
+    symbols = ["SOLUSDT", "SUIUSDT", "HYPEUSDT", "XRPUSDT", "JUPUSDT", "BTCUSDT", "ETHUSDT", "SPCXUSDT", "NVDAUSDT", "XAUUSDT"]
     log.info("Derivatives feed started (poll %ss)", _DERIVATIVES_POLL_SECONDS)
     while True:
         try:
@@ -1313,7 +1377,14 @@ async def _liquidation_feed():
     log.info("Liquidation feed started: %s", _LIQUIDATION_WS_URL)
     while True:
         try:
-            async with websockets.connect(_LIQUIDATION_WS_URL, ping_interval=20, ping_timeout=10) as ws:
+            # ping_timeout=60, NOT 10: this used to be the exact configuration
+            # the DOM-feed comment above documents as socket-killing under load
+            # ("every socket decided it was dead") — the fix reached the DOM
+            # and trade sockets on 2026-10-07 but this stream kept the old
+            # values and flapped whenever the event loop got saturated.
+            async with websockets.connect(_LIQUIDATION_WS_URL, ping_interval=20,
+                                          ping_timeout=60, close_timeout=5,
+                                          ssl=_ws_ssl()) as ws:
                 log.info("Liquidation feed connected")
                 async for raw in ws:
                     try:
@@ -2960,10 +3031,82 @@ async def health_heartbeat():
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+# 2026-10-15 — EL PUENTE SE WEDGEABA SOLO, Y NO ERA "UN PUENTE CAIDO".
+#
+# Sintoma medido: proceso vivo, CPU al 100%, puerto 8000 en CloseWait sin nadie
+# escuchando, y bridge_watchdog reiniciandolo en bucle cada ~4 min (log:
+# UNHEALTHY -> kill -> RECOVERED -> 2 min sano -> UNHEALTHY). El reader se
+# quedaba sin datos y "pausaba" con SKIP: ATAS no disponible.
+#
+# Causa, en bridge_stderr.log:
+#
+#   Task exception was never retrieved
+#   future: <Task finished coro=<IocpProactor.accept.<locals>.accept_coro()>>
+#   exception=OSError(22, 'El nombre de red especificado ya no está disponible', None, 64, None)>
+#   OSError: [WinError 64] ... Accept failed on a socket
+#   socket: <asyncio.TransportSocket fd=1256, laddr=('127.0.0.1', 8000)>
+#
+# Es el ProactorEventLoop de Windows: accept() se implementa con AcceptEx/IOCP,
+# y un cliente que conecta y RESETEA antes de que el accept se complete hace que
+# AcceptEx devuelva ERROR_NETNAME_DELETED (64). El bucle de accept no se vuelve
+# a armar: el servidor deja de aceptar PARA SIEMPRE mientras el proceso sigue
+# vivo y girando. Ningun supervisor que mire "el proceso vive" lo detecta, y el
+# watchdog tarda 2 ciclos + 15s por su flap guard — de ahi los reinicios cada
+# ~4 min en vez de una recuperacion.
+#
+# Dos arreglos, uno por capa:
+#
+#  1. RAIZ: SelectorEventLoop en vez de ProactorEventLoop. El camino
+#     AcceptEx/IOCP no existe ahi, asi que esta clase de fallo desaparece. El
+#     puente no usa subprocesos asyncio (solo run_in_executor sobre hilos), que
+#     es lo unico que el selector no soporta.
+#     OJO: uvicorn 0.52 ya NO consulta la politica de loop; usa `loop_factory`
+#     (uvicorn/config.py get_loop_factory -> asyncio_loop_factory, que en win32
+#     devuelve ProactorEventLoop). Un asyncio.set_event_loop_policy() aqui no
+#     habria hecho NADA. Hay que darselo al runner, y por eso no se usa
+#     uvicorn.run().
+#
+#  2. RED: si aun asi muere el accept, el proceso SALE. El supervisor
+#     (bridge_supervisor.bat) relanza en ~3s: la recuperacion pasa de 2-4 min a
+#     3s, y deja de existir el estado "vivo pero sordo" que ningun control ve.
+EXIT_ACCEPT_DEAD = 70
+
+
+def _bridge_loop_factory():
+    """Loop del puente: selector (sin AcceptEx) + guardia de accept muerto."""
+    loop = asyncio.SelectorEventLoop()
+    # Se registra EXPLICITAMENTE: si algun dia vuelve el Proactor, esto lo dice
+    # en la primera linea del log en vez de tener que deducirlo de un traceback
+    # de 30 lineas. Un arreglo que no se puede inspeccionar no se puede
+    # mantener vivo.
+    log.info("loop del puente: %s (sin AcceptEx/IOCP)", type(loop).__name__)
+
+    def _on_loop_error(loop, context):
+        msg = str(context.get("message") or "")
+        exc = context.get("exception")
+        if "Accept failed on a socket" in msg or (
+                isinstance(exc, OSError) and getattr(exc, "winerror", None) == 64):
+            log.critical(
+                "accept loop MUERTO (%s | %s) — saliendo con %d para que el "
+                "supervisor relance limpio en vez de quedar vivo y sordo",
+                msg, exc, EXIT_ACCEPT_DEAD)
+            os._exit(EXIT_ACCEPT_DEAD)
+        loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_on_loop_error)
+    return loop
+
+
 if __name__ == "__main__":
     log.info(
         "Bridge live on http://%s:%d/alerta-atas — awaiting ATAS X alerts.",
         HOST,
         PORT,
     )
-    uvicorn.run(app, host=HOST, port=PORT)
+    # Equivale exactamente a uvicorn.run(app, host=HOST, port=PORT) (que hace
+    # asyncio.run(self.serve(), loop_factory=...)) salvo que el loop lo elige
+    # _bridge_loop_factory. `Server.serve()` no consulta config.loop, asi que la
+    # eleccion es enteramente nuestra.
+    _server = uvicorn.Server(uvicorn.Config(app, host=HOST, port=PORT))
+    asyncio.run(_server.serve(), loop_factory=_bridge_loop_factory)
