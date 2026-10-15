@@ -101,11 +101,31 @@ def test_z_max_picks_the_largest_magnitude():
         "bybit": _snap("bybit", _book(100.0, 100.0024)),
     }
     f = F.compute(snaps)
-    assert f.z_max() == max(abs(v) for v in f.basis_z.values())
+    # 2026-10-15 — ASERCION CIRCULAR CORREGIDA.
+    #
+    # Aqui ponia `assert f.z_max() == max(abs(v) for v in f.basis_z.values())`.
+    # Y `z_max()` se define EXACTAMENTE asi en features.py:
+    #     return max(abs(v) for v in self.basis_z.values())
+    # O sea: la asercion comparaba la definicion consigo misma. Podia pasar con
+    # z_max() roto mientras los dos lados dijeran lo mismo, y el nombre del test
+    # promete otra cosa — "picks the largest magnitude" es elegir A QUIEN, no
+    # recalcular el maximo.
+    assert f.z_max() == abs(f.basis_z["kraken"]), (
+        "z_max no devolvio la magnitud del venue mas desviado")
+    assert max(f.basis_z, key=lambda k: abs(f.basis_z[k])) == "kraken", (
+        "el venue de mayor magnitud no es el que el test cree")
     # kraken is 50.4bps from the median on a ~1bps spread -> z ~50
     assert abs(f.basis_z["kraken"]) > 40
     # the three venues forming the median are all exactly 0
     assert f.basis_z["binance"] == 0.0 and f.basis_z["okx"] == 0.0
+
+
+def test_z_max_is_none_without_basis_evidence():
+    """El None se documenta como contrato ("None unless there is evidence") y no
+    se comprobaba en ningun sitio: sin venues no hay magnitud que devolver, y
+    devolver 0.0 seria inventar "sin desviacion" a partir de "sin dato"."""
+    f = F.compute({})
+    assert f.z_max() is None
 
 
 # ── dispersion needs consensus ─────────────────────────────────────────────

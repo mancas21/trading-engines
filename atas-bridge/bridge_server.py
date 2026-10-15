@@ -363,6 +363,21 @@ async def _dom_feeds():
                                     s["bid_wall_persistent"] = dp["bid_wall_hits"] >= DOM_PERSIST_REQUIRED
                                     s["ask_wall_persistent"] = dp["ask_wall_hits"] >= DOM_PERSIST_REQUIRED
                                     s["ts"] = time.time()
+                                    # 2026-10-15 — dom_updates y ws_last_msg_ts
+                                    # se declaraban y se exportaban en
+                                    # /health/detailed pero NADIE los escribia:
+                                    # `dom_updates` valia 0 para siempre y
+                                    # `ws_last_msg_ts` era un dict vacio. Un
+                                    # control que no puede moverse no es un
+                                    # control. Aqui SI se sabe que acaba de
+                                    # llegar un snapshot: es el unico sitio
+                                    # donde eso es cierto.
+                                    try:
+                                        import watchdog as _wd
+                                        _wd.STATE.record_dom_update()
+                                        _wd.STATE.record_ws_msg(sym)
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
 

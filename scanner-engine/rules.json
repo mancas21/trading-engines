@@ -164,7 +164,9 @@
     "max_age_s": 300,
     "min_history_bars": 60,
     "gate_signals": false,
-    "gate_note": "No rule may suppress a signal until the Phase 4 auditor has measured it with a direction-adjusted t-statistic and t < -1.65. Four rules that have never been audited must not be allowed to gate anything."
+    "gate_note": "No rule may suppress a signal until the Phase 4 auditor has measured it with a direction-adjusted t-statistic and t < -1.65. Four rules that have never been audited must not be allowed to gate anything.",
+    "read_by_code": false,
+    "_read_by_code_note": "2026-10-15. NINGUN modulo del scanner lee este bloque (verificado: `grep gates scanner-engine/*.py` no encuentra nada). Los valores operativos viven en el codigo -- max_age_s esta en poller.DEFAULT_MAX_AGE_S y scanner.DEFAULT_MAX_AGE_S, y los suelos por par en pairs.py -- y nada los mantiene sincronizados. Se deja asi a proposito: poller es un modulo de bajo nivel y meterle una dependencia de fichero de configuracion para un default que hoy nadie cambia es peor remedio que enfermedad. Lo que SI existe ahora es scanner-engine/tests/test_rules_gates.py, que falla en cuanto las copias diverjan. Si cambias un numero de aqui, cambialo tambien en el codigo o el test te lo dira."
   },
   "carried_overs": {
     "from": "quant-alert-engine rules.json v3.4.1",

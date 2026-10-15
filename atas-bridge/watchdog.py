@@ -25,9 +25,19 @@ from dataclasses import dataclass, field
 class WatchdogState:
     ws_reconnects: dict[str, int] = field(default_factory=dict)  # symbol -> count
     ws_last_msg_ts: dict[str, float] = field(default_factory=dict)
+    # dom_updates: se incrementa en cada snapshot de libro aplicado (ver
+    # _process_depth en bridge_server.py). Es la senal de VIVIDAD del feed DOM:
+    # `dom_state[sym]["ts"]` dice cuando llego el ultimo, pero un contador dice
+    # si el feed esta trabajando o congelado en un valor que no caduca.
+    #
+    # 2026-10-15: estaba declarado y exportado en to_dict() y NADIE lo
+    # incrementaba, asi que valia 0 para siempre. Cableado el mismo dia.
     dom_updates: int = 0
     last_cvd_save_ts: float = 0.0
-    last_calls_check_ts: float = 0.0
+    # 2026-10-15: `last_calls_check_ts` ELIMINADO. El subsistema /calls se borro
+    # en la Fase 6 y nadie escribia este campo desde entonces: solo servia para
+    # que /health/detailed publicara un "no check yet" permanente. Ver el bloque
+    # retirado en collect().
     last_indicator_ts: float = 0.0  # LiveExporter timestamp field
     last_indicator_file_mtime: float = 0.0
     indicator_stale_threshold_s: float = 15.0
@@ -40,13 +50,16 @@ class WatchdogState:
     def record_ws_msg(self, symbol: str) -> None:
         self.ws_last_msg_ts[symbol] = time.time()
 
+    def record_dom_update(self) -> None:
+        """Un snapshot de libro aplicado. Ver el campo dom_updates."""
+        self.dom_updates += 1
+
     def to_dict(self) -> dict:
         return {
             "ws_reconnects": dict(self.ws_reconnects),
             "ws_last_msg_ts": dict(self.ws_last_msg_ts),
             "dom_updates": self.dom_updates,
             "last_cvd_save_ts": self.last_cvd_save_ts,
-            "last_calls_check_ts": self.last_calls_check_ts,
             "last_indicator_ts": self.last_indicator_ts,
             "last_indicator_file_mtime": self.last_indicator_file_mtime,
             "uptime_s": round(time.time() - self.started_at, 1),
@@ -165,19 +178,17 @@ def collect(
         if gaps:
             out["warnings"].append(f"CVD issues: {gaps}")
 
-    # ---- Calls checker ----
-    if STATE.last_calls_check_ts:
-        age = now - STATE.last_calls_check_ts
-        out["checks"]["calls_checker"] = {
-            "age_s": round(age, 1),
-            "stale": age > 30,
-            "open_calls": calls_open,
-        }
-        if age > 30:
-            out["critical"].append(f"calls_checker stale {age:.1f}s")
-            out["status"] = "critical"
-    else:
-        out["checks"]["calls_checker"] = {"age_s": None, "note": "no check yet"}
+    # ---- Calls checker: RETIRADO (2026-10-15) ----
+    #
+    # Aqui vivia un `checks.calls_checker` alimentado por `last_calls_check_ts`.
+    # El subsistema /calls (orderflow_calls.py y companyia) se BORRO en la Fase 6,
+    # asi que ese campo no lo escribe nadie desde entonces: el bloque no podia
+    # salir nunca por la rama `if` y caia SIEMPRE en el `else`, publicando
+    #     {"age_s": null, "note": "no check yet"}
+    # que un humano lee como "un chequeo que aun no ha corrido" cuando en
+    # realidad el chequeo YA NO EXISTE. Un control retirado que se sigue
+    # anunciando es peor que no tenerlo: ocupa sitio en la lista de salud y
+    # enseña a ignorarla.
 
     # Overall
     if out["critical"]:
@@ -185,6 +196,12 @@ def collect(
     elif out["warnings"] and out["status"] == "ok":
         out["status"] = "degraded"
 
+    # 2026-10-15 — `is_healthy()` existia desde siempre con el docstring "Quick
+    # boolean for supervisor scripts" y NO LA LLAMABA NADIE. Se publica aqui, en
+    # el mismo sitio donde se calcula el estado, para que el booleano que un
+    # supervisor quiere consultar sea alcanzable sin reimplementar la regla.
+    # Se deriva de `out`, no se vuelve a llamar a collect() (seria recursion).
+    out["healthy"] = out["status"] != "critical"
     out["watchdog"] = STATE.to_dict()
     return out
 
