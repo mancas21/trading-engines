@@ -56,6 +56,10 @@ def _isolated_gate_state(tmp_path, monkeypatch):
     monkeypatch.setattr(V, "_DOM_GATE_POLL_S", 0.0)
 
 
+def spec6_of(raw):
+    return next(r for r in raw["rules"] if r["id"] == 6)
+
+
 def test_contract_json_matches_code():
     raw = json.loads((ROOT / "atas-bridge" / "rules.json").read_text(encoding="utf-8"))
     assert raw.get("namespace") == "atas"
@@ -74,6 +78,15 @@ def test_contract_json_matches_code():
     assert spec7["conditions"]["dom_vac_thr"] == V.RULE7["vac_thr"]
     assert spec7["conditions"]["dom_vac_venues_min"] == V.RULE7["vac_venues"]
     assert spec7["conditions"]["dom_vac_polls_min"] == V.RULE7["vac_polls"]
+
+    # 2026-10-15 — el umbral z declarado debe ser el que el codigo usa. Sin esta
+    # linea, bastaria con que rules.json dijera z=1.0 y el codigo comparara otro
+    # numero para que el contrato se romiera en silencio, que es el fallo que este
+    # test entero existe para impedir.
+    for spec, R in ((spec6_of(raw), V.RULE6), (spec7, V.RULE7)):
+        assert spec["conditions"]["dom_vac_z_min"] == R["vac_z"], (
+            "rules.json declara dom_vac_z_min=%r y el codigo usa %r"
+            % (spec["conditions"].get("dom_vac_z_min"), R["vac_z"]))
 
 
 def test_the_suite_never_writes_the_live_gate_state():
@@ -272,9 +285,166 @@ def test_dom_vac_publishes_its_inputs_not_only_its_verdict(tmp_path, monkeypatch
     assert "raw" in gate, "la puerta no publica el libro por venue"
     assert gate["raw"] == {"binance": 0.52, "okx": -0.31, "kraken": 0.40, "bybit": 0.02}
     assert "counts" in gate, "la puerta no publica el recuento por lado"
-    assert gate["counts"] == {"buy": 2, "sell": 1}, (
-        "el recuento por lado no cuadra con los valores: 0.52 y 0.40 pasan +0.25; "
-        "-0.31 pasa -0.25 (okx) y bybit 0.02 no pasa ninguna")
+    # 2026-10-15 — EXPECTATIVA NORMALIZADA, no absoluta.
+    #
+    # Este test fijaba antes `{"buy": 2, "sell": 1}` contra el umbral absoluto
+    # 0.25 (0.52 y 0.40 pasaban +0.25; -0.31 pasaba -0.25). Con la calibracion
+    # porvenue esos numeros significan otra cosa, y la cuenta CAMBIA A PROPOSITO:
+    #
+    #   binance  0.52 -> z=+2.02  voto COMPRA
+    #   okx      -0.31 -> z=-0.78  NEUTRO  (su media es -0.196: -0.31 esta DENTRO
+    #                                  de su propio rango normal, no es venta)
+    #   kraken    0.40 -> z=+0.54  NEUTRO  (std 0.494: 0.40 es ruido para kraken)
+    #   bybit     0.02 -> z=-0.42  NEUTRO
+    #
+    # Es exactamente el defecto que se arreglo: con el absoluto, okx y kraken
+    # "votaban" por vivir fuera de un umbral que no era el suyo.
+    assert gate["counts"] == {"buy": 1, "sell": 0}, gate["counts"]
 
-    # Los crudos no son el veredicto: buy tiene 2 venues y el gate pide 3.
+    # Los crudos no son el veredicto: buy tiene 1 venue y el gate pide 3.
     assert gate["buy"]["state"] == "FAIL"
+
+
+# ── 2026-10-15 — CONSENSO NORMALIZADO POR VENUE ─────────────────────────────
+#
+# La condicion (c) comparaba book_imb_5 contra un umbral ABSOLUTO. Medido sobre
+# el historico de reader.db, los venues no son comparables:
+#
+#   venue    media     std      >+0.25%   <-0.25%
+#   binance  +0.080    0.214      21.1       8.9
+#   okx      -0.199    0.145       1.5      38.2
+#   kraken   +0.129    0.499      41.9      25.1
+#   bybit    +0.081    0.155      17.4       1.5
+#
+# OKX cruza +0.25 el 1,5% de las veces: por ESTRUCTURA no puede votar compra, asi
+# que "3 de 4 venues" equivalia a exigir los otros tres a la vez. Kraken, con std
+# 3,4x la de bybit, cruzaba el umbral el 42% con puro ruido.
+#
+# Estos tests fijan el comportamiento nuevo: cada venue contra SU distribucion.
+
+_CAL_OK = {
+    "venues": {
+        "binance": {"n": 341, "mean": 0.083, "std": 0.216},
+        "okx":     {"n": 341, "mean": -0.196, "std": 0.146},
+        "kraken":  {"n": 341, "mean": 0.134, "std": 0.494},
+        "bybit":   {"n": 341, "mean": 0.085, "std": 0.156},
+    }
+}
+
+
+@pytest.fixture
+def cal(monkeypatch):
+    """Calibracion por venue controlada + estado del gate aislado."""
+    monkeypatch.setattr(V, "_CAL_VAC", _CAL_OK)
+    return _CAL_OK
+
+
+@pytest.fixture
+def scanner(monkeypatch):
+    """ Sustituye la lectura del scanner por bookings inventados."""
+    state = {"book": None}
+
+    def _fake(symbol, timeout=None):
+        return state["book"]
+
+    monkeypatch.setattr(V, "_scanner_book_imb5", _fake)
+    return state
+
+
+def test_votes_are_relative_to_each_venue(scanner, cal):
+    """REGRESION del defecto medido: un valor que pasa el umbral absoluto en un
+    venue ruidoso NO debe contar como voto si no destaca en SU propio historial.
+
+    kraken con std 0.494: imb5=0.30 pasa el umbral absoluto 0.25 pero esta a
+    (0.30-0.134)/0.494 = +0.34 sigma de su media: ruido, no acuerdo.
+    """
+    from datetime import datetime, timedelta
+    scanner["book"] = {"binance": 0.30, "okx": -0.19, "kraken": 0.30, "bybit": 0.23}
+    g = V.dom_vac_eval("XRPUSDT", observe=False)
+    # binance: (0.30-0.083)/0.216 = +1.00  -> voto valido (frontera)
+    # kraken : (0.30-0.134)/0.494 = +0.34  -> NO es voto
+    # bybit  : (0.23-0.085)/0.156 = +0.93  -> NO es voto
+    # okx    : -0.19 -> (-0.19+0.196)/0.146 = +0.04 -> neutro
+    assert g["counts"]["buy"] == 1, g["counts"]
+    assert g["buy"]["state"] == "FAIL", g["buy"]
+
+
+def test_okx_structural_bias_no_longer_blocks(scanner, cal):
+    """REGRESION: okx (media -0.196) YA NO necesita cruzar 0 para votar.
+
+    Con el umbral absoluto, okx en -0.10 (cargado al vendedor respecto a si
+    mismo) no contaba como voto vendedor porque no llegaba a -0.25. Normalizado:
+    (-0.10+0.196)/0.146 = +0.66... sino que z=-0.66 no alcanza. Con -0.40 si:
+    (-0.40+0.196)/0.146 = -1.40 -> voto vendedor legitimo.
+    """
+    scanner["book"] = {"binance": -0.40, "okx": -0.40, "kraken": -0.40, "bybit": -0.40}
+    g = V.dom_vac_eval("XRPUSDT", observe=False)
+    # bybit  (-0.40- 0.085)/0.156 = -3.11
+    # kraken (-0.40- 0.134)/0.494 = -1.08   <- SI vota: 0.40 es 1 sigma para kraken
+    # binance(-0.40- 0.083)/0.216 = -2.24
+    # okx    (-0.40+ 0.196)/0.146 = -1.40
+    assert g["counts"]["sell"] == 4, g["counts"]
+    # sin racha aun -> UNEVALUABLE, no MET (el gate pide 2 lecturas)
+    assert g["sell"]["state"] in ("UNEVALUABLE", "MET"), g["sell"]
+
+
+def test_split_market_is_named_not_failed(scanner, cal):
+    """Venues contradiciendose = SPLIT, no FAIL.
+
+    Medido: 27.8% de ciclos con el umbral absoluto. Antes se publicaba FAIL, que
+    es INDISTINGUIBLE de 'no hay senal'. SPLIT no abre la puerta pero se nombra.
+    """
+    scanner["book"] = {"binance": 0.60, "okx": -0.60, "kraken": 0.60, "bybit": 0.60}
+    g = V.dom_vac_eval("XRPUSDT", observe=False)
+    # binance/kraken/bybit muy alcistas; okx (-0.60+0.196)/0.146 = -2.77 venta
+    assert g["counts"]["buy"] >= 1 and g["counts"]["sell"] >= 1
+    assert g["buy"]["state"] == V._SPLIT, g["buy"]
+    assert g["sell"]["state"] == V._SPLIT, g["sell"]
+
+
+def test_split_never_opens_the_gate(scanner, cal):
+    """SPLIT no es MET: el gate no dispara con el mercado partido."""
+    scanner["book"] = {"binance": 0.60, "okx": -0.60, "kraken": 0.60, "bybit": 0.60}
+    for _ in range(6):                      # acumular racha no debe ayudar
+        g = V.dom_vac_eval("XRPUSDT")
+    assert g["buy"]["state"] == V._SPLIT
+    assert g["buy"]["state"] != "MET"
+
+
+def test_missing_calibration_is_unevaluable_not_silent(scanner, monkeypatch):
+    """Sin calibracion la condicion es UNEVALUABLE, NO un calculo con umbral
+    absoluto en silencio — eso seria reintroducir el defecto que se arreglo."""
+    monkeypatch.setattr(V, "_CAL_VAC", {})
+    monkeypatch.setattr(V, "_CAL_VAC_PATH", V.HERE / "no-existe-dom-vac.json")
+    scanner["book"] = {"binance": 0.9, "okx": 0.9, "kraken": 0.9, "bybit": 0.9}
+    g = V.dom_vac_eval("XRPUSDT", observe=False)
+    assert g["buy"]["state"] == "UNEVALUABLE", g["buy"]
+    assert g["sell"]["state"] == "UNEVALUABLE", g["sell"]
+    assert "calibracion" in g["buy"]["detail"]
+
+
+def test_uncalibrated_venue_is_unevaluable(scanner, cal, monkeypatch):
+    """Un venue sin calibrar no se evalua con lo de los demás."""
+    monkeypatch.setattr(V, "_CAL_VAC", {"venues": {"binance": _CAL_OK["venues"]["binance"]}})
+    scanner["book"] = {"binance": 0.9, "okx": 0.9, "kraken": 0.9, "bybit": 0.9}
+    g = V.dom_vac_eval("XRPUSDT", observe=False)
+    assert g["buy"]["state"] == "UNEVALUABLE", g["buy"]
+    assert "sin calibrar" in g["buy"]["detail"], g["buy"]
+
+
+def test_real_calibration_file_is_present_and_complete():
+    """El JSON que consume el gate debe existir y cubrir los 4 venues.
+
+    Sin el, el gate es permanentemente UNEVALUABLE. Este test es el que avisa
+    antes de que el usuario se de cuenta de que el motor se quedo mudo.
+    """
+    path = V.HERE / "dom_vac_calibration.json"
+    assert path.exists(), (
+        "falta dom_vac_calibration.json: ejecutar "
+        "python build_dom_vac_calibration.py")
+    cal = json.loads(path.read_text(encoding="utf-8"))
+    assert set(cal["venues"]) >= {"binance", "okx", "kraken", "bybit"}, cal["venues"]
+    for venue, st in cal["venues"].items():
+        assert st["n"] >= cal["min_n"], venue
+        assert st["std"] > 0, venue
+        assert "mean" in st and "std" in st, venue

@@ -125,6 +125,7 @@ if _R6.get("dom_source") != DOM_SOURCE or _R7.get("dom_source") != DOM_SOURCE:
 RULE6 = {"streak": int(_R6.get("cvd_consecutive_down_min", 2)),
          "levels_min": int(_R6.get("footprint_levels_min", 4)),
          "vac_thr": float(_R6.get("dom_vac_thr", 0.15)),
+         "vac_z": float(_R6.get("dom_vac_z_min", 1.0)),
          "vac_venues": int(_R6.get("dom_vac_venues_min", 3)),
          "vac_polls": int(_R6.get("dom_vac_polls_min", 2)),
          "enforcement": _R6.get("_enforcement", "hard")}
@@ -132,6 +133,7 @@ RULE6 = {"streak": int(_R6.get("cvd_consecutive_down_min", 2)),
 RULE7 = {"streak": int(_R7.get("cvd_consecutive_up_min", 2)),
          "levels_min": int(_R7.get("footprint_levels_min", 3)),
          "vac_thr": float(_R7.get("dom_vac_thr", 0.15)),
+         "vac_z": float(_R7.get("dom_vac_z_min", 1.0)),
          "vac_venues": int(_R7.get("dom_vac_venues_min", 3)),
          "vac_polls": int(_R7.get("dom_vac_polls_min", 2)),
          "enforcement": _R7.get("_enforcement", "hard")}
@@ -141,6 +143,58 @@ RULE7 = {"streak": int(_R7.get("cvd_consecutive_up_min", 2)),
 RULE6_SIDE, RULE7_SIDE = "sell", "buy"
 
 _UNEVALUABLE = "UNEVALUABLE"
+
+# ── CONDICIÓN (c): CALIBRACIÓN POR VENUE ────────────────────────────────────
+#
+# 2026-10-15 — MEDIDO, y es la causa de que la condición (c) fuera MUDO.
+#
+# La (c) comparaba `book_imb_5` de 4 venues contra un umbral ABSOLUTO. Medido
+# sobre la muestra historica (dom_vac_raw de reader.db), los venues NO son
+# comparables entre sí:
+#
+#   venue    media     std      >+0.25%   <-0.25%
+#   binance  +0.080    0.214      21.1       8.9
+#   okx      -0.199    0.145       1.5      38.2
+#   kraken   +0.129    0.499      41.9      25.1
+#   bybit    +0.081    0.155      17.4       1.5
+#
+# OKX cruza +0.25 el 1,5% de las veces: por ESTRUCTURA no puede votar al lado
+# comprador, así que exigir 3 de 4 equivalía a exigir los otros tres a la vez.
+# Kraken, con std 3,4x la de bybit, cruza el umbral el 42% con puro ruido. Un
+# umbral absoluto mide "qué venue vive fuera de su propia banda", no acuerdo.
+#
+# El arreglo: normalizar cada venue contra SU propia distribución. Un voto pasa
+# a significar "este venue está a `vac_z` sigmas de su media", que es la única
+# forma de que los cuatro números sean comparables entre sí.
+#
+# Selectividad CONSERVADA, no aflojada: medido sobre 331 ciclos,
+#   umbral absoluto 0.25 / 3 de 4  ->  consenso en el 6,0%
+#   normalizado z>=1.0 / 3 de 4    ->  consenso en el 5,7%
+# Es decir, el gate no se ha vuelto más permisivo; se ha vuelto comparable.
+#
+# Generado por build_dom_vac_calibration.py desde reader.db. Si falta o un venue
+# no está calibrado, la condición es UNEVALUABLE — nunca se vuelve al umbral
+# absoluto en silencio, que sería reintroducir el defecto.
+_CAL_VAC_PATH = HERE / "dom_vac_calibration.json"
+_CAL_VAC: dict = {}
+
+
+def _load_vac_calibration() -> dict:
+    """Lee la calibración por venue. Cachea; vacío si no existe o no es legible."""
+    global _CAL_VAC
+    if _CAL_VAC or not _CAL_VAC_PATH.exists():
+        return _CAL_VAC
+    try:
+        _CAL_VAC = json.loads(_CAL_VAC_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        _CAL_VAC = {}
+    return _CAL_VAC
+
+
+# Estado propio del mercado PARTIDO. No es MET (no abre la puerta) pero tampoco
+# FAIL: "los venues se contradicen" es información, y antes se tiraba.
+_SPLIT = "SPLIT"
+
 
 # 2026-10-15 — VENTANA DE PERSISTENCIA de las condiciones, declarada en
 # rules.json (`condition_window_s`). 0 = conjunción estricta en el mismo tick,
@@ -272,6 +326,24 @@ def _dom_gate_tick(symbol: str, buy_met: bool, sell_met: bool,
     return rec["buy"], rec["sell"]
 
 
+def _vac_z(tb: dict, cal_venues: dict) -> dict:
+    """z de cada venue contra SU propia distribucion: (x - media) / std.
+
+    Es lo que hace comparables los cuatro libros. Sin esto, un umbral absoluto
+    mide "que venue vive fuera de su banda" (okx cruza +0.25 el 1,5% de las
+    veces y por estructura no puede votar compra; kraken cruza el 42% con
+    ruido), no acuerdo.
+    """
+    out = {}
+    for k, v in tb.items():
+        st = cal_venues.get(k) or {}
+        m, sd = st.get("mean"), st.get("std")
+        if m is None or not sd:
+            continue
+        out[k] = (float(v) - float(m)) / float(sd)
+    return out
+
+
 def dom_vac_eval(symbol: str, observe: bool = True) -> dict:
     """La condición (c) completa para las reglas AT-6/AT-7, compartida por la
     puerta (build_verdict) y por el grabador (verdict_recorder): UNA sola
@@ -310,8 +382,29 @@ def dom_vac_eval(symbol: str, observe: bool = True) -> dict:
         return {"buy": {"state": "UNEVALUABLE", "detail": det},
                 "sell": {"state": "UNEVALUABLE", "detail": det},
                 "venues": len(tb)}
-    counts = {s: sum(1 for v in tb.values()
-                     if (v > R["vac_thr"] if s == "buy" else v < -R["vac_thr"]))
+
+    # ── Normalización por venue contra su propia distribución ──
+    #
+    # Antes: `v > vac_thr` con vac_thr absoluto (0.25). Medido: eso media
+    # "qué venue vive fuera de su banda", no acuerdo (okx cruza +0.25 el 1,5%
+    # de las veces y por estructura jamás puede votar compra; kraken cruza el
+    # 42% con ruido). Ahora cada venue se compara consigo mismo.
+    cal = _load_vac_calibration()
+    cal_venues = (cal.get("venues") or {}) if cal else {}
+    uncalibrated = [k for k in tb if k not in cal_venues]
+    if not cal_venues or uncalibrated:
+        _dom_gate_tick(symbol, False, False, observe=observe)
+        det = ("calibracion dom_vac ausente/vieja"
+               + (f" (venues sin calibrar: {', '.join(sorted(uncalibrated))})"
+                  if uncalibrated else "")
+               + "; regenerar con build_dom_vac_calibration.py")
+        return {"buy": {"state": "UNEVALUABLE", "detail": det},
+                "sell": {"state": "UNEVALUABLE", "detail": det},
+                "venues": len(tb)}
+
+    zthr = max(RULE6["vac_z"], RULE7["vac_z"])
+    counts = {s: sum(1 for zv in _vac_z(tb, cal_venues).values()
+                     if (zv >= zthr if s == "buy" else zv <= -zthr))
               for s, R in sides}
     b_n, s_n = _dom_gate_tick(symbol, counts["buy"] >= RULE7["vac_venues"],
                                counts["sell"] >= RULE6["vac_venues"],
@@ -339,16 +432,40 @@ def dom_vac_eval(symbol: str, observe: bool = True) -> dict:
            "detail": (f"{counts['buy']}C/{counts['sell']}V venues por lado "
                       f"({len(tb)} vivos); racha C={b_n} V={s_n}")}
     for side, R in sides:
-        count, streak, thr = counts[side], streaks[side], R["vac_thr"]
-        if count < R["vac_venues"]:
+        count, streak = counts[side], streaks[side]
+        other = "sell" if side == "buy" else "buy"
+        # PARTIDO = los DOS lados tienen votos. No basta con que el lado opuesto
+        # los tenga: un mercado UNANIME (4 venues comprando, 0 vendiendo) dejaba
+        # el lado vendedor marcado como SPLIT con la condicion anterior
+        # (`counts[other] >= 1`), que es exactamente al reves de lo que significa.
+        # Lo detecto el test test_n_of_m_counting, que venia del commit anterior.
+        parted = counts["buy"] >= 1 and counts["sell"] >= 1
+        # 2026-10-15 — SPLIT: estado propio del mercado CONTRADICHO.
+        #
+        # Antes, si kraken votaba compra y okx venta en el mismo instante, los dos
+        # lados salían FAIL, que es INDISTINGUIBLE de "no hay señal". Medido: con
+        # el umbral absoluto, el 27,8% de 331 ciclos eran mercado partido y todos
+        # se publicaban como FAIL. Eso tiraba información real: "los venues se
+        # contradicen" no es "no hay lecturas".
+        #
+        # SPLIT NO abre la puerta (no es MET), pero sí se nombra. Conservador por
+        # diseño: un gate que no sabe qué hace el libro no debe disparar.
+        if parted:
+            out[side] = {"state": _SPLIT,
+                         "detail": (f"mercado PARTIDO: {counts[side]} venue(s) a favor "
+                                    f"y {counts[other]} en contra (z>={zthr:g}); "
+                                    f"el consenso no es interpretable")}
+        elif count < R["vac_venues"]:
             out[side] = {"state": "FAIL",
-                         "detail": f"{count} venues del lado {side} con |imb5|>{thr:g} (piden {R['vac_venues']})"}
+                         "detail": (f"{count} venues del lado {side} con z>={zthr:g} "
+                                    f"(piden {R['vac_venues']})")}
         elif streak < R["vac_polls"]:
             out[side] = {"state": "UNEVALUABLE",
                          "detail": f"consenso {side} en racha {streak} de {R['vac_polls']} lecturas"}
         else:
             out[side] = {"state": "MET",
-                         "detail": f"{count} venues del lado {side}, racha {streak}>= {R['vac_polls']}"}
+                         "detail": (f"{count} venues del lado {side} con z>={zthr:g}, "
+                                    f"racha {streak}>= {R['vac_polls']}")}
     return out
 
 
@@ -1086,6 +1203,7 @@ def build_verdict() -> dict:
         # mientras las claves de conditions (mas abajo) citaban los de la 6.
         # Coincidian solo porque rules.json hoy pone lo mismo en las dos.
         "thr": {"sell": RULE6["vac_thr"], "buy": RULE7["vac_thr"]},
+        "z": {"sell": RULE6["vac_z"], "buy": RULE7["vac_z"]},
         "venues_min": {"sell": RULE6["vac_venues"], "buy": RULE7["vac_venues"]},
         "polls_min": {"sell": RULE6["vac_polls"], "buy": RULE7["vac_polls"]},
         "buy": gate["buy"], "sell": gate["sell"],
@@ -1101,12 +1219,12 @@ def build_verdict() -> dict:
     v["rule6"] = {
         "conditions": {"a_cvd_down_2plus": a6,
                        f"b_footprint_{RULE6['levels_min']}_sell_heavy": b6,
-                       f"c_vac_sell_{RULE6['vac_venues']}deM_thr{RULE6['vac_thr']:g}": c6},
+                       f"c_vac_sell_{RULE6['vac_venues']}deM_z{RULE6['vac_z']:g}": c6},
         "met": r6_met}
     v["rule7"] = {
         "conditions": {"a_cvd_up_2plus": a7,
                        f"b_footprint_{RULE7['levels_min']}_buy_heavy": b7,
-                       f"c_vac_buy_{RULE7['vac_venues']}deM_thr{RULE7['vac_thr']:g}": c7},
+                       f"c_vac_buy_{RULE7['vac_venues']}deM_z{RULE7['vac_z']:g}": c7},
         "met": r7_met}
 
     # ── Regla 5: No Pattern Anchoring ──
@@ -1196,11 +1314,11 @@ def _reason(v) -> str:
     if b == "BULLISH":
         return (f"Regla 7 satisfecha: CVD sube {RULE7['streak']}+ barras, "
                 f"{RULE7['levels_min']}+ niveles con >={FOOTPRINT_PCT:g}% compra, "
-                f"consenso de libro multi-venue comprador ({RULE7['vac_venues']} venues, |imb5|>{RULE7['vac_thr']:g}, {RULE7['vac_polls']} lecturas)")
+                f"consenso de libro multi-venue comprador ({RULE7['vac_venues']} venues, z>={RULE7['vac_z']:g}, {RULE7['vac_polls']} lecturas)")
     if b == "BEARISH":
         return (f"Regla 6 satisfecha: CVD cae {RULE6['streak']}+ barras, "
                 f"{RULE6['levels_min']}+ niveles con >={FOOTPRINT_PCT:g}% venta, "
-                f"consenso de libro multi-venue vendedor ({RULE6['vac_venues']} venues, |imb5|>{RULE6['vac_thr']:g}, {RULE6['vac_polls']} lecturas)")
+                f"consenso de libro multi-venue vendedor ({RULE6['vac_venues']} venues, z>={RULE6['vac_z']:g}, {RULE6['vac_polls']} lecturas)")
     r6, r7 = v["rule6"], v["rule7"]
     miss6 = [k for k, s in r6["conditions"].items() if s != "MET"]
     miss7 = [k for k, s in r7["conditions"].items() if s != "MET"]

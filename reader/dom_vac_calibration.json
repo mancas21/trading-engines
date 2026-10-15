@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "generated_at": "2026-10-15T20:18:08.411534+00:00",
+  "source": "reader.db:verdicts.dom_vac_raw",
+  "method": "media/std por venue sobre book_imb_5 historico. verdict.dom_vac_eval normaliza (x-mean)/std antes de comparar, para que venues con sesgo y escala distintos (okx media -0.199, kraken std 0.499) sean comparables.",
+  "min_n": 30,
+  "samples_total": 1364,
+  "venues": {
+    "binance": {
+      "n": 341,
+      "mean": 0.083364,
+      "std": 0.216149,
+      "p10": -0.2355,
+      "p50": 0.1188,
+      "p90": 0.3206
+    },
+    "bybit": {
+      "n": 341,
+      "mean": 0.084717,
+      "std": 0.155602,
+      "p10": -0.1135,
+      "p50": 0.0684,
+      "p90": 0.295
+    },
+    "kraken": {
+      "n": 341,
+      "mean": 0.133633,
+      "std": 0.494175,
+      "p10": -0.5491,
+      "p50": 0.12,
+      "p90": 0.7978
+    },
+    "okx": {
+      "n": 341,
+      "mean": -0.19583,
+      "std": 0.145819,
+      "p10": -0.3488,
+      "p50": -0.2061,
+      "p90": -0.0245
+    }
+  },
+  "skipped_venues": {},
+  "note": "Selectividad conservada frente al umbral absoluto que sustituye (6.0% -> 5.7% de ciclos con consenso). NO validado como edge."
+}
