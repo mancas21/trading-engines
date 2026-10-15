@@ -65,6 +65,22 @@ RETRY_BACKOFF_S = 60.0
 RETRY_BACKOFF_MAX_S = 300.0
 MAX_RETRY_ATTEMPTS = 20
 
+# Contrato de codigos de salida del grabador (verdict_recorder.RECORDED/SKIP/
+# FAIL, y tests/test_supervisor_health.py lo fija). Los tres viven aqui para que
+# el supervisor no tenga que importar al grabador (que abre base y red).
+RECORDER_RECORDED = 0   # se escribio fila
+RECORDER_SKIP = 2       # "ATAS sin dato": condicion NORMAL, no consume crashes
+RECORDER_FAIL = 1       # error real del proceso
+# Codigo convencional de timeout (coreutils 124). Se devuelve en vez de 0 para
+# que un hijo colgado no pueda parecer sano.
+CHILD_TIMEOUT = 124
+# Si el grabador lleva esto de seguido sin registrar, ya no es "ATAS parpadeo":
+# es un servicio que no da servicio, y tiene que verse en el status.
+MAX_CONSECUTIVE_SKIPS = 60      # ~30 min con RECORD_EVERY_S=30
+# 2026-10-15 — Cadencia del CARRIL LENTO, al que se pasa cuando ya se agoto el
+# tope de reintentos. Antes se devolvia 1 y el proceso MORIA (ver la rama).
+RETRY_EXHAUSTED_S = 1800.0      # 30 min entre intentos ya agotado el tope
+
 # Lock de instancia unica.
 #
 # Por que: el supervisor se lanza desde la carpeta Inicio, y TAMBIEN a mano
@@ -240,9 +256,13 @@ def run_child(script: Path, args: list[str], timeout: float) -> tuple[int, str]:
                            capture_output=True, text=True, timeout=timeout)
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except subprocess.TimeoutExpired:
-        # El notificador con --once puede tardar si tv_live.mjs se cuelga; no es
-        # un crash, asi que se distingue de un fallo real.
-        return 0, "timeout (tratado como no-crash)"
+        # 2026-10-15 — DEVOLVIA 0 ("tratado como no-crash"), asi que un hijo
+        # PERMANENTEMENTE colgado dejaba el ciclo con ok=True para siempre:
+        # fails a 0, sin pausa, sin gave_up y sin aviso. Un control que no
+        # puede fallar no es un control. El timeout es un codigo real; quien
+        # decide si eso pausa el servicio es el llamante (el notificador puede
+        # colgarse en tv_live.mjs sin que el grabador tenga la culpa).
+        return CHILD_TIMEOUT, "timeout (hijo no termino)"
     except Exception as e:
         return 1, f"{type(e).__name__}: {str(e)[:120]}"
 
@@ -283,15 +303,37 @@ def cycle(dry_run: bool = False) -> tuple[bool, str]:
     #
     # Se resuelve antes de notificar: notificar un veredicto cuyo resultado ya
     # se conoce evita el "sesgo sin cambio" sobre una fila que si cambia.
-    rc_v = 0
+    # 2026-10-15 — SEPARAR "no hay dato" de "fallo el proceso".
+    #
+    # Antes TODO pasaba por `rc_r == 0`: con ATAS caido el SKIP salia con rc=1
+    # y el ciclo entero se comportaba como un crash (fallo el resolve, fallo el
+    # notify, sumaba fails). Medido: 5 SKIP seguidos pausaban el servicio y 20
+    # mas lo rendian con gave_up=true, y NADA lo relanzaba despues.
+    #
+    # `healthy` = el proceso funciono (0 grabo, 2 no habia dato). Solo eso
+    # consume el presupuesto de crashes. `recorded` = ademas escribio fila, y
+    # eso es lo que exige notificar.
+    healthy = rc_r in (RECORDER_RECORDED, RECORDER_SKIP)
+    recorded = rc_r == RECORDER_RECORDED
+
+    # resolve usa klines de Binance, NO el puente: una caida de ATAS no debe
+    # impedir resolver las filas pendientes de antes. Antes se gateaba con
+    # rc_r == 0, asi que durante toda la caida de ATAS no se resolvia nada —
+    # exactamente el incidente documentado arriba (1.163 filas sin medir).
+    rc_v = None
     out_v = "no-op"
-    if rc_r == 0:
+    if healthy:
         rc_v, out_v = run_child(RECORDER, ["resolve"], timeout=120)
         st["resolver_rc"] = rc_v
         st["resolver_tail"] = out_v.strip().splitlines()[-1] if out_v.strip() else ""
+        # Antes solo se guardaba el ultimo `resolver_rc` y nadie acumulaba
+        # fallos: Binance devolviendo 418 podia estar rompiendo TODA la
+        # medicion durante semanas con consecutive_failures: 0 y sin aviso.
+        st["resolver_consecutive_failures"] = (
+            st.get("resolver_consecutive_failures", 0) + 1 if rc_v != 0 else 0)
     else:
         st["resolver_rc"] = None
-        st["resolver_tail"] = "no se resuelve: record fallo"
+        st["resolver_tail"] = "no se resuelve: el grabador fallo (no es un SKIP)"
     st["recorder_rc"] = rc_r
     st["recorder_tail"] = out_r.strip().splitlines()[-1] if out_r.strip() else ""
 
@@ -303,18 +345,32 @@ def cycle(dry_run: bool = False) -> tuple[bool, str]:
     # de "un control que se calcula, se imprime y nunca se consume". Se envia de
     # verdad; el anti-spam lo garantiza el CAMBIO DE SESGO del notificador, no
     # un dry-run aqui.
-    if rc_r == 0 and "recorded" in out_r:
+    if recorded and "recorded" in out_r:
         nargs = ["--once"] + (["--dry-run"] if dry_run else [])
         rc_n, out_n = run_child(NOTIFIER, nargs, timeout=150)
         st["notify_rc"] = rc_n
         st["notify_mode"] = "dry-run" if dry_run else "send"
         st["notify_tail"] = out_n.strip().splitlines()[-1] if out_n.strip() else ""
+        st["notify_consecutive_failures"] = (
+            st.get("notify_consecutive_failures", 0) + 1 if rc_n != 0 else 0)
     else:
         st["notify_rc"] = None
         st["notify_mode"] = None
         st["notify_tail"] = "sin veredicto nuevo: no se evalua notificacion"
 
-    ok = rc_r == 0
+    # Sin dato seguido: SE VE, pero no es un crash del proceso, asi que no
+    # consume el presupuesto de reintentos. Matar el servicio porque ATAS este
+    # caido era exactamente lo que dejaba al reader muerto y sin relanzador
+    # (el unico relanzador es el acceso Reader.lnk de Inicio de sesion).
+    skips = (st.get("consecutive_skips", 0) + 1) if rc_r == RECORDER_SKIP else 0
+    st["consecutive_skips"] = skips
+    st["no_data"] = bool(skips >= MAX_CONSECUTIVE_SKIPS)
+    if skips == MAX_CONSECUTIVE_SKIPS:
+        log(f"ATAS sin dato {skips} ciclos seguidos (~"
+            f"{skips * RECORD_EVERY_S / 60:.0f} min): servicio vivo y listo para "
+            f"reanudar solo. ultimo: {st['recorder_tail'][:70]}")
+
+    ok = healthy
     write_status(st)
     return ok, st.get("recorder_tail", "")
 
@@ -361,13 +417,38 @@ def _loop_body(interval: float, dry_run: bool = False) -> int:
         # a su vez exige attempts>0, y en un proceso recien arrancado attempts
         # arranca en 0. Solo el primer ciclo correcto de ESTE proceso puede
         # decir que el gave_up anterior ya no describe la realidad.
+        # 2026-10-15 — ESTADO FANTASMA DEL PROCESO ANTERIOR.
+        #
+        # `gave_up` era un flag que ESCRIBE UN PROCESO AL MORIR y que nadie
+        # limpia: medido 2026-10-14, el supervisor agoto 20 reintentos a las
+        # 11:45, dejo gave_up=true al salir, y al relanzarlo el proceso nuevo
+        # ciclaba bien pero el archivo seguia diciendo "servicio muerto".
+        #
+        # Aqui vivia la limpieza SOLO de `gave_up`. Pero `paused`, `paused_at`,
+        # `retry_attempt`, `retry_backoff_s` y `degraded` se escriben igual y se
+        # limpian igual de poco: el status de hoy (10:10) seguia anunciando
+        # `paused_at: 09:41` con el servicio grabando perfectamente. Es el MISMO
+        # fallo —un estado que describe a un proceso que ya no existe— y
+        # limpiarlo solo en la rama de recuperacion no basta: esa rama exige
+        # `paused_was`, que exige attempts>0, y en un proceso recien arrancado
+        # attempts vale 0.
+        #
+        # El primer ciclo correcto de ESTE proceso es la unica prueba de que el
+        # estado anterior ya no describe la realidad.
         if ok and not _cleared_gave_up[0]:
             _cleared_gave_up[0] = True
-            if st.get("gave_up"):
+            stale = [k for k in ("gave_up", "paused", "paused_at",
+                                 "retry_attempt", "retry_backoff_s",
+                                 "degraded", "degraded_at") if k in st]
+            if stale:
+                for k in ("gave_up", "paused", "paused_at", "retry_attempt",
+                          "retry_backoff_s", "degraded", "degraded_at"):
+                    st.pop(k, None)
                 st["gave_up"] = False
                 st["gave_up_cleared_at"] = datetime.now().isoformat()
-                log("gave_up del proceso anterior ya no aplica: este proceso "
-                    f"cicla bien. limpiado a las {st['gave_up_cleared_at']}")
+                log(f"estado del proceso anterior ya no aplica ({', '.join(stale)}): "
+                    f"este proceso cicla bien. limpiado a las "
+                    f"{st['gave_up_cleared_at']}")
 
         write_status(st)
         if fails >= MAX_FAST_FAILS:
@@ -403,12 +484,40 @@ def _loop_body(interval: float, dry_run: bool = False) -> int:
             st["retry_backoff_s"] = backoff
             write_status(st)
             if attempts >= MAX_RETRY_ATTEMPTS:
-                log(f"AGOTADOS {attempts} reintentos. El servicio queda PARADO "
-                    f"(no en bucle). Revisa la causa antes de relanzar.")
-                st["paused"] = False
-                st["gave_up"] = True
+                # 2026-10-15 — CARRIL LENTO en vez de MORIR.
+                #
+                # El diseño original era "queda PARADO y visible, no en bucle"
+                # (ver arriba). La premisa — que alguien lo veria — es
+                # empiricamente FALSA: el gave_up del 14-oct a las 11:45 paso
+                # horas inadvertido hasta que se relanzo a mano. Y la auditoria
+                # de fiabilidad confirmo que NADA relanza este proceso:
+                # reader_supervisor.bat es de un solo tiro (lanza y sale), no
+                # hay tarea programada, y el unico relanzador es el acceso
+                # Reader.lnk de Inicio de sesion.
+                #
+                # O sea: "rendirse" no era "quedar visible", era MORIR — y morir
+                # por una causa transitoria (la base bloqueada un rato, un
+                # payload raro del puente) dejaba al reader sin grabar para
+                # siempre.
+                #
+                # El carril lento conserva la propiedad que el diseño original
+                # protegia: NO hay bucle rapido. Un intento cada
+                # RETRY_EXHAUSTED_S, con `degraded` marcado en el status, y se
+                # recupera solo cuando la causa cede. Y NO se relanza ningun
+                # proceso — solo se reintenta la lectura; un reinicio de proceso
+                # es lo que provoco la pila de dialogos del incidente "Already
+                # running".
+                log(f"AGOTADOS {attempts} reintentos seguidos: paso a CARRIL "
+                    f"LENTO (un intento cada {RETRY_EXHAUSTED_S / 60:.0f} min). "
+                    f"NO me rindo: nada me relanza, rendirse es morir. Me "
+                    f"recupero solo cuando la causa ceda. ultimo: {tail[:70]}")
+                st["paused"] = True
+                st["gave_up"] = False
+                st["degraded"] = True
+                st["degraded_at"] = datetime.now().isoformat()
                 write_status(st)
-                return 1
+                backoff = RETRY_EXHAUSTED_S
+                attempts = MAX_RETRY_ATTEMPTS      # no crece sin limite
             time.sleep(backoff)
             continue
 
@@ -422,8 +531,17 @@ def _loop_body(interval: float, dry_run: bool = False) -> int:
             except Exception:
                 pass
             st.pop("paused", None)
+            # paused_at SE ESCRIBIA al pausar pero no se borraba aqui: el status
+            # vivo dejo visible `paused_at` con `gave_up=false` y sin `paused`,
+            # o sea una pausa que no existe. Cualquier lector la veia.
+            st.pop("paused_at", None)
             st.pop("retry_attempt", None)
             st.pop("retry_backoff_s", None)
+            # Tambien el carril lento: si no se limpia, el status sigue
+            # anunciando "degradado" con el servicio ya sano — el mismo fallo de
+            # estado fantasma que sufria `paused_at` unas lineas mas arriba.
+            st.pop("degraded", None)
+            st.pop("degraded_at", None)
             st["gave_up"] = False
             st["recovered_at"] = datetime.now().isoformat()
             write_status(st)
@@ -442,9 +560,22 @@ def do_status() -> int:
         return 1
     st = json.loads(STATUS.read_text(encoding="utf-8"))
     print(f"  ultimo ciclo : {st.get('last_cycle_iso')}")
-    for k in ("recorder_rc", "recorder_tail", "notify_rc", "notify_tail",
-              "consecutive_failures"):
+    # La senal MAS importante (servicio rendido) no salia aqui: solo se
+    # imprimian recorder/notify/consecutive_failures, asi que `--status`
+    # podia verse verde con gave_up=true. Es justo lo que un humano mira
+    # para saber si el reader esta vivo.
+    for k in ("gave_up", "gave_up_cleared_at", "paused", "paused_at",
+              "degraded", "degraded_at", "retry_attempt", "recovered_at"):
+        if k in st:
+            print(f"  {k:14s} {st.get(k)}")
+    for k in ("recorder_rc", "recorder_tail", "consecutive_failures",
+              "consecutive_skips", "no_data", "resolver_rc", "resolver_tail",
+              "resolver_consecutive_failures", "notify_rc", "notify_tail",
+              "notify_consecutive_failures"):
         print(f"  {k:14s} {st.get(k)}")
+    if st.get("gave_up"):
+        print("  AVISO: gave_up=true — NADA relanza el supervisor; hace falta "
+              "start-reader.ps1 (o el acceso Reader.lnk de Inicio de sesion)")
     return 0
 
 
