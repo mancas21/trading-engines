@@ -87,6 +87,9 @@ scanner-engine/tests/_ssl_*.py
 reader/reader_supervisor.lock
 reader/audit_atas_state.json
 reader/dom_gate_state.json
+# Estado de la ventana de persistencia de las condiciones 6/7 (el grabador lo
+# escribe en cada ciclo). Es estado de ejecucion: no se versiona.
+reader/condition_window_state.json
 
 # 2026-10-13 — scripts de diagnostico de una sesion concreta. Se conservan
 # porque documentan COMO se midio lo que motivo la cuarentena de la regla 6
