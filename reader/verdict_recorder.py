@@ -550,13 +550,22 @@ def do_resolve(c) -> int:
     Nunca se usa el close de la barra de señal: ese precio solo se conoce
     después de que la barra cerró, y llenarse ahí inventa edge.
     """
-    sym = c.execute("SELECT v FROM recorder_meta WHERE k='symbol'").fetchone()
-    if not sym:
-        row = c.execute("SELECT symbol FROM verdicts ORDER BY id DESC LIMIT 1").fetchone()
-        if not row:
-            print("  no hay verdicts que resolver")
-            return 0
-        sym = (row[0],)
+    # 2026-10-15 — AQUI HABIA TRES LINEAS QUE NO PODIAN HACER NADA.
+    #
+    # Ponia:
+    #     sym = c.execute("SELECT v FROM recorder_meta WHERE k='symbol'").fetchone()
+    # y NADIE escribe esa clave: el grabador solo guarda 'last_record_ts'. La
+    # consulta devolvia None siempre y caia al respaldo de "la ultima fila de
+    # verdicts". Y el `sym` resultante NO SE USABA despues — el bucle de mas
+    # abajo agrupa por `by_sym`, sacado de la propia tabla.
+    #
+    # O sea: una variable muerta alimentada por una consulta que no puede acertar.
+    # La guarda util ("no hay nada que resolver") la da el `pending` de aqui
+    # abajo, que ademas mira lo que importa — filas SIN RESOLVER — y no la ultima
+    # fila de la tabla, que puede estar resuelta.
+    if not c.execute("SELECT 1 FROM verdicts LIMIT 1").fetchone():
+        print("  no hay verdicts que resolver")
+        return 0
     # Una fila es resoluble si tiene identidad de barra: bar_key (la clave estable,
     # fix 2026-10-13) o, para el historico previo al fix, bar_index. El filtro
     # anterior exigia bar_index IS NOT NULL, lo que ya no describe la realidad:

@@ -94,7 +94,13 @@ LOCK = HERE / "reader_supervisor.lock"
 # Rutas de lock que ESTE proceso ha reclamado. El fichero de PID por si solo no
 # puede expresar "un segundo objeto InstanceLock en el mismo interprete debe ser
 # rechazado", porque el pid que contiene es el nuestro y por tanto siempre vivo.
-_CLAIMED: dict[str, int] = {}
+# 2026-10-15 — `_CLAIMED` ELIMINADO aqui tambien (existia igual en
+# scanner-engine/supervisor.py). Era un dict de "rutas de lock que YO he
+# reclamado" que se declaraba, se escribia al adquirir y se borraba al soltar, y
+# que NADIE LEIA. La proteccion que su comentario prometia — rechazar un segundo
+# lock en el mismo interprete — la da la comprobacion del PID del fichero:
+# `acquire` rechaza cuando el pid leido es el nuestro, que es exactamente ese
+# caso. El dict solo acumulaba estado sin consumidor.
 
 
 class InstanceLock:
@@ -198,7 +204,6 @@ class InstanceLock:
                     os.write(fd, f"{os.getpid()}\n".encode())
                 finally:
                     os.close(fd)
-                _CLAIMED[str(self.path)] = os.getpid()
                 self._held = True
                 return True
 
@@ -213,7 +218,6 @@ class InstanceLock:
                 self.path.unlink()
             except OSError:
                 pass
-        _CLAIMED.pop(str(self.path), None)
         self._held = False
 
 

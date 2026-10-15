@@ -34,8 +34,12 @@ import time
 HERE = pathlib.Path(__file__).resolve().parent
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BACKOFF_S = 3.0
-# Never read a stale lock held by a PID that no longer exists.
-STALE_LOCK_GRACE_S = 0.0
+# 2026-10-15 — aqui vivia `STALE_LOCK_GRACE_S = 0.0`, con un comentario
+# ("Never read a stale lock held by a PID that no longer exists") que describia
+# una politica que NADIE implementaba con la constante: no tenia un solo lector
+# en todo el arbol. La politica SI se aplica — `InstanceLock.acquire` consulta
+# `_alive(pid)` y reclama el fichero si el titular murio — pero con la funcion,
+# no con un plazo configurable. Se quita para no hacer creer que existe.
 
 # Exit code reported when the watchdog kills a hung child. Module level so it
 # can be imported and asserted on: it must be NON-ZERO, or should_restart()
@@ -58,10 +62,14 @@ WATCHDOG_KILLED = -9
 # while a slow-but-working cycle is never punished.
 STALL_S = 900.0
 
-# Which lock paths THIS process has claimed. The PID file alone cannot express
-# "a second lock object in the same interpreter must be refused", because the
-# pid it holds is our own and therefore always alive.
-_CLAIMED: dict[str, int] = {}
+# 2026-10-15 — `_CLAIMED` se elimina: era un dict de "rutas de lock que YO he
+# reclamado" que se declaraba, se escribia al adquirir y se borraba al soltar, y
+# que NADIE LEIA en ningun sitio. El comentario decia que servia para rechazar
+# "un segundo lock en el mismo interprete", pero esa proteccion la da la
+# comprobacion del PID del fichero (`acquire` rechaza cuando el pid leido es el
+# nuestro, que es exactamente el caso del segundo objeto en el mismo proceso).
+# O sea: la proteccion existia por otra via y el dict solo acumulaba estado sin
+# consumidor. Se quita el dict y se deja la explicacion donde corresponde.
 
 
 def should_restart(returncode: int | None) -> bool:
@@ -185,7 +193,6 @@ class InstanceLock:
                     os.write(fd, f"{os.getpid()}\n".encode())
                 finally:
                     os.close(fd)
-                _CLAIMED[str(self.path)] = os.getpid()
                 self._held = True
                 return True
 
@@ -200,7 +207,6 @@ class InstanceLock:
                 self.path.unlink()
             except OSError:
                 pass
-        _CLAIMED.pop(str(self.path), None)
         self._held = False
 
 
