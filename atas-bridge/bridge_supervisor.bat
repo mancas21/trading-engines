@@ -17,9 +17,14 @@ REM en bridge_server.py (ping_timeout=60 + backoff escalonado con jitter).
 REM
 REM Este supervisor es la RED DE SEGURIDAD para cuando eso no basta: comprueba
 REM que el PUERTO responde, no solo que el proceso existe. Estados:
-REM   exit 0        -> el operador paro el puente. PARAR, sin relanzar.
-REM   Puerto abajo  -> proceso colgado o muerto. Reiniciar.
-REM   Puerto arriba -> sano.
+REM   exit 0        : el operador paro el puente. PARAR, sin relanzar.
+REM   Puerto abajo  : proceso colgado o muerto. Reiniciar.
+REM   Puerto arriba : sano.
+REM (2026-10-15: estas tres lineas usaban una flecha escrita con guion y mayor
+REM que. En un .bat eso NO es texto inerte aunque la linea empiece por REM: cmd
+REM procesa la redireccion igual, asi que cada arranque del supervisor creaba
+REM tres ficheros vacios en este directorio llamados el, proceso y sano. Se
+REM cambiaron por dos puntos.)
 REM
 REM Y hay un TECHO de reinicios rapidos: un bucle que nunca para es un fallo que
 REM hay que mirar, no recuperacion. Al agotarlo, el puente queda PARADO.
@@ -29,10 +34,14 @@ REM definitivo porque el watchdog HTTP lo relanza en 2 minutos como maximo, cosa
 REM que no era cierta cuando se escribio este comentario y ahora si.
 REM
 REM OJO AL EDITAR ESTE FICHERO: en un .bat los comentarios REM NO son texto
-REM inerte. Un parentesis sin cerrar, un simbolo de redireccion o un tanto por
-REM ciento suelto desincronizan el parser de cmd y el script empieza a ejecutar
-REM basura en bucle. Medido hoy: por eso este arreglo no arrancaba. Los
-REM comentarios de aqui van sin parentesis, sin redirecciones y sin porcentajes.
+REM inerte, cmd sigue procesando la linea. Una redireccion crea ficheros vacios
+REM y un porcentaje suelto o un parentesis abierto desincronizan el parser, que
+REM empieza a ejecutar basura en bucle. MEDIDO hoy: por eso este arreglo no
+REM arrancaba y cmd imprimia "M no se reconoce como un comando" sin parar. Los
+REM comentarios nuevos de aqui van sin parentesis, sin redirecciones y sin
+REM porcentajes. Las lineas viejas de mas abajo que si llevan parentesis
+REM funcionan porque abren y cierran en lineas contiguas, pero no se deben
+REM imitar: si se descoloca una sola, el script deja de arrancar.
 setlocal EnableDelayedExpansion
 title ATAS Bridge Supervisor
 cd /d C:\Users\Lenovo\trading-engines\atas-bridge

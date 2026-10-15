@@ -102,6 +102,20 @@ Every trade plan delivered in analysis MUST be logged via `POST /calls` (outcome
 
 ## Order-flow call generation (Binance-only) — `orderflow_calls.py`
 
+> **RETIRADO (2026-10-15).** Este programa **ya no existe en el repositorio**:
+> de `orderflow_calls.py` y `orderflow_calls_report.py` solo quedan `.pyc`
+> huerfanos en `__pycache__`, y `monitor_supervisor.bat` (el supervisor que los
+> lanzaba) tampoco esta. Nada de esta seccion se puede ejecutar hoy.
+>
+> Los lanzadores sobrevivieron al programa y mentian en verde:
+> `start-monitor.ps1` mataba el monitor, invocaba un `.vbs` que apuntaba a
+> `monitor_supervisor.bat` inexistente, y terminaba anunciando "Monitor
+> supervisor launched". Su log tiene la ultima linea del **2026-09-17**.
+> `start-monitor.ps1` ya lo dice en vez de fingirlo.
+>
+> Se conserva el texto de abajo como registro de por que se construyo y que
+> medía, no como instrucciones.
+
 `/calls` sat at **0 entries** and `/calls/stats` returned **HTTP 500**, so the whole
 validation loop was dead. Two independent causes:
 
