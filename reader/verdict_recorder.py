@@ -57,14 +57,24 @@ BRIDGE = "http://127.0.0.1:8000"
 LIVE_MAX_AGE_S = 300.0          # misma regla live-only que el resto del sistema
 DEFAULT_HORIZON_BARS = 12
 
+# Codigos de salida del subcomando `record`. Son CONTRATO con el supervisor
+# (reader_supervisor.py RECORDER_SKIP): 2 es "no hay dato", condicion normal,
+# y NO consume el presupuesto de crashes. Ver do_record().
+RECORDED = 0    # se escribio una fila
+SKIP = 2        # sin dato utilizable (ATAS caido/viejo): no es un fallo
+FAIL = 1        # error real (excepcion: base bloqueada, payload roto, ...)
+
 # Reglas 6/7 de atas-bridge/rules.json. Los niveles de footprint se leen del
 # modulo verdict (que los carga de rules.json) — antes estaban transcritos a
 # mano AQUI con otros numeros, y la condicion (c) se evaluaba con umbrales
 # (dom 5/10) que rules.json ya no declara: el ledger media una regla distinta
 # de la que la puerta decia aplicar. La (c) ahora es la MISMA funcion que usa
 # la puerta: verdict.dom_vac_eval (consenso multi-venue del scanner).
-R6 = {"levels_min": 4}
-R7 = {"levels_min": 3}
+# ... y ahora TAMBIEN los niveles de footprint: verdict.RULE6["levels_min"] /
+# verdict.RULE7["levels_min"], que verdict.py carga del mismo rules.json que la
+# puerta. Estaban transcritos a mano aqui como {4} y {3} — justamente lo que el
+# comentario de arriba dice que ya no se hace. Dos numeros hardcodeados que
+# hubieran dejado de seguir a rules.json en cuanto alguien los tocara.
 
 
 def get(path: str, timeout: float = 25.0):
@@ -163,36 +173,29 @@ def ema(vals):
 
 
 def classify_footprint(top_levels):
-    """Regla 6 cuenta niveles con bid%>70; regla 7 con bid%<30.
+    """UNA sola implementación: delega en `verdict.classify_footprint`.
 
-    La asimetría es intencional (4 vs 3): un footprint con 3 niveles
-    predominantemente vendedores NO satisface ninguna de las dos.
-    Lados sin contraparte (ask==0) cuentan como 100% bid y distorsionan el
-    recuento, así que se marcan aparte.
-    El umbral viene de rules.json via verdict.FOOTPRINT_PCT (65 en v3.4.1) —
-    el 70/30 hardcoded hacia que el ledger contara con un umbral distinto del
-    que la puerta aplica.
+    2026-10-15 — DERIVA CORREGIDA. Había DOS clasificadores del footprint y ya
+    discrepaban en tres cosas a la vez, pese a que el propio docstring del
+    módulo documenta el fallo histórico ("la media una regla distinta de la
+    que la puerta decía aplicar"):
+
+      1. FRONTERA — la puerta contaba `bp >= 65`, este `bp > 65`. Un nivel con
+         bid_pct exactamente 65.0 (bid 13 / ask 7, alcanzable con enteros)
+         contaba para el veredicto publicado y NO para la fila de reader.db:
+         `r6_b` del ledger y `b6` de la puerta podían ser distintos en la misma
+         lectura, y sobre esa muestra se midió y se puso en cuarentena la
+         regla 6.
+      2. ORDEN del tuple — `(sell_h, buy_h, thin, rows)` aquí vs
+         `(rows, sell_h, buy_h, thin)` allí: un anzuelo listo para el siguiente
+         copy-paste.
+      3. CAMPOS — aquí faltaban `bid`/`ask` y el `tag`, que la puerta sí
+         publica.
+
+    Devuelve el orden histórico de este módulo para no tocar sus call sites.
     """
-    sell_h = buy_h = thin = 0
-    rows = []
-    for lv in top_levels or []:
-        if not isinstance(lv, dict):
-            continue
-        bid = lv.get("bid", 0) or 0
-        ask = lv.get("ask", 0) or 0
-        tot = bid + ask
-        if not tot:
-            continue
-        bp = 100.0 * bid / tot
-        is_thin = (bid == 0 or ask == 0)
-        if is_thin:
-            thin += 1
-        if bp > verdict.FOOTPRINT_PCT:
-            sell_h += 1
-        elif bp < 100.0 - verdict.FOOTPRINT_PCT:
-            buy_h += 1
-        rows.append({"price": lv.get("price"), "bid_pct": round(bp, 1),
-                     "delta": lv.get("delta", 0), "thin": is_thin})
+    rows, sell_h, buy_h, thin = verdict.classify_footprint(
+        top_levels, verdict.FOOTPRINT_PCT)
     return sell_h, buy_h, thin, rows
 
 
@@ -234,25 +237,35 @@ def read_live():
     cv = get("/cvd")
     cvd_state = (cv.get("cvd") or cv).get(str(i.get("ticker")).upper()) or {}
     bd = cvd_state.get("bar_deltas") or []
-    up = dn = 0
-    for d in reversed(bd):
-        if d > 0:
-            if dn:
-                break
-            up += 1
-        elif d < 0:
-            if up:
-                break
-            dn += 1
-        else:
-            break
-    cond_a6 = ("UNEVALUABLE" if len(bd) < 2 else
-               ("MET" if dn >= 2 else "FAIL"))
-    cond_a7 = ("UNEVALUABLE" if len(bd) < 2 else
-               ("MET" if up >= 2 else "FAIL"))
+    up, dn = verdict.streak_from_bar_deltas(bd)
 
-    cond_b6 = "MET" if sell_h >= R6["levels_min"] else "FAIL"
-    cond_b7 = "MET" if buy_h >= R7["levels_min"] else "FAIL"
+    # 2026-10-15 — EL LEDGER MEDIABA LA MISMA REGLA QUE LA PUERTA.
+    #
+    # Antes aqui se reimplementaba la condicion (a) a mano con `len(bd) < 2`
+    # y un `>= 2` literal, mientras la puerta exigia ademas CONTIGUIDAD via
+    # verdict.cvd_integrity (verdict.py:896-908). Con un hueco dentro de la
+    # ventana la puerta emitia UNEVALUABLE y, por ser AND estricto, NEUTRAL; el
+    # ledger grababa r6_a=MET en la misma lectura. Dos implementaciones de una
+    # decision — la clase de fallo que este propio modulo documenta en su
+    # docstring como ya ocurrida con los umbrales. Encima, esa muestra
+    # inflaba rule6_fired_resolved y toda la medicion de la regla 6.
+    int_a = verdict.cvd_integrity(cvd_state, verdict.RULE6["streak"],
+                                  verdict.CVD_INTEGRITY_WINDOW)
+    int_b = verdict.cvd_integrity(cvd_state, verdict.RULE7["streak"],
+                                  verdict.CVD_INTEGRITY_WINDOW)
+    if not int_a["ok"]:
+        cond_a6 = "UNEVALUABLE"
+    else:
+        cond_a6 = ("UNEVALUABLE" if len(bd) < 2 else
+                   ("MET" if dn >= verdict.RULE6["streak"] else "FAIL"))
+    if not int_b["ok"]:
+        cond_a7 = "UNEVALUABLE"
+    else:
+        cond_a7 = ("UNEVALUABLE" if len(bd) < 2 else
+                   ("MET" if up >= verdict.RULE7["streak"] else "FAIL"))
+
+    cond_b6 = "MET" if sell_h >= verdict.RULE6["levels_min"] else "FAIL"
+    cond_b7 = "MET" if buy_h >= verdict.RULE7["levels_min"] else "FAIL"
 
     # (c) multi-venue: LA MISMA funcion que evalua la puerta (verdict.py).
     # Cada lectura del grabador es un ciclo del gate — ver verdict.dom_vac_eval.
@@ -419,10 +432,29 @@ def db():
 
 
 def do_record(c) -> int:
+    """Devuelve un CODIGO DE SALIDA, no un booleano.
+
+    2026-10-15 — BUG QUE MATABA EL SERVICIO. Devolvia 1 al grabar y 0 en SKIP,
+    mientras `main` hacía `return 0 if do_record(c) else 1`: un SKIP salia con
+    rc=1, o sea exactamente al reves. El supervisor (`ok = rc_r == 0`) contaba
+    ese rc como crash, consumia el presupuesto de 5 fallos rapidos y luego los
+    20 reintentos, y salia con gave_up=true. Medido en supervisor.log: TODAS
+    las PAUSA eran "SKIP: ATAS no disponible: RemoteDisconnected", y
+    supervisor_launch.log muestra salidas con code 1 que nadie relanzaba.
+
+    Peor aun: ese mismo rc=1 puerta el resolve (reader_supervisor.py:288) y el
+    notify (:306), asi que "ATAS esta caido" se traducia en "no se resuelve
+    NADA y no se notifica NADA" — de ahi el `resolver_tail` vivo
+    "no se resuelve: record fallo".
+
+    El propio start-reader.ps1 ya documentaba el contrato que el codigo
+    incumplia: "si ATAS esta cerrado el grabador simplemente no graba y lo
+    dice" (condicion normal, no fallo).
+    """
     rec, err = read_live()
     if rec is None:
         print(f"  SKIP: {err}")
-        return 0
+        return SKIP
     cols = ("ts,symbol,bar_index,bar_time,bar_key,bar_seg,src_age_s,price_last,"
             "poc,value_area_low,value_area_high,levels,thin_levels,"
             "footprint_sell_heavy,"
@@ -449,7 +481,7 @@ def do_record(c) -> int:
     c.commit()
     print(f"  recorded {rec['symbol']} bar#{rec['bar_index']} bias={rec['bias']} "
           f"r6={rec['r6_met']} r7={rec['r7_met']}")
-    return 1
+    return RECORDED
 
 
 def do_resolve(c) -> int:
@@ -589,7 +621,11 @@ def main() -> int:
     a = ap.parse_args()
     c = db()
     if a.cmd == "record":
-        return 0 if do_record(c) else 1
+        # Ya es un codigo de salida: 0=grabado, 2=sin dato, 1=error. Antes era
+        # `0 if do_record(c) else 1`, que invertia el SKIP. Las excepciones de
+        # `do_record` escapan y Python sale con 1 por su cuenta (ese si es el
+        # camino de error real).
+        return do_record(c)
     if a.cmd == "resolve":
         do_resolve(c)
         return 0

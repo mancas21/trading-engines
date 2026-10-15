@@ -208,12 +208,51 @@ def _dom_gate_save(s: dict) -> None:
         pass                                        # el gate degrada, no truena
 
 
-def _dom_gate_tick(symbol: str, buy_met: bool, sell_met: bool) -> tuple[int, int]:
+# 2026-10-15 — BUG DE PERSISTENCIA (mismo patrón que ya costó un día aquí).
+#
+# rules.json declara `dom_vac_polls_min: 2` = "lecturas del reader (~30s)".
+# Pero UN ciclo del supervisor invoca el gate DOS veces sobre el MISMO snapshot
+# del scanner: `verdict_recorder.record` (reader_supervisor.py:261) y, si llegó
+# a registrar, el notificador vía `build_verdict` (reader_supervisor.py:306 →
+# verdict.py:878). Las dos lecturas ocurren separadas por milisegundos y el
+# scanner solo refresca cada ~12s, asi que la "persistencia" exigida por AT-6 y
+# AT-7 se cumplia con UNA sola observacion real: el gate direccional disparaba
+# con media evidencia.
+#
+# Solución: una racha solo avanza cuando la observación es NUEVA. Cualquier
+# segunda llamada dentro de _DOM_GATE_POLL_S LEE la racha sin moverla, así que
+# el doble tick deja de ser posible venga de donde venga.
+_DOM_GATE_POLL_S = 15.0    # una observación nueva del reader (ciclo ~30s)
+# Y no sobrevive a una parada: si nadie ha leído el gate durante más de esto,
+# las lecturas anteriores dejan de valer. Una caída de ATAS o una pausa del
+# supervisor no puede dar por buena una racha empezada horas atrás — era el
+# contrato prometido por el propio docstring ("la racha muere") y solo lo
+# cumplía si moría el scanner.
+_DOM_GATE_STALE_S = 120.0
+
+
+def _dom_gate_tick(symbol: str, buy_met: bool, sell_met: bool,
+                   observe: bool = True) -> tuple[int, int]:
     """Rachas consecutivas de consenso por lado. Un fallo en cualquier fuente
     (scanner caído, venues insuficientes) pasa buy_met/sell_met=False y la
-    racha muere — conservador por diseño."""
+    racha muere — conservador por diseño.
+
+    Solo avanza una vez por observación real: ver _DOM_GATE_POLL_S. Con
+    `observe=False` solo se LEE (ver dom_vac_eval).
+    """
     st = _dom_gate_load()
     rec = st.get(symbol) or {"buy": 0, "sell": 0}
+    if not observe:
+        return int(rec.get("buy", 0)), int(rec.get("sell", 0))
+    now = time.time()
+    ts = float(rec.get("ts") or 0.0)
+    age = now - ts
+    if age < _DOM_GATE_POLL_S:
+        # Misma observación (el otro hijo del mismo ciclo): se lee, no se avanza.
+        return int(rec.get("buy", 0)), int(rec.get("sell", 0))
+    if age > _DOM_GATE_STALE_S:
+        rec["buy"], rec["sell"] = 0, 0      # la racha muere con la parada
+    rec["ts"] = now
     rec["buy"] = int(rec.get("buy", 0)) + 1 if buy_met else 0
     rec["sell"] = int(rec.get("sell", 0)) + 1 if sell_met else 0
     st[symbol] = rec
@@ -221,7 +260,7 @@ def _dom_gate_tick(symbol: str, buy_met: bool, sell_met: bool) -> tuple[int, int
     return rec["buy"], rec["sell"]
 
 
-def dom_vac_eval(symbol: str) -> dict:
+def dom_vac_eval(symbol: str, observe: bool = True) -> dict:
     """La condición (c) completa para las reglas AT-6/AT-7, compartida por la
     puerta (build_verdict) y por el grabador (verdict_recorder): UNA sola
     implementación, o las dos desincronizan como ya pasó con los umbrales.
@@ -229,41 +268,57 @@ def dom_vac_eval(symbol: str) -> dict:
     Devuelve {"buy": {"state", "detail"}, "sell": {...}, "venues": n} donde
     state es MET/FAIL/UNEVALUABLE. MET exige: >= vac_venues venues del lado,
     durante vac_polls lecturas consecutivas del reader.
+
+    `observe=False` LEE la racha sin avanzarla. Solo el poll del grabador
+    (`verdict_recorder.record`, el ciclo real del reader) es una observación:
+    sin esto, el notificador del MISMO ciclo y `live_reader --text` (invocado a
+    mano) también contarían, y dos lecturas de un CLI hecho a pulso podrian
+    llevar la racha a MET sin que el grabador nunca la observara.
     """
-    thr = RULE7["vac_thr"]
-    need = RULE7["vac_venues"]
-    polls = RULE7["vac_polls"]
+    # 2026-10-15 — cada lado con LOS UMBRALES QUE DECLARA. Antes se leían los de
+    # la regla 7 para los DOS lados mientras la etiqueta anunciaba los de la 6
+    # (`c_vac_sell_{RULE6['vac_venues']}` / "... {RULE6['vac_thr']:g}"):
+    # coincidían solo porque rules.json hoy pone 0.25/3/2 en las dos, así que
+    # ni el test de contrato lo veía. Si alguien tunesa solo la 6, el motor
+    # seguiría aplicando los de la 7 y publicando los de la 6 — la clase
+    # exacta de "declara una cosa y evalúa otra" que ya costó un día.
     tb = _scanner_book_imb5(symbol)
-    if tb is None:
-        _dom_gate_tick(symbol, False, False)
+    sides = (("buy", RULE7), ("sell", RULE6))   # 7 = acumulación (lado bid)
+    if tb is None:                              # 6 = distribución (lado ask)
+        _dom_gate_tick(symbol, False, False, observe=observe)
         return {"buy": {"state": "UNEVALUABLE",
                         "detail": "scanner multi-venue no disponible"},
                 "sell": {"state": "UNEVALUABLE",
                          "detail": "scanner multi-venue no disponible"},
                 "venues": 0}
+    need = max(RULE6["vac_venues"], RULE7["vac_venues"])
     if len(tb) < need:
-        _dom_gate_tick(symbol, False, False)
-        return {"buy": {"state": "UNEVALUABLE",
-                        "detail": f"solo {len(tb)} venue(s) vivo(s); el consenso pide {need}"},
-                "sell": {"state": "UNEVALUABLE",
-                         "detail": f"solo {len(tb)} venue(s) vivo(s); el consenso pide {need}"},
+        _dom_gate_tick(symbol, False, False, observe=observe)
+        det = (f"solo {len(tb)} venue(s) vivo(s); el consenso pide {need}")
+        return {"buy": {"state": "UNEVALUABLE", "detail": det},
+                "sell": {"state": "UNEVALUABLE", "detail": det},
                 "venues": len(tb)}
-    n_buy = sum(1 for v in tb.values() if v > thr)
-    n_sell = sum(1 for v in tb.values() if v < -thr)
-    b_n, s_n = _dom_gate_tick(symbol, n_buy >= need, n_sell >= need)
-    detail = (f"{n_buy}C/{n_sell}V venues con |imb5|>{thr:g} "
-              f"({len(tb)} vivos); racha C={b_n} V={s_n} de {polls}")
-    out = {"buy": {}, "sell": {}, "venues": len(tb), "detail": detail}
-    for side, count, streak in (("buy", n_buy, b_n), ("sell", n_sell, s_n)):
-        if count < need:
+    counts = {s: sum(1 for v in tb.values()
+                     if (v > R["vac_thr"] if s == "buy" else v < -R["vac_thr"]))
+              for s, R in sides}
+    b_n, s_n = _dom_gate_tick(symbol, counts["buy"] >= RULE7["vac_venues"],
+                               counts["sell"] >= RULE6["vac_venues"],
+                               observe=observe)
+    streaks = {"buy": b_n, "sell": s_n}
+    out = {"buy": {}, "sell": {}, "venues": len(tb),
+           "detail": (f"{counts['buy']}C/{counts['sell']}V venues por lado "
+                      f"({len(tb)} vivos); racha C={b_n} V={s_n}")}
+    for side, R in sides:
+        count, streak, thr = counts[side], streaks[side], R["vac_thr"]
+        if count < R["vac_venues"]:
             out[side] = {"state": "FAIL",
-                         "detail": f"{count} venues del lado {side} con |imb5|>{thr:g} (piden {need})"}
-        elif streak < polls:
+                         "detail": f"{count} venues del lado {side} con |imb5|>{thr:g} (piden {R['vac_venues']})"}
+        elif streak < R["vac_polls"]:
             out[side] = {"state": "UNEVALUABLE",
-                         "detail": f"consenso {side} en racha {streak} de {polls} lecturas"}
+                         "detail": f"consenso {side} en racha {streak} de {R['vac_polls']} lecturas"}
         else:
             out[side] = {"state": "MET",
-                         "detail": f"{count} venues del lado {side}, racha {streak}>= {polls}"}
+                         "detail": f"{count} venues del lado {side}, racha {streak}>= {R['vac_polls']}"}
     return out
 
 # ── COBERTURA DE REGLAS ────────────────────────────────────────────────────
@@ -559,7 +614,7 @@ def streak_from_bar_deltas(bar_deltas):
     return up, dn
 
 
-def classify_footprint(top_levels, sell_pct=None, buy_pct=None):
+def classify_footprint(top_levels, sell_pct=None):
     """Clasifica niveles del footprint como venta/compra dominante.
 
     Regla 6 cuenta niveles con `footprint_sell_pct_min`% o mas de volumen en el
@@ -579,11 +634,20 @@ def classify_footprint(top_levels, sell_pct=None, buy_pct=None):
 
     Ahora se leen de rules.json. Los defaults (70/30) solo aplican si el JSON no
     se puede leer, y avisa de eso al cargar el modulo.
+
+    2026-10-15 — TRAMPA ELIMINADA. La firma traia un `buy_pct` que se guardaba
+    en `_bp` y NUNCA se usaba: el lado compra se evaluaba con `100.0 - _sp`.
+    El comportamiento era el correcto (ask-dominante = complemento exacto del
+    umbral de venta: con 65, bid<=35 es ask>=65), pero el parametro invitaba a
+    creer lo contrario. Llamadas reales pasaban `buy_pct=FOOTPRINT_PCT` (=65),
+    y quien "arreglara" el parametro muerto para que se usara pasaria a aceptar
+    `bid <= 65%` como compra dominante — casi todo el libro — y romperia la
+    regla 7 de golpe. El complemento es una identidad, no una configuracion.
     """
     # Defaults solo si rules.json no se pudo leer. load_footprint_pct() avisa
     # de esa situacion al importar el modulo.
     _sp = 70.0 if sell_pct is None else float(sell_pct)
-    _bp = 30.0 if buy_pct is None else float(buy_pct)
+    _low = 100.0 - _sp            # lado ask dominante = complemento exacto
     rows, sell_h, buy_h, thin = [], 0, 0, 0
     for lv in top_levels or []:
         if not isinstance(lv, dict):
@@ -600,7 +664,7 @@ def classify_footprint(top_levels, sell_pct=None, buy_pct=None):
         if bp >= _sp:
             sell_h += 1
             tag = f"SELL>{_sp:g}"
-        elif bp <= 100.0 - _sp:
+        elif bp <= _low:
             buy_h += 1
             tag = f"BUY>{_sp:g}"
         else:
@@ -769,7 +833,7 @@ def build_verdict() -> dict:
     v["value_area"] = [fp.get("value_area_low"), fp.get("value_area_high")]
 
     rows, sell_h, buy_h, thin = classify_footprint(
-        fp.get("top_levels"), FOOTPRINT_PCT, FOOTPRINT_PCT)
+        fp.get("top_levels"), FOOTPRINT_PCT)
     imbalance = dom.get("imbalance_pct")
     ema = dom.get("imbalance_pct_ema")
     v["footprint"] = {"levels": len(rows), "sell_heavy": sell_h,
@@ -875,14 +939,17 @@ def build_verdict() -> dict:
     # sostenido P lecturas. La EMA se SIGUE PUBLICANDO como contexto (v["dom"])
     # pero ya no decide nada — un número que se muestra y un número que gatean
     # dejan de ser el mismo por accidente.
-    gate = dom_vac_eval(v["symbol"])
-    c6 = gate[RULE6_SIDE]["state"]
+    gate = dom_vac_eval(v["symbol"], observe=False)   # la observación es del
+    c6 = gate[RULE6_SIDE]["state"]                    # grabador, no de aquí
     c7 = gate[RULE7_SIDE]["state"]
     v["dom_vac"] = {
         "symbol": v["symbol"],
-        "thr": RULE7["vac_thr"],
-        "venues_min": RULE7["vac_venues"],
-        "polls_min": RULE7["vac_polls"],
+        # Cada lado con LOS SUYOS: antes ambos reportaban los de la regla 7
+        # mientras las claves de conditions (mas abajo) citaban los de la 6.
+        # Coincidian solo porque rules.json hoy pone lo mismo en las dos.
+        "thr": {"sell": RULE6["vac_thr"], "buy": RULE7["vac_thr"]},
+        "venues_min": {"sell": RULE6["vac_venues"], "buy": RULE7["vac_venues"]},
+        "polls_min": {"sell": RULE6["vac_polls"], "buy": RULE7["vac_polls"]},
         "buy": gate["buy"], "sell": gate["sell"],
         "detail": gate.get("detail", ""),
     }
