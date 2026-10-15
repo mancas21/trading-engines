@@ -1049,6 +1049,19 @@ def build_verdict() -> dict:
                  f"{COND_WINDOW_S:g}s; la ventana NO anade evidencia, solo deja "
                  "de descartar la que ya habia"),
     }
+
+    # Estructura del chart (TradingView). CONTEXTO, NO señal: no entra en el
+    # sesgo. Existe para que el silencio sea auditable. Import perezoso y
+    # protegido: la puerta tiene que seguir funcionando aunque live_reader o el
+    # chart no esten.
+    try:
+        import live_reader as _lr
+        v["structure"] = _lr.structure_block()
+    except Exception as _e:                             # noqa: BLE001
+        v["structure"] = {"ok": False,
+                          "error": f"{type(_e).__name__}: {str(_e)[:60]}",
+                          "validated": False}
+
     v["dom_vac"] = {
         "symbol": v["symbol"],
         # Cada lado con LOS SUYOS: antes ambos reportaban los de la regla 7

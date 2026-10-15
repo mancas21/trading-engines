@@ -44,6 +44,16 @@ BRIDGE = "http://127.0.0.1:8000"
 CDP = "http://127.0.0.1:9222"
 TV_SCRIPT = ROOT / "tradingview-bridge" / "tv_live.mjs"
 STALE_S = 300.0
+# 2026-10-15 — Cache del chart.
+#
+# `_tradingview_read()` lanza node y puede tardar hasta 120 s. El notificador lo
+# llamaba en CADA ciclo (30 s) y ademas el veredicto necesita la estructura para
+# publicarla: hacerlo dos veces por ciclo es caro y arriesga el ritmo del reader.
+# Se cachea en disco; las lecturas dentro de la ventana devuelven la copia CON SU
+# EDAD, para que quien la lea sepa si es fresca. Y si node/CDP fallan de forma
+# puntual no se pierde la ultima lectura buena: se devuelve marcada.
+TV_CACHE_S = 240.0
+_TV_CACHE = HERE / "tv_structure_cache.json"
 
 
 def _json(url: str, timeout: float = 20.0):
@@ -79,7 +89,7 @@ def src_atas() -> dict:
 
 
 # ── Fuente 2: TradingView (estructura, NUNCA order flow) ──
-def src_tradingview() -> dict:
+def _tradingview_read() -> dict:
     """Estructura desde el chart real.
 
     OJO: el nivel gratuito de TradingView NO tiene feed L2, así que cualquier
@@ -148,6 +158,74 @@ def src_tradingview() -> dict:
     kv["note"] = ("estructura solamente: TradingView free no tiene L2, su "
                   "order-flow es proxy OHLC")
     return kv
+
+
+def src_tradingview(max_age_s: float = TV_CACHE_S, force: bool = False) -> dict:
+    """Estructura del chart, CACHEADA. Ver TV_CACHE_S arriba."""
+    now = time.time()
+    cached = None
+    try:
+        if _TV_CACHE.exists():
+            cached = json.loads(_TV_CACHE.read_text(encoding="utf-8"))
+    except Exception:                               # noqa: BLE001
+        cached = None
+    if not force and isinstance(cached, dict) and \
+            (now - float(cached.get("read_ts") or 0)) < max_age_s:
+        return cached
+    fresh = _tradingview_read()
+    fresh["read_ts"] = now
+    try:
+        tmp = _TV_CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(fresh, indent=1), encoding="utf-8")
+        tmp.replace(_TV_CACHE)
+    except Exception:                               # noqa: BLE001
+        pass
+    if not fresh.get("ok") and isinstance(cached, dict) and cached.get("ok"):
+        # Un fallo puntual de node/CDP no puede borrar la ultima lectura buena:
+        # se devuelve marcada, y quien la lea sabe que es vieja.
+        out = dict(cached)
+        out["stale_error"] = fresh.get("error")
+        return out
+    return fresh
+
+
+def structure_block(max_age_s: float = TV_CACHE_S) -> dict:
+    """Bloque de estructura para el veredicto: CONTEXTO, nunca una señal.
+
+    MEDIDO 2026-10-15 sobre 928 barras de 5m de JUPUSDT, mismo horizonte que el
+    ledger (12 barras = 60 min): las señales de estructura ALCISTA no tienen
+    edge — ruptura de pivote t=+0,13; EMA9>EMA21 con cierre encima t=-0,14;
+    cruce de EMA al alza t=-0,92. El t=+4,13 del lado corto es la DERIVA del
+    mercado, no predicción (el mismo error que puso la regla 6 en cuarentena).
+
+    Por eso este bloque NO decide el sesgo (y la Regla 4 esta retirada). Existe
+    para lo que SI es un defecto: que el silencio del motor fuera inauditable.
+    Durante el rally de hoy el motor dijo 86 NEUTRAL seguidos y no habia forma de
+    distinguir "lo mire y no hay señal" de "no lo mire".
+    """
+    tv = src_tradingview(max_age_s=max_age_s)
+    if not tv.get("ok"):
+        return {"ok": False, "error": tv.get("error"), "validated": False}
+    return {
+        "ok": True,
+        "source": "tradingview",
+        "symbol": tv.get("symbol"),
+        "tf": tv.get("tf"),
+        "close": tv.get("close"),
+        "ema9": tv.get("ema9"), "ema21": tv.get("ema21"),
+        "ema50": tv.get("ema50"), "ema200": tv.get("ema200"),
+        "stack": tv.get("stack"),
+        "rsi14": tv.get("rsi14"), "rsi6": tv.get("rsi6"),
+        "atr14": tv.get("atr14"),
+        "position_in_range": tv.get("position_in_range"),
+        "volume_ratio": tv.get("volume_ratio"),
+        "read_age_s": round(time.time() - float(tv.get("read_ts") or 0), 1),
+        "stale_error": tv.get("stale_error"),
+        "validated": False,
+        "note": ("CONTEXTO, NO señal: no decide el sesgo. Medido sin edge en el "
+                 "lado alcista; existe para que el silencio del motor sea "
+                 "auditable — ver lo que veia cuando dijo NEUTRAL."),
+    }
 
 
 # ── Fuente 3: precios 24h (CoinGecko) + breadth (el DOM del bridge) ──

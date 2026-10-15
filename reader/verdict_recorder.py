@@ -425,6 +425,12 @@ _MIGRATIONS = [
     ("verdicts", "bar_key", "TEXT"),
     # bar_seg: segmento de reloj (0 = sesion normal, >0 tras un reinicio).
     ("verdicts", "bar_seg", "INTEGER"),
+    # 2026-10-15 — structure: la lectura de TradingView en el momento del
+    # veredicto (JSON). CONTEXTO, no señal: no decide el sesgo. Existe porque el
+    # silencio del motor era INAUDITABLE — durante el rally de hoy emitio 86
+    # NEUTRAL seguidos y no habia forma de distinguir "lo mire y no hay señal" de
+    # "no lo mire". Ver live_reader.structure_block().
+    ("verdicts", "structure", "TEXT"),
     # 2026-10-15 — resolved_bar_min: con que tamano de barra se resolvio la fila.
     #
     # El resolutor pedia klines de 15m mientras indexaba con horizon_bars (12),
@@ -487,13 +493,22 @@ def do_record(c) -> int:
     if rec is None:
         print(f"  SKIP: {err}")
         return SKIP
+    # Estructura del chart en el momento del veredicto (CONTEXTO, no señal).
+    # Va cacheada en live_reader, asi que normalmente es gratis. Y NUNCA puede
+    # romper el registro: si falla, se anota el fallo y la fila se graba igual.
+    try:
+        import live_reader as _lr
+        _struct = json.dumps(_lr.structure_block())
+    except Exception as _e:                         # noqa: BLE001
+        _struct = json.dumps({"ok": False,
+                              "error": f"{type(_e).__name__}: {str(_e)[:60]}"})
     cols = ("ts,symbol,bar_index,bar_time,bar_key,bar_seg,src_age_s,price_last,"
             "poc,value_area_low,value_area_high,levels,thin_levels,"
             "footprint_sell_heavy,"
             "footprint_buy_heavy,imbalance_pct,imbalance_pct_ema,imbalance_ema_n,"
             "tape_buy_pct,volume_ratio,cvd,cvd_bars,cvd_streak_up,cvd_streak_down,"
             "r6_a,r6_b,r6_c,r6_met,r7_a,r7_b,r7_c,r7_met,bias,score,score_parts,"
-            "horizon_bars,resolved")
+            "horizon_bars,structure,resolved")
     # `resolved` se escribe EXPLICITO a 0. La tabla real de reader.db no tiene
     # DEFAULT en esa columna (el CREATE TABLE solo aplica a bases nuevas), asi
     # que omitirla deja NULL y el filtro `resolved=0` del resolver NUNCA la
@@ -506,7 +521,7 @@ def do_record(c) -> int:
         "imbalance_pct_ema", "imbalance_ema_n", "tape_buy_pct", "volume_ratio",
         "cvd", "cvd_bars", "cvd_streak_up", "cvd_streak_down",
         "r6_a", "r6_b", "r6_c", "r6_met", "r7_a", "r7_b", "r7_c", "r7_met",
-        "bias", "score", "score_parts", "horizon_bars")) + (0,)
+        "bias", "score", "score_parts", "horizon_bars")) + (_struct, 0,)
     c.execute(f"INSERT INTO verdicts ({cols}) VALUES ({','.join('?' * len(vals))})", vals)
     c.execute("INSERT OR REPLACE INTO recorder_meta VALUES ('last_record_ts', ?)",
               (str(rec["ts"]),))
