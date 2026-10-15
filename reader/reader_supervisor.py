@@ -51,6 +51,11 @@ NOTIFIER = HERE / "verdict_notify.py"
 # barra, asi que mas fino no anade nada); el notificador cada 60s.
 RECORD_EVERY_S = 30.0
 NOTIFY_EVERY_S = 60.0
+# Digest ejecutivo a Telegram: cada 15 min. Lo aplica verdict_notify.py
+# (DIGEST_EVERY_S), no este bucle: el supervisor llama al notificador en cada
+# ciclo y el notificador decide si toca por tiempo. Asi el intervalo se cambia
+# en un solo sitio y no hace falta tocar el supervisor.
+DIGEST_EVERY_S = 900.0
 
 # Codigo que el notificador usa para decir "ya hay otro servicio".
 ALREADY_RUNNING_EXIT = 3
@@ -350,7 +355,14 @@ def cycle(dry_run: bool = False) -> tuple[bool, str]:
     # verdad; el anti-spam lo garantiza el CAMBIO DE SESGO del notificador, no
     # un dry-run aqui.
     if recorded and "recorded" in out_r:
-        nargs = ["--once"] + (["--dry-run"] if dry_run else [])
+        # --digest ademas de --once: el aviso por CAMBIO DE SESGO sigue siendo
+        # inmediato, y el digest periodico (15 min) se envia aunque el sesgo no
+        # cambie. El modulo decide por tiempo; si no toca, sale sin enviar.
+        #
+        # 2026-10-15 — el digest NO depende de que el chat este abierto. Lo
+        # dispara este supervisor, que ya es un servicio (Reader.lnk en Inicio),
+        # no una sesion del agente.
+        nargs = ["--once", "--digest"] + (["--dry-run"] if dry_run else [])
         rc_n, out_n = run_child(NOTIFIER, nargs, timeout=150)
         st["notify_rc"] = rc_n
         st["notify_mode"] = "dry-run" if dry_run else "send"

@@ -235,16 +235,40 @@ def structure_block(max_age_s: float = TV_CACHE_S) -> dict:
 # que cada dato dice de dónde viene, una etiqueta que nombra un venue que NO
 # sirvió el dato es el mismo defecto que un valor imputado — se corrige el
 # nombre, no la proveniencia.
-def src_prices_24h() -> dict:
+# Ticker de ATAS -> id de CoinGecko. Hace falta para que el contexto de 24 h
+# describa el activo ANALIZADO. Antes la funcion pedia bitcoin,ripple,solana
+# fijos: con el chart en JUPUSDT devolvia el cambio de SOL y nadie lo notaba,
+# porque el numero se leia igual de plausible.
+_CG_BY_TICKER = {
+    "XRPUSDT": "ripple",
+    "JUPUSDT": "jupiter-exchange-solana",
+    "BTCUSDT": "bitcoin",
+    "ETHUSDT": "ethereum",
+    "SOLUSDT": "solana",
+}
+
+
+def src_prices_24h(symbol: str | None = None) -> dict:
+    """Precio y cambio de 24 h del activo ANALIZADO (+ bitcoin como referencia).
+
+    2026-10-15 — TIENE QUE RECIBIR EL SIMBOLO. Ped'ia 3 ids fijos y devolvia el
+    cambio de SOL con el chart en JUPUSDT: el contexto describia otro activo.
+    Ademas, el error iba en `price_error` mientras quien lee mira `error`, as�
+    que un fallo se ve'ia como "fuente ausente" sin motivo.
+    """
     out = {"ok": False, "source": "coingecko"}
+    cg_id = _CG_BY_TICKER.get(str(symbol or "").upper())
+    ids = "bitcoin" + ("," + cg_id if cg_id and cg_id != "bitcoin" else "")
     try:
         with urllib.request.urlopen(
-                "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ripple,solana"
+                "https://api.coingecko.com/api/v3/simple/price?ids=" + ids +
                 "&vs_currencies=usd&include_24hr_change=true", timeout=20) as r:
             out["prices"] = json.loads(r.read().decode())
         out["ok"] = True
+        out["cg_id"] = cg_id
     except Exception as e:
-        out["price_error"] = f"{type(e).__name__}: {str(e)[:60]}"
+        out["error"] = f"{type(e).__name__}: {str(e)[:60]}"
+        out["price_error"] = out["error"]
     d = _json(f"{BRIDGE}/dom")
     ds = d.get("dom") or d
     if isinstance(ds, dict):
@@ -285,7 +309,7 @@ def read_all() -> dict:
     t0 = time.time()
     atas = src_atas()
     tv = src_tradingview()
-    px = src_prices_24h()
+    px = src_prices_24h(symbol=(atas.get("verdict") or {}).get("symbol"))
     mc = src_macro()
     present = [n for n, s in (("atas", atas), ("tradingview", tv),
                               ("prices_24h", px), ("macro", mc)) if s.get("ok")]
