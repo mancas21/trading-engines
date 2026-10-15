@@ -55,7 +55,15 @@ HERE = Path(__file__).resolve().parent.parent
 DB = HERE / "reader" / "reader.db"
 BRIDGE = "http://127.0.0.1:8000"
 LIVE_MAX_AGE_S = 300.0          # misma regla live-only que el resto del sistema
-DEFAULT_HORIZON_BARS = 12
+# Horizonte de resolucion, en BARRAS DE LA GRAFICA.
+#
+# CRITICO: `do_resolve` indexa con este mismo numero la serie que descarga de
+# Binance, asi que la descarga TIENE que ser del mismo tamano de barra que la
+# grafica. Estuvo pidiendo 15m: la fila declaraba 12 barras y la medicion
+# cubria 180 minutos, el triple. Ver el bloque de do_resolve.
+DEFAULT_HORIZON_BARS = 12       # 12 x 5 min = 60 minutos
+BAR_MINUTES = 5                 # tamano de barra del chart de ATAS
+_RESOLVE_INTERVAL = f"{BAR_MINUTES}m"   # UNA sola fuente para las dos cosas
 
 # Codigos de salida del subcomando `record`. Son CONTRATO con el supervisor
 # (reader_supervisor.py RECORDER_SKIP): 2 es "no hay dato", condicion normal,
@@ -521,8 +529,27 @@ def do_resolve(c) -> int:
     resolved = 0
     for s, items in by_sym.items():
         api = s.split("/")[0].replace("-", "").upper()
+        # 2026-10-15 — BUG DE MEDICION: EL HORIZONTE NO ERA EL QUE LA FILA DECIA.
+        #
+        # Aqui ponia `interval=15m`. Pero `horizon_bars` (12, DEFAULT_HORIZON_BARS)
+        # son barras de la GRAFICA DE ATAS, que es de 5 MINUTOS, y el indexado de
+        # abajo (`exit_i = sig_i + h`) es en unidades de la serie que se descarga.
+        # Con 15m, 12 barras son 180 MINUTOS: la fila declaraba 12 barras y la
+        # medicion cubria el TRIPLE del horizonte previsto. Con 5m son los 60
+        # minutos que corresponden al mismo numero.
+        #
+        # Y esto no es un detalle: `forward_return` es la tabla sobre la que se
+        # midio si las reglas 6 y 7 tienen edge, y es la que sostiene su
+        # cuarentena. Un horizonte 3x mas largo mide otra cosa — una deriva de 3
+        # horas en vez del movimiento posterior a la senal — y ni siquiera se
+        # veia: la fila solo guarda horizon_bars, no el intervalo realizado.
+        #
+        # El comentario de mas abajo ya avisaba de la trampa gemela: emparejar
+        # `bar_time` de ATAS ("00:05:00", rejilla de 5 minutos) contra aperturas
+        # de 15m daba CERO coincidencias. La rejilla del chart es de 5m; la
+        # descarga tiene que usar la misma.
         url = (f"https://fapi.binance.com/fapi/v1/klines?symbol={api}"
-               f"&interval=15m&limit=1500")
+               f"&interval={_RESOLVE_INTERVAL}&limit=1500")
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "reader/1.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
