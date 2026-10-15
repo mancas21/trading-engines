@@ -318,6 +318,24 @@ def dom_vac_eval(symbol: str, observe: bool = True) -> dict:
                                observe=observe)
     streaks = {"buy": b_n, "sell": s_n}
     out = {"buy": {}, "sell": {}, "venues": len(tb),
+           # 2026-10-15 — LOS DATOS CRUDOS, no solo el veredicto de la puerta.
+           #
+           # La condicion (c) FALLA su propio criterio pre-registrado en
+           # rules.json ("N=10 transiciones MET<->no-MET por dia"): medido
+           # 61-63/dia sobre 27,5 h reales, contra 19-23/dia del gate viejo que
+           # sustituyo. Y la causa esta medida: los venues NO son comparables
+           # (kraken 60% de las muestras por encima de +0,25 y solo 16,9% por
+           # debajo de -0,25; okx con std 0,34 y 10,6% en el lado vendedor), asi
+           # que un umbral ABSOLUTO mide "que venues viven fuera de la banda",
+           # no acuerdo.
+           #
+           # El candidato es normalizar por venue contra su propia distribucion.
+           # Pero eso NO se puede validar con una muestra de minutos: la tasa por
+           # dia necesita horas. Sin estos crudos, cada intento de rediseno
+           # obliga a volver a muestrear a mano. Con ellos, la decision se toma
+           # offline sobre el historico real.
+           "raw": {k: round(float(v), 4) for k, v in tb.items()},
+           "counts": dict(counts),
            "detail": (f"{counts['buy']}C/{counts['sell']}V venues por lado "
                       f"({len(tb)} vivos); racha C={b_n} V={s_n}")}
     for side, R in sides:

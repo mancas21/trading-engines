@@ -250,3 +250,31 @@ def test_footprint_buy_side_is_the_complement_not_a_second_threshold():
     rows, sell_h, buy_h, thin = V.classify_footprint(lvl, V.FOOTPRINT_PCT)
     assert sell_h == 0
     assert buy_h == 1, "ask>=UMBral es compra dominante y no estaba contando"
+
+
+# ── Los CRUDOS de (c): la puerta falla su propio criterio, hay que poder medirlo ──
+
+def test_dom_vac_publishes_its_inputs_not_only_its_verdict(tmp_path, monkeypatch):
+    """La condicion (c) FALLA el criterio pre-registrado en rules.json
+    ("N=10 transiciones MET<->no-MET por dia"): medido 61-63/dia sobre 27,5 h
+    reales, contra 19-23/dia del gate viejo que sustituyo. Y la causa esta
+    medida: los venues no son comparables (kraken 60% de las muestras por encima
+    de +0,25 y 16,9% por debajo; okx con std 0,34 y 10,6% en el lado vendedor),
+    asi que un umbral ABSOLUTO mide "que venues viven fuera de la banda".
+
+    Redisenar eso exige HORAS de datos, no una muestra de minutos. Con los crudos
+    guardados en el ledger, la decision se toma offline sobre el historico real
+    en vez de volver a muestrear a mano."""
+    monkeypatch.setattr(V, "_scanner_book_imb5", lambda s, timeout=4.0:
+                        {"binance": 0.52, "okx": -0.31, "kraken": 0.40, "bybit": 0.02})
+    gate = V.dom_vac_eval("XRPUSDT")
+
+    assert "raw" in gate, "la puerta no publica el libro por venue"
+    assert gate["raw"] == {"binance": 0.52, "okx": -0.31, "kraken": 0.40, "bybit": 0.02}
+    assert "counts" in gate, "la puerta no publica el recuento por lado"
+    assert gate["counts"] == {"buy": 2, "sell": 1}, (
+        "el recuento por lado no cuadra con los valores: 0.52 y 0.40 pasan +0.25; "
+        "-0.31 pasa -0.25 (okx) y bybit 0.02 no pasa ninguna")
+
+    # Los crudos no son el veredicto: buy tiene 2 venues y el gate pide 3.
+    assert gate["buy"]["state"] == "FAIL"

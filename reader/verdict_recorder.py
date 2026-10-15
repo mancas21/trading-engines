@@ -378,6 +378,12 @@ def read_live():
         "score": score,
         "score_parts": json.dumps(parts),
         "horizon_bars": DEFAULT_HORIZON_BARS,
+        # Crudos de la condicion (c): libro por venue y recuentos. NO es un
+        # veredicto, son las ENTRADAS — para poder evaluar cualquier rediseno
+        # offline sobre el historico real en vez de volver a muestrear a mano.
+        # Ver el bloque de dom_vac_eval en verdict.py.
+        "dom_vac_raw": json.dumps({k: _gate.get(k) for k in
+                                   ("raw", "counts", "venues", "buy", "sell")}),
         "fill_price": None,
         "forward_return": None,
         "resolved": 0,
@@ -425,6 +431,13 @@ _MIGRATIONS = [
     ("verdicts", "bar_key", "TEXT"),
     # bar_seg: segmento de reloj (0 = sesion normal, >0 tras un reinicio).
     ("verdicts", "bar_seg", "INTEGER"),
+    # 2026-10-15 — dom_vac_raw: las ENTRADAS de la condicion (c) (libro por
+    # venue + recuentos), no su veredicto. La condicion FALLA su propio criterio
+    # pre-registrado (61-63 transiciones/dia contra <=10) y su causa esta medida
+    # (venues no comparables: kraken 60% arriba, okx 10,6% abajo), pero validar
+    # un rediseno necesita HORAS de datos. Con los crudos guardados, la decision
+    # se toma offline sobre el historico real.
+    ("verdicts", "dom_vac_raw", "TEXT"),
     # 2026-10-15 — structure: la lectura de TradingView en el momento del
     # veredicto (JSON). CONTEXTO, no señal: no decide el sesgo. Existe porque el
     # silencio del motor era INAUDITABLE — durante el rally de hoy emitio 86
@@ -508,7 +521,7 @@ def do_record(c) -> int:
             "footprint_buy_heavy,imbalance_pct,imbalance_pct_ema,imbalance_ema_n,"
             "tape_buy_pct,volume_ratio,cvd,cvd_bars,cvd_streak_up,cvd_streak_down,"
             "r6_a,r6_b,r6_c,r6_met,r7_a,r7_b,r7_c,r7_met,bias,score,score_parts,"
-            "horizon_bars,structure,resolved")
+            "horizon_bars,dom_vac_raw,structure,resolved")
     # `resolved` se escribe EXPLICITO a 0. La tabla real de reader.db no tiene
     # DEFAULT en esa columna (el CREATE TABLE solo aplica a bases nuevas), asi
     # que omitirla deja NULL y el filtro `resolved=0` del resolver NUNCA la
@@ -521,7 +534,7 @@ def do_record(c) -> int:
         "imbalance_pct_ema", "imbalance_ema_n", "tape_buy_pct", "volume_ratio",
         "cvd", "cvd_bars", "cvd_streak_up", "cvd_streak_down",
         "r6_a", "r6_b", "r6_c", "r6_met", "r7_a", "r7_b", "r7_c", "r7_met",
-        "bias", "score", "score_parts", "horizon_bars")) + (_struct, 0,)
+        "bias", "score", "score_parts", "horizon_bars", "dom_vac_raw")) + (_struct, 0,)
     c.execute(f"INSERT INTO verdicts ({cols}) VALUES ({','.join('?' * len(vals))})", vals)
     c.execute("INSERT OR REPLACE INTO recorder_meta VALUES ('last_record_ts', ?)",
               (str(rec["ts"]),))
