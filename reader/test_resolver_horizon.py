@@ -165,3 +165,36 @@ def test_the_fill_is_never_the_signal_bars_close(tmp_path, monkeypatch):
     signal_close = 100 + k + 0.5
     assert fill != signal_close, "el fill es el close de la barra de senal"
     assert fill >= 100 + (k + 1), "el fill no es posterior al instante de la senal"
+
+
+def test_a_resolved_row_declares_the_bar_size_it_was_resolved_with(tmp_path, monkeypatch):
+    """La OTRA mitad del defecto era que fuera invisible: la fila guardaba
+    `horizon_bars` pero no la unidad con la que se resolvio, asi que mirando la
+    base no habia forma de detectar el desajuste ni de saber que filas son
+    comparables entre si.
+
+    NULL = resuelta ANTES del arreglo (unidad desconocida, no mezclar).
+    El valor = la unidad correcta."""
+    rows = _klines()
+    _capture_urlopen(monkeypatch, rows)
+    c = VR.db()
+    _insert(c, rows[5][0] / 1000.0, VR.DEFAULT_HORIZON_BARS)
+
+    VR.do_resolve(c)
+
+    got = c.execute("SELECT resolved_bar_min FROM verdicts WHERE id=1").fetchone()[0]
+    assert got == VR.BAR_MINUTES == 5, (
+        "la fila no declara con que unidad se resolvio: el desajuste vuelve a "
+        "ser invisible mirando la base")
+
+
+def test_the_migration_is_idempotent_on_an_existing_db(tmp_path, monkeypatch):
+    """reader.db ya existe con su historico y CREATE TABLE IF NOT EXISTS no
+    altera una tabla viva: la columna entra por migracion y abrir dos veces no
+    puede romper ni perder filas."""
+    c1 = VR.db()
+    _insert(c1, 1_700_000_000.0, VR.DEFAULT_HORIZON_BARS)
+    c2 = VR.db()                      # segunda apertura sobre la misma base
+    cols = {r[1] for r in c2.execute("PRAGMA table_info(verdicts)")}
+    assert "resolved_bar_min" in cols
+    assert c2.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0] == 1

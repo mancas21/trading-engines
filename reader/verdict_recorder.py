@@ -413,6 +413,18 @@ _MIGRATIONS = [
     ("verdicts", "bar_key", "TEXT"),
     # bar_seg: segmento de reloj (0 = sesion normal, >0 tras un reinicio).
     ("verdicts", "bar_seg", "INTEGER"),
+    # 2026-10-15 — resolved_bar_min: con que tamano de barra se resolvio la fila.
+    #
+    # El resolutor pedia klines de 15m mientras indexaba con horizon_bars (12),
+    # asi que medía 180 minutos donde la fila declaraba 12 barras de 5m = 60. Y
+    # era INVISIBLE: la fila guardaba horizon_bars pero no la unidad con la que
+    # se resolvio, o sea que mirando la base no habia forma de detectar el
+    # desajuste ni de saber que filas son comparables con cuales.
+    #
+    # Con esta columna: NULL = resuelta ANTES del arreglo (unidad desconocida,
+    # no mezclar con el resto); 5 = resuelta con la unidad correcta. La fila ya
+    # no puede mentir en silencio sobre su propio horizonte.
+    ("verdicts", "resolved_bar_min", "INTEGER"),
 ]
 
 
@@ -590,8 +602,9 @@ def do_resolve(c) -> int:
             fr = (exit_px - fill_open) / fill_open if fill_open else None
             if fr is None:
                 continue
-            c.execute("UPDATE verdicts SET fill_price=?, forward_return=?, resolved=1 "
-                      "WHERE id=?", (round(fill_open, 10), round(fr, 8), vid))
+            c.execute("UPDATE verdicts SET fill_price=?, forward_return=?, resolved=1,"
+                      " resolved_bar_min=? WHERE id=?",
+                      (round(fill_open, 10), round(fr, 8), BAR_MINUTES, vid))
             resolved += 1
             # ── REGLA 8 (Audit On Loss) ──────────────────────────────────────
             # rules.json v3.4.1: "After a call that fails (price moves >1%
