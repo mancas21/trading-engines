@@ -297,6 +297,14 @@ def upsert_verdict(
     resolver scores carries the freshest reading taken before the exit bar
     closed.
 
+    STATE (refreshed on later polls): direction, venues_live, rules_met,
+    rules_unevaluable, score, candidate.
+    EXECUTION (frozen at `ts`, NEVER refreshed): fill_price, ref_venue,
+    fill_spread_bps, cross_basis_bps, price_basis_ok. The horizon and the exit
+    bar are anchored at `ts`, so the entry price has to be too — refreshing the
+    entry while the exit stays at `ts` truncates the measured horizon and
+    attenuates any real edge. See the comment in the UPDATE below.
+
     Returns (row_id, created). `created=False` means an existing window row
     was updated. The unique partial index on (pair, exit_window_ms) is the
     structural guarantee: two rows for one window cannot exist, in this
@@ -323,16 +331,43 @@ def upsert_verdict(
         ).fetchone()
         if row is not None:
             rid = int(row[0])
+            # 2026-10-15 — EL ANCLA DE ENTRADA NO SE REFRESCA.
+            #
+            # `ts` es el nacimiento de la decision y NUNCA se mueve (correcto:
+            # es la clave del dedup y el ancla del horizonte — el resolutor
+            # busca la vela de salida en `ts*1000 + horizon_bars*step_ms`).
+            # Pero este UPDATE refrescaba `fill_price` en cada poll posterior:
+            # la fila quedaba con la ENTRADA del ultimo poll y la SALIDA
+            # anclada en `ts`. Como los polls van cada ~12s y la ventana dura
+            # hasta ~5 min, el retorno medido cubria solo la parte FINAL del
+            # horizonte: la fila decia un horizonte y medía otro mas corto.
+            #
+            # El sesgo NO es ruido. Si la regla predice algo, el movimiento
+            # empieza al disparar; mover la entrada hacia adelante recorta
+            # justo el trozo que la regla predijo, asi que ATENUA el edge
+            # medido de forma sistematica. Es la clase de error que hace que
+            # una regla con edge real parezca no tenerlo — y sobre esta tabla
+            # se midieron y se pusieron en cuarentena las reglas 6 y 7.
+            #
+            # Y era INVISIBLE al auditor: `exit_close_ms` se graba bien
+            # (anclado en ts), asi que el horizonte realizado que se reporta
+            # parece correcto. El truncamiento esta en la ENTRADA, y la
+            # entrada no se audita.
+            #
+            # Se congelan por tanto los campos de EJECUCION — el precio al que
+            # la decision se habria ejecutado y la calidad de ese fill (venue,
+            # spread, basis) — porque describen el instante `ts`. Se sigue
+            # refrescando el ESTADO (reglas, venues_live, score, candidate),
+            # que es lo que el docstring pide y lo unico que no lleva su propio
+            # origen temporal: quien lo lee quiere la lectura mas fresca.
             db.execute(
                 """UPDATE verdicts SET
                        direction=?, venues_live=?, rules_met=?, rules_unevaluable=?,
-                       score=?, fill_price=?, ref_venue=?, fill_spread_bps=?,
-                       cross_basis_bps=?, price_basis_ok=?, candidate=?
+                       score=?, candidate=?
                      WHERE id=?""",
                 (int(direction), int(venues_live),
                  json.dumps(list(rules_met)), json.dumps(list(rules_unevaluable)),
-                 int(score), fill_price, ref_venue, fill_spread_bps,
-                 cross_basis_bps, 1 if price_basis_ok else 0, cand, rid),
+                 int(score), cand, rid),
             )
             db.commit()
             return rid, False

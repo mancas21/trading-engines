@@ -9,7 +9,7 @@
     {
       "id": 2,
       "title": "CVD Extremes = Exhaustion",
-      "description": "A CVD spike >2x prior ATH in one bar is EXHAUSTION, not continuation. Same for crashes >2x max 1-bar decline. Flag as exhaustion; do NOT call continuation.",
+      "description": "ALL: un pico de CVD de UNA barra (delta por barra, NUNCA la serie acumulada de la sesion) >= conditions.spike_multiple (1.5) x el maximo de las conditions.min_prior_bars (3) barras previas es EXHAUSTION, no continuacion. Simetrico para las caidas contra el minimo previo. Flag as exhaustion; do NOT call continuation. NOTE 2026-10-15: esta descripcion decia '>2x prior ATH' mientras conditions{} evalua 1.5x desde el changelog 3.4.1 (2026-10-07). Ahora cita los valores que el motor aplica (verdict.py, bloque Regla 2: compara bar_deltas, no high_cvd/low_cvd).",
       "enforcement": "hard",
       "conditions": {
         "spike_multiple": 1.5,
@@ -95,8 +95,11 @@
     {
       "id": 8,
       "title": "Audit On Loss",
-      "description": "After a call that fails (price moves >1% against within 2 bars), record loss with root cause in audit.log.json at START of next analysis.",
-      "enforcement": "hard"
+      "description": "After a call that fails (price moves against by more than conditions.loss_pct within 2 bars), record loss with root cause at START of next analysis. El fichero es reader/audit_losses.jsonl (una linea JSON por perdida, append; ver verdict.py _audit_record_loss). NOTE 2026-10-15: decia 'audit.log.json', que es el fichero de un subsistema /calls ya BORRADO — verdict.py corrigio la ruta el 2026-10-07 y la declara ahora aqui.",
+      "enforcement": "hard",
+      "conditions": {
+        "loss_pct": 0.01
+      }
     }
   ],
   "scoring_weights": {

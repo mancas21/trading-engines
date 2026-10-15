@@ -19,6 +19,7 @@ as regressions so they cannot recur:
 
 Run:  quant-alert-engine/venv/Scripts/python.exe -m pytest scanner-engine/tests/test_recorder.py -v
 """
+import json
 import pathlib
 import sys
 import time
@@ -247,3 +248,79 @@ def test_resolution_skips_rows_with_no_data(tmp_path):
                            venues_live=4, rules_met=["1"], rules_unevaluable=[])
     assert R.resolve(db, ids=[rid], return_by_pair={}) == 0
     assert db.execute("SELECT resolved FROM verdicts WHERE id=?", (rid,)).fetchone()[0] == 0
+
+
+# ── BUG 4: el ancla de entrada no puede moverse tras la decision ───────────
+#
+# Medido 2026-10-15. El horizonte y la vela de salida se anclan en `ts`, que es
+# el nacimiento de la decision y nunca se mueve (el resolutor busca la salida en
+# `ts*1000 + horizon_bars*step_ms`). Pero el upsert refrescaba `fill_price` en
+# CADA poll posterior, asi que la fila quedaba con la ENTRADA del ultimo poll y
+# la SALIDA anclada en `ts`: medía solo la parte final del horizonte.
+#
+# El sesgo no es ruido. Si la regla predice algo, el movimiento empieza al
+# disparar; mover la entrada hacia adelante recorta justo el trozo predicho y
+# ATENUA el edge medido de forma sistematica — la clase de error que hace que
+# una regla con edge real parezca no tenerlo. Y sobre esta tabla se midieron y
+# se pusieron en cuarentena las reglas 6 y 7.
+#
+# Era invisible al auditor ademas: `exit_close_ms` se graba bien (anclado en
+# ts), asi que el horizonte realizado reportado parece correcto; el
+# truncamiento estaba en la entrada, que no se audita.
+
+def test_later_poll_in_the_same_window_cannot_move_the_entry_price(tmp_path):
+    db = R.open_db(_tmp_db(tmp_path))
+    ts0 = time.time()
+    win = int(ts0 * 1000) + 300_000            # misma ventana de salida
+    rid, created = R.upsert_verdict(
+        db, pair="ETH/USD", ts=ts0, direction=1, horizon_bars=5,
+        exit_window_ms=win, fill_price=100.0, venues_live=4,
+        rules_met=["2"], rules_unevaluable=[], score=1,
+        ref_venue="binance", fill_spread_bps=2.0, cross_basis_bps=0.5,
+        price_basis_ok=True, candidate=True)
+    assert created is True
+
+    # ~4 minutos despues, en la MISMA ventana: el precio ya se movio y las
+    # reglas cambiaron.
+    rid2, created2 = R.upsert_verdict(
+        db, pair="ETH/USD", ts=ts0 + 240, direction=1, horizon_bars=5,
+        exit_window_ms=win, fill_price=103.0, venues_live=4,
+        rules_met=["2", "3"], rules_unevaluable=[], score=3,
+        ref_venue="okx", fill_spread_bps=9.0, cross_basis_bps=4.0,
+        price_basis_ok=False, candidate=True)
+    assert created2 is False and rid2 == rid
+
+    row = db.execute(
+        "SELECT ts, fill_price, ref_venue, fill_spread_bps, cross_basis_bps,"
+        " price_basis_ok, score, rules_met FROM verdicts WHERE id=?", (rid,)
+    ).fetchone()
+    assert row[0] == ts0, "el ts de la decision no puede moverse"
+    assert row[1] == 100.0, (
+        "la ENTRADA se refresco al ultimo poll: la fila mide solo la parte "
+        "final del horizonte y el edge medido sale atenuado")
+    assert row[2] == "binance" and row[3] == 2.0 and row[4] == 0.5, (
+        "venue/spread/basis describen el fill del instante de la decision: "
+        "emparejarlos con otra lectura es incoherente")
+    assert row[5], (
+        "price_basis_ok tambien pertenece al instante de entrada: debe "
+        "conservar el valor de la decision (True), no heredar el False "
+        "posterior")
+    assert row[6] == 3, "el ESTADO si debe refrescarse (lectura mas fresca)"
+    assert json.loads(row[7]) == ["2", "3"]
+
+
+def test_a_new_window_still_writes_a_fresh_entry_price(tmp_path):
+    """El congelado es POR VENTANA. Una ventana nueva es una decision nueva y
+    tiene que entrar con SU precio; si no, esto no seria un ledger."""
+    db = R.open_db(_tmp_db(tmp_path))
+    ts0 = time.time()
+    R.upsert_verdict(db, pair="ETH/USD", ts=ts0, direction=1, horizon_bars=5,
+                     exit_window_ms=int(ts0 * 1000) + 300_000, fill_price=100.0,
+                     venues_live=4, rules_met=["2"], rules_unevaluable=[])
+    rid2, created2 = R.upsert_verdict(
+        db, pair="ETH/USD", ts=ts0 + 600, direction=1, horizon_bars=5,
+        exit_window_ms=int(ts0 * 1000) + 600_000, fill_price=105.0,
+        venues_live=4, rules_met=["2"], rules_unevaluable=[])
+    assert created2 is True
+    assert db.execute("SELECT fill_price FROM verdicts WHERE id=?",
+                      (rid2,)).fetchone()[0] == 105.0

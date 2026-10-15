@@ -23,8 +23,31 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $lock = Join-Path $here "data\scanner.lock"
 
 function Get-ScannerProcs {
+    # 2026-10-15 — BUG ARREGLADO: el filtro era `CommandLine -match
+    # 'scanner-engine'`, y el HIJO no lleva esa palabra por ningun lado: se
+    # lanza con ruta RELATIVA y cwd=scanner-engine, asi que su CommandLine es
+    #     python.exe scanner.py --interval 12
+    # Medido en vivo:
+    #   PID 29304 supervisor.py -> SI casaba (su CommandLine lleva la ruta
+    #                              completa de scanner-engine\supervisor.py)
+    #   PID 29296 scanner.py    -> NO casaba (y es EL ESCRITOR de la base)
+    # Dos consecuencias, las dos reales:
+    #   1. El orden "children first" era un no-op: la lista solo tenia un
+    #      proceso, y siempre el supervisor.
+    #   2. La verificacion final era CIEGA justo al fallo que este script
+    #      existe para prevenir. Su propio docstring lo dice: "killing only the
+    #      supervisor left an orphan scanner writing to the database". Si el
+    #      hijo queda huerfano, este filtro no lo ve, el script canta
+    #      "stopped; lock cleared" y el scanner sigue escribiendo en la base.
+    # Se casa ademas por NOMBRE DE SCRIPT, que es lo unico que el hijo lleva
+    # encima. El patron es de argumento completo para no barrer nada mas: el
+    # unico otro scanner.py del arbol es un fichero de libreria dentro del venv
+    # de QAE, que nunca se ejecuta como `python scanner.py`.
     Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match 'scanner-engine' }
+        Where-Object {
+            $_.CommandLine -match 'scanner-engine' -or
+            $_.CommandLine -match '(^|[\s"])scanner\.py([\s"]|$)'
+        }
 }
 
 $procs = Get-ScannerProcs
