@@ -101,3 +101,4 @@ reader/_diag_rule8.py
 # el .json), pero ninguna ruta de produccion los carga: verdict.py ya no
 # llama a scorecard() y la carga de _CAL es codigo muerto.
 reader/scorecard_calibration.json
+reader/tv_structure_cache.json
