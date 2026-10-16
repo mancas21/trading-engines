@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Skill-format live read: assembles every section of the quant-crypto-analysis format from the
-current live stack (bridge :8000 + QAE :8081 + Binance klines). Read-only."""
+current live stack (bridge :8000 + Binance klines). Read-only."""
 import json
 import math
 import os
@@ -124,7 +124,7 @@ def corr_stats(closes_by_sym, n_ret=200):
 
 now = time.time()
 out = {"ts": now, "iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "multi_tf": {}, "flow": {},
-       "walls": {}, "tape": None, "quant": {}, "rules": {}, "risk": {}, "health": {}}
+       "walls": {}, "tape": None, "rules": {}, "risk": {}, "health": {}}
 
 # ---------------- services
 # ---------------- data: one pull, read from disk (raw/live_snapshot.json) so the bridge is
@@ -133,16 +133,22 @@ SNAP = json.load(open(os.path.join(HERE, "raw", "live_snapshot.json"), encoding=
 BR = SNAP["bridge"]
 h1 = BR["health"]
 hd = BR["health/detailed"]
-ctx = {s: (BR["context"].get(s) or {}) for s in SYMS}
 dom = BR["dom"]
 tcvd = BR["taker-cvd"]
 der = BR["derivatives"]
-quant = BR["quant"]
 ind = BR["indicators"]
 atr_cvd = BR["cvd"]
-st = BR["calls/stats"]
 blk = BR["blackout/status"]
-qae = SNAP["qae"]["health"]
+
+# El simbolo PRIMARIO es el que tiene ATAS en el grafico y NO tiene por que estar en
+# la cesta de 9. MEDIDO 2026-10-16: con ATAS en JUP/USDT (instrumento elegido,
+# atas_target match=True) `D["multi_tf"][tk]` lanzaba KeyError y la tarjeta no llegaba
+# a imprimirse; solo funcionaba mientras el grafico estuviera en un simbolo de la
+# cesta (en HEAD: SUIUSDT). Se le anaden sus bloques (multi_tf/flow/walls) al lado de
+# los 9; la cesta sigue siendo los 9 para la correlacion y el ranking.
+PRIMARY = (ind.get("ticker") or "").upper() if isinstance(ind, dict) else ""
+SYMS_ALL = SYMS + ([PRIMARY] if PRIMARY and PRIMARY not in SYMS else [])
+ctx = {s: (BR["context"].get(s) or {}) for s in SYMS_ALL}
 out["snapshot_as_of"] = SNAP["pulled_at_iso"]
 
 # ---------------- degraded-feed report
@@ -167,32 +173,13 @@ for _s, _v in (BR.get("context") or {}).items():
     _r = _err(_v, f"bridge /context/{_s}")
     if _r:
         degraded.append(_r)
-for _ep, _v in (SNAP.get("qae") or {}).items():
-    if _err(_v):
-        # one consolidated line, added below if the process check says the engine is up
-        _qae_health_failed = True
-# A dead :8081 does NOT mean the engine is down. The health server is a diagnostic
-# thread; the engine keeps running (and keeps alerting) without it — on 2026-09-27 the
-# health thread had been failing since 17:37 with "Unable to configure formatter
-# 'default'" while the engine emitted TG alerts normally. Only claim the engine is down
-# if its LOG also says it stopped; otherwise say the health endpoint alone is down.
-_qae_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qae_status.txt")
-qae_proc = _qae_health_down = None
-_qae_health_failed = any(_err(v) for v in (SNAP.get("qae") or {}).values())
-try:
-    import subprocess as _sp
-    _proc_out = _sp.run(["powershell", "-NoProfile", "-Command",
-                         "(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*quant_alert*' -and $_.Name -like 'python*' } | Measure-Object).Count"],
-                        capture_output=True, text=True, timeout=25).stdout.strip()
-    qae_proc = int(_proc_out) if _proc_out.isdigit() else None   # NB: not `out` — that is the result dict
-except Exception as _e:  # noqa: BLE001
-    qae_proc = None
-if qae_proc and _qae_health_failed:
-    _qae_health_down = True
-    degraded.append("QAE engine IS running but :8081/health does not answer "
-                    "(health_server thread failed to bind — diagnostic endpoint only)")
-elif not qae_proc and _qae_health_failed:
-    degraded.append("QAE :8081 not answering and no engine process found — engine down")
+# 2026-10-16: aqui vivian dos entradas mas de "degraded", y ninguna de las dos era
+# una fuente. La del subsistema /calls (endpoint borrado en la Fase 6: 404 en cada
+# pull) y la del QAE (:8081, app cancelada que jamas fue dependencia de este
+# analisis). Con las dos dentro, el cartel "FEED DEGRADED" salia en TODAS las
+# lecturas con cero feeds caidos de verdad, y el skill prohibe expresamente
+# reportar el QAE como fuente ausente. Una lista de degradados que siempre trae
+# dos lineas fijas deja de significar "algo se ha roto".
 _kl_err = [s for s, d in (SNAP.get("binance") or {}).items()
            if isinstance(d, dict) and any(isinstance(k, dict) and "__error__" in k for k in d.values())]
 if _kl_err:
@@ -203,10 +190,6 @@ if isinstance(der, dict) and der and all((v or {}).get("openInterest") is None
 out["degraded"] = degraded
 
 out["health"] = {"bridge": (h1.get("status") or ("down" if isinstance(h1, dict) and "__error__" in h1 else None)),
-                 "qae": ("health-endpoint down (engine running)" if _qae_health_down
-                         else ("down" if isinstance(qae, dict) and "__error__" in qae else qae.get("status"))),
-                 "qae_processes": qae_proc,
-                 "uptime_qae_h": round((qae.get("uptime_seconds") or 0) / 3600, 2),
                  "atas_ticker": ind.get("ticker"),
                  # Age the ATAS sample AGAINST THE MOMENT IT WAS PULLED, not against `now`.
                  # Fix LAG-1 (2026-09-27): this used `now - timestamp`, where `now` is taken
@@ -219,13 +202,16 @@ out["health"] = {"bridge": (h1.get("status") or ("down" if isinstance(h1, dict) 
                  "live_indicators": hd["checks"]["live_indicators"],
                  "warnings": hd.get("warnings"), "blackout": blk.get("blackout"),
                  "next_event": (blk.get("next_event") or {}).get("name"),
-                 "seconds_to_next": round(blk.get("seconds_to_next") or 0),
-                 "ml_filter": (qae.get("checks", {}).get("ml_filter") or {})}
+                 "seconds_to_next": round(blk.get("seconds_to_next") or 0)}
 
 # ---------------- multi-TF structure + flow
 _closes15 = {}
-for s in SYMS:
+for s in SYMS_ALL:
     k15, k1h, k4h = klines(s, "15m"), klines(s, "1h"), klines(s, "4h")
+    if k15 is None or k1h is None or k4h is None:
+        # El primario puede no existir en Binance (o fallar su serie de red): se omite
+        # su bloque en vez de reventar la tarjeta entera con un TypeError/KeyError.
+        continue
     _closes15[s] = k15["c"]
     row = {}
     for name, k in (("15m", k15), ("1h", k1h), ("4h", k4h)):
@@ -319,14 +305,11 @@ if tk:
                        abs(ind.get("delta") or 0) / max(abs(x) for x in closed[-16:]), 2),
                    "dom_imbalance": (ind.get("dom") or {}).get("imbalance_pct")}
 
-# ---------------- quant engine alerts by TF
-q = {}
-for sym, blob in (quant or {}).items():
-    for al in (blob or {}).get("alerts", []):
-        q.setdefault(al.get("timeframe") or "?", []).append(
-            {"symbol": sym, "signal": al.get("signal_name"), "price": al.get("precio"),
-             "color": al.get("color"), "age_min": round((now - (al.get("ts") or now)) / 60, 1)})
-out["quant"] = q
+# ---------------- quant engine alerts: RETIRADO (2026-10-16)
+# Leia BR["quant"], el buffer que solo llena el QAE con POST /quant-alert. Con el
+# QAE cancelado el buffer no puede recibir nada: `out["quant"]` era {} en todas
+# las lecturas y la tarjeta imprimia "freshest alerts: none" como si fuera una
+# medida. Se retira la fuente; no se sustituye por nada.
 
 # ---------------- scorecard + rule verdict for the ATAS symbol
 try:
@@ -340,19 +323,18 @@ try:
     R7 = json.load(open(os.path.join(HERE, "results7.json"), encoding="utf-8"))
 except FileNotFoundError:
     pass
-out["track_record"] = {k: st.get(k) for k in ("n_traded", "wins", "losses", "winrate", "expectancy_r_net",
-                                              "expectancy_r_gross", "profit_factor_gross", "confidence",
-                                              "cancelled", "open", "cost_bps")}
-out["track_record"]["validated"] = {k: (st.get("validated") or {}).get(k)
-                                    for k in ("n", "winrate", "expectancy_r_net", "by_direction")}
+# track_record se retira con su fuente (2026-10-16): `st` salia de
+# BR["calls/stats"], endpoint de un subsistema borrado en la Fase 6. Publicaba 11
+# campos en None como si fueran un registro de operaciones resueltas, y no lo
+# consumia nadie.
 out["exit_variants"] = None if not R7 else R7["summary"]
-_pc1, _breadth = corr_stats(_closes15)
-out["risk"] = {"corr_pc1_pct": _pc1, "eff_breadth": _breadth, "qae_gates": {
-    k: (v.get("metrics") if isinstance(v, dict) else None)
-    for k, v in (qae.get("checks") or {}).items()}}
+# La correlacion es de la CESTA (los 9), no del primario: anadirle JUP cambiaria la
+# metrica sin que nadie lo haya pedido. corr_stats ya tolera que falte algun simbolo.
+_pc1, _breadth = corr_stats({s: c for s, c in _closes15.items() if s in SYMS})
+out["risk"] = {"corr_pc1_pct": _pc1, "eff_breadth": _breadth}
 
 json.dump(out, open(os.path.join(HERE, "live_read.json"), "w", encoding="utf-8"), indent=1)
 print(f"live_read.json written — {out['iso']}")
-print("services:", out["health"]["bridge"], "/", out["health"]["qae"],
+print("services:", out["health"]["bridge"],
       "| ATAS on", out["health"]["atas_ticker"], f"({out['health']['atas_age_s']}s)")
 print("blackout:", out["health"]["blackout"], "| next:", out["health"]["next_event"])

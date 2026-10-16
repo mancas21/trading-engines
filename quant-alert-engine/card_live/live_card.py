@@ -2,8 +2,7 @@
 """Live quant card — the short delivery format. SINGLE SOURCE OF TRUTH.
 
 This file is the ONLY implementation of the card. The chat analysis and the Telegram
-alert (card_alert.py -> quant_alert_engine.send_periodic_snapshot) both run THIS file, so
-the two channels cannot drift apart.
+alert (card_alert.py) both run THIS file, so the two channels cannot drift apart.
 
 One card, <= ~20 lines, primary symbol = whatever chart ATAS is on, then a basket read
 and engine status. Numbers come from live_read.json (single pull).
@@ -71,7 +70,10 @@ for s in SY:
 
 tk = D["health"]["atas_ticker"]
 m, f, w, t = D["multi_tf"][tk], D["flow"][tk], D["walls"][tk], D["tape"]
-b_ema, b_raw = sc[tk]["ema"], sc[tk]["raw"]
+# `sc` es la CESTA (9). Si el primario no esta en ella (ATAS en otro instrumento), su
+# sesgo se calcula con la misma formula en vez de reventar con KeyError — el bug que
+# dejaba la tarjeta muerta con el grafico en JUP/USDT. `raw` no se usa en ningun sitio.
+b_ema = sc[tk]["ema"] if tk in sc else bias(f["imb_ema"], m, f, w)
 sym_disp = tk.replace("USDT", "/USDT")
 
 _dg = list(D.get("degraded") or [])
@@ -178,11 +180,10 @@ thin = min(sc, key=lambda s: D["walls"][s]["ask_depth_usd"])
 print(f"        thinnest book: {thin.replace('USDT','')} ${D['walls'][thin]['bid_depth_usd']:,} bid / "
       f"${D['walls'][thin]['ask_depth_usd']:,} ask · {_corr_txt}")
 print(LINE)
-al = [(a["age_min"], tf, a["symbol"], a["signal"]) for tf, alist in (D["quant"] or {}).items()
-      for a in alist]
-al.sort()
-alerts = " · ".join(f"[{tf}] {s} {sig} {age:.0f}m" for age, tf, s, sig in al[:3]) or "none"
-print(f"ENGINE  bridge {D['health']['bridge']} · QAE {D['health']['qae']} · ATAS {tk} "
+# 2026-10-16: se retiro la linea "freshest alerts". Leia D["quant"], el buffer del
+# QAE, que con el QAE cancelado es {} para siempre — imprimia "none" en cada
+# lectura como si fuera una medida. Y la linea ENGINE ya no nombra el QAE: no es
+# una fuente de esta tarjeta (el skill prohibe reportarlo como fuente ausente).
+print(f"ENGINE  bridge {D['health']['bridge']} · ATAS {tk} "
       f"{D['health']['atas_age_s']}s old · blackout {D['health']['blackout']}")
-print(f"        freshest alerts: {alerts}")
 print(LINE)
