@@ -119,6 +119,21 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Silen
     }
   }
 Write-Log "Watchdog run started"
+
+# --- log rotation ------------------------------------------------------------
+# This task already runs every 2 minutes, so it is the clock for rotating the
+# logs that nothing else rotates: process redirections (">>" and
+# -RedirectStandardOutput) have no rotation code anywhere, so they only grow.
+# The rotator never truncates in place - it renames. While a writer holds the
+# handle it reports "in use" and moves on, which is the ONLY thing Windows
+# permits: measured with the writer alive, MOVE/CLEAR/TRUNCATE all fail and only
+# reading works. Silent when nothing is due, so it does not bloat this log.
+$rotator = Join-Path (Split-Path -Parent $scriptDir) "scripts\rotate_logs.ps1"
+if (Test-Path $rotator) {
+  $rot = & powershell -NoProfile -ExecutionPolicy Bypass -File $rotator 2>&1
+  if ($rot) { $rot | ForEach-Object { Write-Log "rotate: $_" } }
+}
+
 if (Test-Bridge) {
   if ((Get-FailCount) -ne 0) { Set-FailCount 0 }
   Write-Log "Watchdog run finished: healthy"

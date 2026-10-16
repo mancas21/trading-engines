@@ -12,39 +12,36 @@ and engine status. Numbers come from live_read.json (single pull).
 """
 import json
 import os
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 D = json.load(open(os.path.join(HERE, "live_read.json"), encoding="utf-8"))
 SY = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "SUIUSDT", "HYPEUSDT", "SPCXUSDT",
       "NVDAUSDT", "XAUUSDT"]
 LINE = "─" * 62
-BRIDGE_DIR = r"C:\Users\Lenovo\trading-engines\atas-bridge"
-MIN_SCORE = 20.0
+READER_DIR = r"C:\Users\Lenovo\trading-engines\reader"
 
 
-def real_scores():
-    """The ACTUAL generator scores, from orderflow_calls.score_cross_section().
+def gate_states():
+    """Las reglas 6 y 7 y el sesgo, LEIDOS de la puerta (reader/verdict.py).
 
-    The card used to print its own home-made composite here and call it |score| — that
-    number never gated anything. On live data it disagreed with the generator on
-    direction and magnitude (SUI: card +9.4 vs generator -18.8), so the TRIGGER line
-    was reporting the wrong thing. If the import fails we say so rather than invent a
-    substitute.
+    La puerta es la unica implementacion de las reglas: sus umbrales salen de
+    atas-bridge/rules.json y su condicion (c) es el consenso multi-venue
+    normalizado. Esta tarjeta los IMPRIME, no los recalcula. Devuelve
+    (veredicto, None), o (None, motivo) cuando la puerta no puede opinar; en ese
+    caso el llamante lo dice y NO inventa un sustituto, porque un calculo local
+    seria un veredicto distinto con la misma autoridad aparente.
     """
     try:
-        import sys
-        from collections import deque
-        if BRIDGE_DIR not in sys.path:
-            sys.path.insert(0, BRIDGE_DIR)
-        import orderflow_calls as ofc
-        hists = {s: deque(maxlen=ofc.HISTORY_MAXLEN) for s in SY}
-        atas = ofc.get("/indicators")
-        snaps = {s: sn for s in SY
-                 if (sn := ofc.collect(s, hists[s], atas, ofc.ATAS_MAX_AGE_S))}
-        scored = ofc.score_cross_section(snaps)
-        return {s: scored[s][0] for s in scored}, {s: snaps[s].get("atas_status") for s in scored}
+        if READER_DIR not in sys.path:
+            sys.path.insert(0, READER_DIR)
+        import verdict
+        v = verdict.build_verdict()
+        if v.get("bias") == "UNAVAILABLE":
+            return None, v.get("reason") or "la puerta no pudo construir veredicto"
+        return v, None
     except Exception as e:  # noqa: BLE001
-        return None, {"_err": f"{type(e).__name__}: {e}"}
+        return None, f"{type(e).__name__}: {e}"
 
 
 def clip(x):
@@ -114,41 +111,52 @@ if f["poc"] is None:
 else:
     print(f"        POC {f['poc']} = {_poc_txt} · VA {f['val']}–{f['vah']} "
           f"({f['va_loc']}){_depth}")
-r6a = t["cons_dn_closed"] >= 2
-r6b = len(t["sell_levels"]) >= 4
-r7a = t["cons_up_closed"] >= 2
-r7b = len(t["buy_levels"]) >= 3
-r6c_a, r7c_a = (t["dom_imbalance"] or 0) < 5, (t["dom_imbalance"] or 0) > 10
-r6c_b, r7c_b = f["imb_ema"] < 5, f["imb_ema"] > 10
-ok = lambda v: "ok" if v else "no"
-print(f"RULES   R6 [a {ok(r6a)} ({t['cons_dn_closed']}dn) · b {ok(r6b)} ({len(t['sell_levels'])} lvl) · "
-      f"c ATAS{ok(r6c_a)}/{t['dom_imbalance']:+.0f} BNB{ok(r6c_b)}/{f['imb_ema']:+.1f}] "
-      f"→ {'PASS' if r6a and r6b and r6c_b else 'FAIL'}")
-print(f"        R7 [a {ok(r7a)} ({t['cons_up_closed']}up) · b {ok(r7b)} ({len(t['buy_levels'])} lvl) · "
-      f"c ATAS{ok(r7c_a)} BNB{ok(r7c_b)}] → {'PASS' if r7a and r7b and r7c_b else 'FAIL'}"
-      f"{'   ← legs pass on ATAS DOM, BNB avg says no' if r7a and r7b and r7c_a and not r7c_b else ''}")
-print(f"        R1 {'ok' if max(t['cons_up_closed'], t['cons_dn_closed']) >= 2 else 'no'} · "
-      f"R2 exhaustion {t['rule2_multiple']}x (flag at 2x) · R3 no probability quoted · "
-      f"R10 deleted in v3.3 (no band gate)")
-# The trigger is the GENERATOR's composite (orderflow_calls.py monitor: |score| >=
-# min_score, default 20), z-scored across symbols. The card's own bias is a different
-# number with different weights and it gates nothing.
-GEN, ATAS_STATUS = real_scores()
-g = (GEN or {}).get(tk)
-if GEN is None:
-    print("TRIGGER generator score unavailable (orderflow_calls import failed) — "
-          f"card bias {b_ema} is NOT the trigger")
-elif g is None:
-    print(f"TRIGGER no generator snapshot for {tk}")
+# ── RULES: salida de la PUERTA, no una copia propia ─────────────────────────
+#
+# Esta tarjeta tenia su PROPIA implementacion de las reglas 6 y 7, con TRES
+# problemas, medidos en vivo el 2026-10-16:
+#   1. umbrales ESCRITOS A MANO (`cons_dn_closed>=2`, `sell_levels>=4`,
+#      `buy_levels>=3`) en vez de leerse de atas-bridge/rules.json;
+#   2. su PROPIA condicion (c): `imb_ema < 5 / > 10`, que es el imbalance
+#      ABSOLUTO del libro de Binance — justo el enfoque que la puerta ABANDONO
+#      tras medirlo (mide "que venue vive fuera de su banda", no acuerdo);
+#   3. un PASS/FAIL que ademas usaba SOLO la pata de Binance e ignoraba la de
+#      ATAS, pese a imprimirla.
+# Efecto medido ese dia: la tarjeta imprimia `R6 a ok (3dn)` mientras la puerta
+# decia `a_cvd_down_2plus=FAIL`, y su (c) daba `FAIL` contra `SPLIT` /
+# `UNEVALUABLE` de la puerta. Dos canales, dos veredictos sobre lo mismo.
+#
+# Ahora se IMPRIME el veredicto de la puerta. No se recalcula: si la puerta no
+# puede opinar se dice, y no se sustituye por un calculo local.
+GATE, _gate_err = gate_states()
+print("RULES   desde la PUERTA (reader/verdict.py) — no recalculadas aqui")
+if GATE is None:
+    print(f"        puerta no disponible: {_gate_err}")
+    print("        sin veredicto de reglas (no se sustituye por un calculo local)")
 else:
-    fires = abs(g) >= MIN_SCORE
-    print(f"TRIGGER {tk.replace('USDT','/USDT')} generator score {g:+.1f} vs min_score "
-          f"{MIN_SCORE:.0f} → {'FIRES' if fires else 'below trigger, no plan'}"
-          f"   (card bias {b_ema} is a separate, non-gating number)")
-_fires = GEN is not None and g is not None and abs(g) >= MIN_SCORE
-print(f"PLAN    " + ("NO TRADE — generator score below the trigger (v3.3: score ranks, never gates a band)"
-                            if not _fires
-                            else ("watch long" if g > 0 else "watch short") + " — R6/R7 above must confirm"))
+    for _tag, _key in (("R6", "rule6"), ("R7", "rule7")):
+        _r = GATE[_key]
+        _conds = " · ".join(f"{k}={v}" for k, v in _r["conditions"].items())
+        print(f"        {_tag} {'MET' if _r['met'] else 'no'}   {_conds}")
+    _r2 = GATE.get("rule2") or {}
+    _r2txt = _r2.get("note", "sin nota") if _r2.get("applicable") else "no aplicable"
+    _enf = GATE["rule6"].get("enforcement", "?")
+    _counts = "" if GATE["rule6"].get("counts_toward_bias", True) else " (no cuenta para el sesgo)"
+    _age = GATE.get("src_age_s")
+    _agetxt = f" · datos del gate {_age:.0f}s" if isinstance(_age, (int, float)) else ""
+    print(f"        sesgo de la puerta {GATE['bias']} · R2 {_r2txt} · R6={_enf}{_counts}{_agetxt}")
+# El generador de scores (orderflow_calls.score_cross_section) YA NO EXISTE: se
+# borro en d9b5d15 ("limpieza de la ruta perdedora"), asi que la linea TRIGGER
+# solo podia fallar. Y fallaba MINTIENDO sobre el motivo: imprimia "generator
+# score below the trigger", que sugiere que el score existe y esta bajo, cuando
+# lo cierto es que el modulo no esta. El plan se lee del sesgo de la PUERTA,
+# que es lo unico que decide algo en esta tarjeta.
+if GATE is None:
+    print("PLAN    sin plan — la puerta no puede evaluar las reglas")
+else:
+    print("PLAN    " + {"BULLISH": "watch long — R7 MET",
+                       "BEARISH": "watch short — R6 MET"}
+          .get(GATE["bias"], "NO TRADE — las reglas no disparan"))
 print(f"        setup invalidation needs 2 closed 15m bars, not a wick (R1) · "
       f"flip level {w['ask'][0]} up / {w['bid'][0]} down")
 _vol_txt = f"{f['rng4h_vs_em']}x" if f['rng4h_vs_em'] is not None else "n/a"

@@ -1,5 +1,5 @@
 @echo off
-REM qae_supervisor.bat — thin launcher for qae_supervisor.py.
+REM qae_supervisor.bat - thin launcher for qae_supervisor.py.
 REM
 REM Kept as a .bat (and with this filename) so the existing launch chain keeps
 REM working unchanged: launch_qae.vbs ejecuta cmd /c qae_supervisor.bat.

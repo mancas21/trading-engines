@@ -1,7 +1,7 @@
 @echo off
 REM scanner-engine launcher
 REM
-REM 2026-10-11 — DESACOPLADO de quant-alert-engine. Antes este script usaba
+REM 2026-10-11 - DESACOPLADO de quant-alert-engine. Antes este script usaba
 REM   %ROOT%\quant-alert-engine\venv\Scripts\python.exe, lo que ataba este motor
 REM   al de QAE: borrar QAE mataba el scanner. Verificado que no hace falta:
 REM   las unicas dependencias no-stdlib del scanner son certifi, opcional, con

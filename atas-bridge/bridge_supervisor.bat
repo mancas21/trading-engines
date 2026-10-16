@@ -52,6 +52,10 @@ set "FAST_WINDOW=180"
 set /a SPAWNS=0
 set /a FAST=0
 :loop
+REM Rotacion de logs en el UNICO punto donde el handle esta probado cerrado:
+REM aqui el hijo anterior ya murio y cmd ya solto la redireccion. Medido: con el
+REM hijo vivo renombrar y truncar fallan, y aqui el renombrado funciona.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\scripts\rotate_logs.ps1" >> bridge_supervisor.log 2>&1
 set /a SPAWNS+=1
 echo [%date% %time%] === Starting bridge (spawn %SPAWNS%) === >> bridge_supervisor.log
 REM Cuando arranco ESTE intento, para poder medir cuanto duro.

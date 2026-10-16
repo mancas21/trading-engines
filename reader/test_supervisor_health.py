@@ -77,13 +77,19 @@ def _fake_runner(monkeypatch, recorder_rc, recorder_out, resolve_rc=0,
     """Sustituye subprocess: devuelve los rc programados y registra llamadas."""
     calls = []
 
+    # El notificador se llama con --once Y --digest (c139605): --once conserva el
+    # aviso inmediato por cambio de sesgo, --digest anade el resumen ejecutivo de
+    # 15 min aunque el sesgo no cambie. El stub exige LAS DOS, para que quitar
+    # --digest (o volver a no enviar nada) ponga esto rojo otra vez.
+    NOTIFY_ARGS = (["--once", "--digest"], ["--once", "--digest", "--dry-run"])
+
     def run(script, args, timeout):
         calls.append(list(args))
         if args == ["record"]:
             return recorder_rc, recorder_out
         if args == ["resolve"]:
             return resolve_rc, "  resolved 3/4"
-        if args == ["--once"]:
+        if args in NOTIFY_ARGS:
             return notify_rc, "  notified"
         raise AssertionError(f"llamada inesperada: {args}")
 
@@ -143,7 +149,9 @@ def test_recorded_cycle_runs_notify(monkeypatch):
     ok, _ = RS.cycle()
     assert ok is True
     assert ["resolve"] in calls
-    assert ["--once"] in calls
+    assert ["--once", "--digest"] in calls, (
+        "el notificador perdio --digest: el resumen ejecutivo de 15 min dejaria "
+        "de enviarse y nada lo avisaria (es justo el defecto que arreglo c139605)")
 
 
 def test_recorder_crash_is_a_crash(monkeypatch):

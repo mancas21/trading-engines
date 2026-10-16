@@ -1,5 +1,5 @@
 @echo off
-REM reader_supervisor.bat — supervisor del grabador + notificador (reader redesigned).
+REM reader_supervisor.bat - supervisor del grabador + notificador (reader redesigned).
 REM
 REM Modelo copiado de bridge_supervisor.bat / qae_supervisor.bat, con la
 REM correccion aplicada tras el incidente de los "Already running": el supervisor
@@ -16,6 +16,11 @@ title READER Supervisor (grabador + notificador)
 cd /d "%~dp0"
 
 set "PYTHON=C:\Users\Lenovo\AppData\Local\Programs\Python\Python312\python.exe"
+
+REM Rotacion antes de abrir el log: en este punto la ejecucion anterior termino y
+REM su redireccion esta cerrada, que es la unica situacion en la que Windows deja
+REM renombrar el fichero. Con el escritor vivo, renombrar y truncar fallan.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\scripts\rotate_logs.ps1" >> "%~dp0supervisor_launch.log" 2>&1
 
 echo [%date% %time%] Reader supervisor started >> "%~dp0supervisor_launch.log"
 "%PYTHON%" "%~dp0reader_supervisor.py" --loop --interval 30 >> "%~dp0supervisor_stdout.log" 2>> "%~dp0supervisor_stderr.log"
