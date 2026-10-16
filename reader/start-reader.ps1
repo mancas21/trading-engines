@@ -9,6 +9,24 @@
 $ErrorActionPreference = 'SilentlyContinue'
 $root = 'C:\Users\Lenovo\trading-engines\reader'
 
+# 2026-10-16 — NO MATARSE A SI MISMO (misma clase de bug ya arreglada en
+# start-bridge.ps1 y bridge_watchdog.ps1). El filtro '*reader_supervisor*' casa
+# con CUALQUIER proceso cuya linea de comandos mencione el nombre, incluida la
+# shell de diagnostico que invoca este script. MEDIDO HOY (16-oct ~18:01): mato
+# a la shell llamante antes de arrancar nada. Se excluyen el propio proceso y
+# toda su cadena de ancestros.
+$ancestors = @{}
+$p = $PID
+for ($i = 0; $i -lt 10 -and $p -gt 0; $i++) {
+  try {
+    $p = (Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction Stop).ParentProcessId
+    if ($p -gt 0) { $ancestors[[int]$p] = $true }
+  } catch { break }
+}
+function Test-IsSelf([int]$id) {
+  return ($id -eq $PID -or $ancestors.ContainsKey($id))
+}
+
 # Solo procesos PYTHON del supervisor. El filtro ancho '*reader_supervisor*'
 # tambien casa con el cmd.exe que ejecuta reader_supervisor.bat, y contar ese
 # era justo lo que permitia declarar "arrancado" sin que hubiera nada.
@@ -20,9 +38,9 @@ function Get-ReaderSupervisorPids {
 
 # 1) Primero los procesos del supervisor, o los hijos que tiene ya colgando.
 $supers = @(Get-CimInstance Win32_Process |
-            Where-Object { $_.CommandLine -like '*reader_supervisor*' })
+            Where-Object { $_.CommandLine -like '*reader_supervisor*' -and
+                           -not (Test-IsSelf ([int]$_.ProcessId)) })
 foreach ($p in $supers) {
-  if ($p.ProcessId -eq $PID) { continue }
   Stop-Process -Id $p.ProcessId -Force
   Write-Host "  parado supervisor (PID $($p.ProcessId))" -ForegroundColor Yellow
 }
@@ -30,10 +48,10 @@ if ($supers.Count -eq 0) { Write-Host "  no habia supervisor corriendo" -Foregro
 
 # 2) Luego los hijos (grabador / notificador) que puedan quedar vivos.
 $kids = @(Get-CimInstance Win32_Process |
-          Where-Object { $_.CommandLine -like '*verdict_recorder*' -or
-                         $_.CommandLine -like '*verdict_notify*' })
+          Where-Object { ($_.CommandLine -like '*verdict_recorder*' -or
+                          $_.CommandLine -like '*verdict_notify*') -and
+                         -not (Test-IsSelf ([int]$_.ProcessId)) })
 foreach ($p in $kids) {
-  if ($p.ProcessId -eq $PID) { continue }
   Stop-Process -Id $p.ProcessId -Force
   Write-Host "  parado hijo (PID $($p.ProcessId))" -ForegroundColor Yellow
 }
