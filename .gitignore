@@ -41,6 +41,7 @@ card_live/raw/
 quant-alert-engine/INFO
 *.err
 .watchdog_failcount
+.engines_watchdog_*_fails
 
 # Secrets — NEVER commit live .env files (ship .env.example instead)
 .env

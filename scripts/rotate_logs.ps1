@@ -61,7 +61,8 @@ $Logs = @(
   @{ Name = 'tradingview-bridge\bot_stdout.log';        CapMB = 2;  Keep = 2 },
   @{ Name = 'tradingview-bridge\bot_stderr.log';        CapMB = 2;  Keep = 2 },
   @{ Name = 'tradingview-bridge\bot_supervisor.log';    CapMB = 1;  Keep = 2 },
-  @{ Name = 'tradingview-bridge\monitor.log';           CapMB = 1;  Keep = 2 }
+  @{ Name = 'tradingview-bridge\monitor.log';           CapMB = 1;  Keep = 2 },
+  @{ Name = 'scripts\engines_watchdog.log';             CapMB = 1;  Keep = 2 }
 )
 
 # Is the file held open by another process? A probe, not a guess: we ask for
