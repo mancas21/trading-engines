@@ -12,15 +12,28 @@ DST=/home/ubuntu/vps-reader-backup
 DAY=$(date -u +%F)
 mkdir -p "$DST"
 
-# SQLite en caliente: `sqlite3 .backup` es consistente aunque haya escritura
-# concurrente. Un `cp` de un .db vivo puede capturar una escritura a medias.
+# Copia EN CALIENTE y consistente. Este VPS NO tiene el CLI de sqlite3, y un
+# `cp` de un .db vivo puede capturar una pagina a medias y dejar un fichero
+# corrupto que no se descubre hasta que hay que restaurarlo — lo peor que puede
+# hacer un backup, porque falla en silencio. Se usa la MISMA API de backup
+# online que expone el CLI (`.backup`), desde el modulo sqlite3 de python3 (que
+# esta garantizado), y se comprueba con quick_check.
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-if command -v sqlite3 >/dev/null 2>&1; then
-  sqlite3 "$SRC/reader/reader.db" ".backup '$TMP/reader.db'"
-else
-  cp "$SRC/reader/reader.db" "$TMP/reader.db"
-  echo "$(date -u +%FT%TZ) AVISO sqlite3 no esta: backup por cp (no consistente en caliente)" >> "$DST/backup.log"
+if ! python3 - "$SRC/reader/reader.db" "$TMP/reader.db" <<'PY'
+import sqlite3, sys
+src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+dst = sqlite3.connect(sys.argv[2])
+with dst:
+    src.backup(dst)
+res = dst.execute("PRAGMA quick_check").fetchone()[0]
+dst.close(); src.close()
+if res != "ok":
+    sys.exit(f"quick_check fallo: {res}")
+PY
+then
+  echo "$(date -u +%FT%TZ) ERROR copia consistente de reader.db" >> "$DST/backup.log"
+  exit 1
 fi
 
 # Lista explicita de lo que existe: tar con ficheros ausentes devuelve !=0 y

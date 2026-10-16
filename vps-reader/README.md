@@ -79,7 +79,7 @@ ni `dom_gate_state.json` (son estado, no binario).
 |---|---|---|
 | cada minuto | un ciclo: lee el scanner, evalúa (c), graba fila y línea de dashboard | `cycle.log` |
 | cada hora (:11) | watchdog externo: mtime de `cycle.log`, `/health` del scanner, disco, rotación | `watchdog.log`, `watchdog.heartbeat` |
-| diario (06:05) | backup con `sqlite3 .backup` + sha256, retención 90 días | `snap-YYYY-MM-DD.tar.gz` |
+| diario (06:05) | backup: copia online consistente (`sqlite3 .backup` vía python3) + `quick_check` + sha256, retención 90 días | `snap-YYYY-MM-DD.tar.gz` |
 
 ## Calibración — heredada del PC, y por qué es legítimo
 
