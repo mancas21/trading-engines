@@ -126,9 +126,10 @@ _BAR_SEGMENT = 0          # segmentos consumidos; NUNCA decrece
 _last_bar_key = None      # clave emitida en la ultima lectura
 _last_tag = None          # etiqueta de la ultima vela
 _last_day = None          # dia (epoch//86400) de la ultima vela
+_last_symbol = None       # instrumento de la ultima lectura (cambio = reinicio)
 
 
-def bar_key(bar_time: str | None, wall_ts: float) -> tuple:
+def bar_key(bar_time: str | None, wall_ts: float, symbol: str | None = None) -> tuple:
     """Clave de barra estable: (dia, etiqueta_HHMMSS, segmento).
 
     - dia:        epoch//86400. Separa el mismo reloj de otro dia.
@@ -138,8 +139,18 @@ def bar_key(bar_time: str | None, wall_ts: float) -> tuple:
                   etiqueta y el mismo dia, que solo puede pasar tras un reload.
 
     Devuelve una tupla; el llamante la serializa como texto para la columna.
+
+    2026-10-16 — EL CAMBIO DE INSTRUMENTO ES UN REINICIO. La clave no llevaba el
+    instrumento y el cambio de grafica (XRP -> JUP) reuso la MISMA clave
+    '20740|21:30:00|0' en 30 filas de DOS simbolos: las ultimas 25 de XRP y las
+    5 primeras de JUP. En la serie de precios del ledger ese punto se lee como
+    un salto de x4,17 (1,3328 -> 0,3198): un artefacto de identidad, no un
+    movimiento. Con la grafica en el mismo reloj (misma etiqueta, mismo dia) el
+    contador no avanzaba porque no habia retroceso de etiqueta. Ahora el
+    instrumento entra en la decision: si cambia, la serie de ATAS reinicio y
+    toca segmento nuevo.
     """
-    global _BAR_SEGMENT, _last_bar_key, _last_tag, _last_day
+    global _BAR_SEGMENT, _last_bar_key, _last_tag, _last_day, _last_symbol
 
     tag = (bar_time or "").strip() or "?"
     day = int(wall_ts) // 86400
@@ -154,6 +165,8 @@ def bar_key(bar_time: str | None, wall_ts: float) -> tuple:
             retrocede = True              # rollover de dia: el reloj de ATAS
         elif tag < _last_tag:             # retrocede a una vela anterior
             retrocede = True
+    if symbol is not None and _last_symbol is not None and symbol != _last_symbol:
+        retrocede = True                  # cambio de instrumento = serie nueva
 
     if retrocede:
         _BAR_SEGMENT += 1
@@ -163,6 +176,8 @@ def bar_key(bar_time: str | None, wall_ts: float) -> tuple:
     key = (day, tag, _BAR_SEGMENT)
     _last_tag = tag
     _last_day = day
+    if symbol is not None:
+        _last_symbol = symbol
     _last_bar_key = key
     return key
 
@@ -174,6 +189,41 @@ def bar_key_str(key: tuple) -> str:
     un separador de dos puntos haria la clave ambigua al partirla.
     """
     return "|".join(str(x) for x in key)
+
+
+def _seed_bar_key_state(c) -> None:
+    """Continua la identidad de barra donde quedo el ledger.
+
+    2026-10-16 — el grabador corre como proceso CORTO (`record` por ciclo): sin
+    este seed, `_last_tag`/`_last_day`/`_last_symbol`/`_BAR_SEGMENT` renacian en
+    cada arranque y la comparacion "retrocede" no podia ver ni el rollover de
+    dia ni el cambio de instrumento. Leyendo la ultima fila antes de grabar, el
+    estado sobrevive al proceso: los segmentos ya no se repiten por reinicio.
+
+    Idempotente y de solo lectura: no toca la base.
+    """
+    global _BAR_SEGMENT, _last_bar_key, _last_tag, _last_day, _last_symbol
+    try:
+        row = c.execute("SELECT symbol, bar_key FROM verdicts "
+                        "WHERE bar_key IS NOT NULL ORDER BY id DESC LIMIT 1"
+                        ).fetchone()
+    except sqlite3.Error:
+        return
+    if not row:
+        return
+    sym, bk = row
+    parts = str(bk).split("|")
+    if len(parts) != 3:
+        return
+    try:
+        day, seg = int(parts[0]), int(parts[2])
+    except (TypeError, ValueError):
+        return
+    _last_day = day
+    _last_tag = parts[1]
+    _BAR_SEGMENT = seg
+    _last_symbol = sym
+    _last_bar_key = (day, parts[1], seg)
 
 
 def ema(vals):
@@ -345,11 +395,12 @@ def read_live():
     # Clave de barra estable. Se calcula ANTES del dict para que ts y key
     # provengan del mismo instante leido.
     _wall = time.time()
-    _bk = bar_key(i.get("time"), _wall)
+    _sym = str(i.get("ticker")).upper()
+    _bk = bar_key(i.get("time"), _wall, _sym)
 
     rec = {
         "ts": _wall,
-        "symbol": str(i.get("ticker")).upper(),
+        "symbol": _sym,
         "bar_index": i.get("bar_index"),
         "bar_time": i.get("time"),
         "bar_key": bar_key_str(_bk),
@@ -478,6 +529,7 @@ def db():
     c = sqlite3.connect(DB, timeout=20)
     c.executescript(SCHEMA)
     _migrate(c)
+    _seed_bar_key_state(c)
     c.commit()
     return c
 
