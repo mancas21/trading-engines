@@ -550,24 +550,34 @@ def condition_window_eval(symbol: str, states: dict, window_s: float,
 # Que reglas declara rules.json y cuales implementa REALMENTE este modulo.
 #
 # El JSON declara 8 (v3.4.1). Este modulo implementa 2, 6 y 7 como puertas
-# direccionales, 3 y 4 como limites de salida, y 8 como registro de perdidas (que se
+# direccionales, 3 como limite de salida, y 8 como registro de perdidas (que se
 # dispara desde verdict_recorder al resolver un veredicto, no aqui). La 5 es una
 # regla de CONDUCTA — "no anclar en patrones pasados" — que un programa no puede
 # comprobar; lo que si hace el sistema es no persistir el analisis anterior como
 # entrada, y eso ya ocurre porque cada veredicto se evalua solo con la lectura
 # actual.
 #
+# La 4 esta RETIRADA en rules.json (enforcement=disabled, 2026-10-13). Su
+# scorecard() sobrevive solo para reproducir la medicion que lo retiro (a93147f)
+# y NINGUNA ruta de produccion lo llama: declararla implementada era anunciar
+# una regla que ya no corre — que es justo lo que hizo `_IMPLEMENTED[4]` hasta
+# el 2026-10-16.
+#
 # La 1 no tiene codigo propio porque es la condicion (a) de las reglas 6 y 7.
 _IMPLEMENTED = {
     1: "condicion (a) de las reglas 6 y 7: exige 2+ barras consecutivas",
     2: "rule2_exhaustion() sobre los deltas por barra",
     3: "solo puede emitir 'unvalidated' (lineas probability)",
-    4: "scorecard() + SCORE_BANDS",
     6: "3 condiciones AND, umbrales de rules.json",
     7: "3 condiciones AND, umbrales de rules.json",
     8: "_audit_record_loss(), llamada desde verdict_recorder al resolver",
 }
 _NOT_IMPLEMENTED = {
+    4: ("scorecard() + SCORE_BANDS existen en el modulo pero NINGUNA ruta de "
+        "produccion los llama: retirados en a93147f tras medirse sin poder "
+        "predictivo (pearson +0.0175, spearman -0.0156 sobre 1.205 filas; "
+        "rules.json los marca disabled). Declararla implementada era anunciar "
+        "una regla retirada."),
     5: "regla de conducta: no comprobable por codigo",
 }
 
