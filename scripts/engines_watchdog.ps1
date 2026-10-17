@@ -25,7 +25,9 @@
 #   dead, unreadable, or its command line is NOT a scanner process (recycled
 #   pid, measured today), the lock is removed. Then start-scanner.ps1 (detached,
 #   idempotent) is run and the port is re-probed for up to ~48s.
-# - reader: checks that the supervisor process exists AND that
+# - reader: checks that reader_supervisor.lock names a live pid (Get-Process:
+#   no WMI on the healthy path - measured 2026-10-17, a saturated WMI service
+#   can stall a Win32_Process scan for minutes) AND that
 #   reader/supervisor_status.json has a cycle younger than 300s (measured
 #   cadence: one cycle every ~30s, and last_cycle is written on every cycle
 #   even when ATAS is closed - see reader_supervisor.py:287). Same lock
@@ -94,10 +96,19 @@ function Test-Scanner {
   } catch { return $false }
 }
 
+# Reader liveness WITHOUT WMI on the healthy path (measured 2026-10-17: a
+# Get-CimInstance Win32_Process scan sat ~5 minutes while a diagnostic loop
+# hammered WMI every 200 ms - the 2-minute cadence must not depend on WMI):
+# reader_supervisor.lock holds the supervisor pid (bare number, like
+# scanner.lock) and supervisor_status.json advances every ~30s cycle.
+# Dead pid => unhealthy at once; a recycled pid still fails the 300s freshness
+# check. The holder identity is only verified on the recovery path.
 function Test-Reader {
-  $sup = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-           Where-Object { $_.CommandLine -like '*reader_supervisor*' })
-  if ($sup.Count -eq 0) { return $false }
+  $lock = Join-Path $ReaderDir 'reader_supervisor.lock'
+  if (-not (Test-Path $lock)) { return $false }
+  $pidTxt = ((Get-Content $lock -Raw) -replace '[^0-9]', '')
+  if (-not $pidTxt) { return $false }
+  if (-not (Get-Process -Id $pidTxt -ErrorAction SilentlyContinue)) { return $false }
   $sf = Join-Path $ReaderDir 'supervisor_status.json'
   if (-not (Test-Path $sf)) { return $false }
   try { $j = Get-Content $sf -Raw | ConvertFrom-Json } catch { return $false }
@@ -116,7 +127,16 @@ function Clear-StaleLock([string]$LockPath, [string[]]$CmdPatterns) {
   $txt = Get-Content $LockPath -Raw
   $pidTxt = ($txt -replace '[^0-9]', '')
   if (-not $pidTxt) { Remove-Item $LockPath -Force; return $true }
-  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$pidTxt" -ErrorAction SilentlyContinue
+  # Bounded, and conservative on failure: if WMI cannot answer, the lock is
+  # left alone - an unverified holder is never displaced (two supervisors are
+  # worse than a stale lock). -OperationTimeoutSec exists because local CIM
+  # queries have NO timeout by default.
+  try {
+    $p = Get-CimInstance Win32_Process -Filter "ProcessId=$pidTxt" -OperationTimeoutSec 10 -ErrorAction Stop
+  } catch {
+    Write-Log "lock ${LockPath}: WMI did not answer for pid $pidTxt; left untouched"
+    return $false
+  }
   if ($p) {
     $cl = "$($p.CommandLine)"
     foreach ($pat in $CmdPatterns) { if ($cl -like $pat) { return $false } }
