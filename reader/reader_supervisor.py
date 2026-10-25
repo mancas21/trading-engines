@@ -46,6 +46,12 @@ PYTHON = r"C:\Users\Lenovo\AppData\Local\Programs\Python\Python312\python.exe"
 
 RECORDER = HERE / "verdict_recorder.py"
 NOTIFIER = HERE / "verdict_notify.py"
+# 2026-10-24 — brief de FASES multi-par. Sustituye al digest de 15 min (el
+# usuario pidio analisis de fase estilo trader, no plantilla de un simbolo).
+# Se auto-limita por tiempo en el propio script y comparte marcador
+# (phase_state.json) con el cron del agente, que manda la version redactada
+# por el modelo mientras la app esta abierta; este es el suelo siempre-activo.
+PHASE_NOTIFIER = HERE / "phase_brief.py"
 
 # Ritmo de cada hijo. El grabador cada 30s (la granularidad del footprint es de
 # barra, asi que mas fino no anade nada); el notificador cada 60s.
@@ -355,14 +361,10 @@ def cycle(dry_run: bool = False) -> tuple[bool, str]:
     # verdad; el anti-spam lo garantiza el CAMBIO DE SESGO del notificador, no
     # un dry-run aqui.
     if recorded and "recorded" in out_r:
-        # --digest ademas de --once: el aviso por CAMBIO DE SESGO sigue siendo
-        # inmediato, y el digest periodico (15 min) se envia aunque el sesgo no
-        # cambie. El modulo decide por tiempo; si no toca, sale sin enviar.
-        #
-        # 2026-10-15 — el digest NO depende de que el chat este abierto. Lo
-        # dispara este supervisor, que ya es un servicio (Reader.lnk en Inicio),
-        # no una sesion del agente.
-        nargs = ["--once", "--digest"] + (["--dry-run"] if dry_run else [])
+        # 2026-10-24 — el digest de 15 min se RETIRA: el usuario pidió que a
+        # Telegram llegue el brief de fases (phase_brief.py) en su lugar.
+        # El aviso por CAMBIO DE SESGO sigue inmediato; sin --digest.
+        nargs = ["--once"] + (["--dry-run"] if dry_run else [])
         rc_n, out_n = run_child(NOTIFIER, nargs, timeout=150)
         st["notify_rc"] = rc_n
         st["notify_mode"] = "dry-run" if dry_run else "send"
@@ -373,6 +375,14 @@ def cycle(dry_run: bool = False) -> tuple[bool, str]:
         st["notify_rc"] = None
         st["notify_mode"] = None
         st["notify_tail"] = "sin veredicto nuevo: no se evalua notificacion"
+
+    # Brief de fases multi-par (2026-10-24). Fuera de la puerta `recorded`:
+    # barre scanner + Binance, no depende del veredicto ATAS. El script se
+    # auto-limita por tiempo y respeta el marcador del cron del agente.
+    pargs = ["--once"] + (["--dry-run"] if dry_run else [])
+    rc_p, out_p = run_child(PHASE_NOTIFIER, pargs, timeout=180)
+    st["phase_rc"] = rc_p
+    st["phase_tail"] = out_p.strip().splitlines()[-1] if out_p.strip() else ""
 
     # Sin dato seguido: SE VE, pero no es un crash del proceso, asi que no
     # consume el presupuesto de reintentos. Matar el servicio porque ATAS este

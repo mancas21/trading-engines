@@ -129,6 +129,18 @@ nunca existió.
 - La regla 4 queda medida y **sin edge**. Si se quiere seguir, hay que buscar
   OTRA regla, no pulir esta.
 
+### Corrección 2026-10-11 (post-auditoría): ese veredicto ya no es medible por el código actual
+
+El n=662 de arriba quedó fuera de la población auditable por la exclusión de
+`price_basis_ok` (5,560 filas legacy con fill venue no recuperable) y, encima,
+la auditoría encontró que la selección de barra de salida medía en los pares
+de 5m un horizonte real de 0–300s (media ~150s), nunca los 300s declarados.
+Ambos defectos están corregidos (`outcomes.select_exit_bar`, semántica ceil;
+`exit_close_ms` grabado por fila; `MEASUREMENT_VERSION = 3`; backfill --all
+recomputó 6,034 filas: horizonte realizado mínimo 300s en los 8 pares). La
+regla 4 vuelve a ser hipótesis: el auditor v3 la reporta `insufficient`
+(n=50, n_eff=23.6) hasta que la base v3 llegue a n_eff >= 50.
+
 ---
 
 ## 3. Nada de esto sobrevive un borrado — el repo está sucio
@@ -230,3 +242,76 @@ Sin dependencias: el scanner es stdlib puro, `python3` alcanza.
 4. Decidir si se despliega el scanner a la VPS (§6) — requiere commit+push primero.
 5. **La regla 4 ya está respondida: SIN EDGE (§2).** No pulirla más. Si se quiere
    seguir, hay que medir OTRA regla contra este mismo banco de pruebas.
+
+---
+
+## 7. Post-auditoría 2026-10-11 (tarde): el plan de quitar/añadir, ejecutado
+
+La auditoría completa del repo midió las tres reglas del scanner en la era v3:
+todas DROP (bruto ≈ 0, neto −9.6/−11.3/−11.8 bps, t −5.6/−9.5/−12.5). El margen
+está en eficiencia de evidencia y costos, no en más reglas. Ejecutado:
+
+**QUITAR:**
+- Reglas 1 y 2 RETIRADAS con su medida escrita (`DROP refuted n=... t=...` en
+  rules.json, vía `promotion.py --retire` — el camino de bajada que faltaba).
+  Siguen disparando como observación; ya no producen candidatos ni consumen
+  celdas Bonferroni. La regla 4 queda como única hipótesis direccional viva.
+- `bias_score` de signal_engine ELIMINADO (pesos v3.4.1 medidos anti-predictivos,
+  spread −4.0). El bridge queda en estado + chequeos de reglas; scoring solo en
+  verdict.py.
+- Celdas PER LOCAL HOUR fuera del audit (hora local sobre días de muestra =
+  ruido que diluía el Bonferroni de las celdas reales).
+- quant-alert-engine CONGELADO (ARCHIVED.md); 37 one-off de atas-bridge a
+  `_archive/` (quedó `_shared_read.py`, único con import vivo).
+
+**AÑADIR:**
+- **Ledger de puntos de decisión (v4)**: una fila por (par, ventana de salida)
+  vía `recorder.upsert_verdict` con clave `exit_window_ms` + índice único
+  parcial. Medido en vivo: 3 filas/75s frente a ~250 del esquema anterior
+  (~80x menos inflación); n_eff debe converger a n. La regla de retracción
+  v3→v4 ya disparó una vez y quedó baselinada.
+- **Auditor ATAS** (`reader/audit_atas.py`): reglas 6/7 sobre reader.db con la
+  misma vara (neto-de-costo 12bps, n_eff, Bonferroni sobre 2 celdas). Primera
+  medición: r6 n=159 pero n_eff=2.7 (autocorr +0.97 — el reader graba cada 30s
+  y la regla persiste); r7 n=3. INSUFFICIENT honesto. Nota para el futuro: el
+  reader necesita su propio ledger de puntos de decisión (dedup por ventana),
+  mismo patrón que el scanner.
+- **Entrega del cron a Telegram**: `audit_tick.py` entrega al chat de
+  `atas-bridge/.env` (los mismos candidatos que verdict_notify; override con
+  AUDIT_TG_CHAT_ID) y ejecuta el tick ATAS en la misma tarea. Mensaje de prueba
+  entregado y verificado.
+
+**Fase 3 (cuando el ledger v4 acumule ~48h):** regla 4 con ejecución maker vía
+`quant_engine/fills.py` (bruto +2bps contra taker 12bps es la única vía operable:
+por el costo, no puliendo features); meta-labeling con `ml_train.py` sobre el
+ledger eficiente; condicionamiento de régimen (cross_basis_bps ya se graba) como
+diagnóstico, nunca gates.
+
+
+## 8. Gate del DOM re-hecho (Fix 2-A de docs/FIXES-gate-DOM.md, noche 2026-10-11)
+
+La condición (c) de AT-6/AT-7 ya no es la EMA del libro Binance (32 cambios de
+estado/día): es consenso multi-venue del scanner — N venues con libro top-5
+cargado del lado, sostenido P lecturas (`verdict.dom_vac_eval`, thr 0.25
+calibrado con muestra viva, barra de aceptación N=10 transiciones/día
+pre-registrada en rules.json). El touch se descartó como base: 0 consensos en
+480 ciclos. El grabador del reader, que duplicaba la puerta con umbrales
+divergentes, ahora usa la MISMA función. signal_engine ya no evalúa AT-6/AT-7.
+Namespace de reglas en ambos JSON + informes citando fichero. 232 tests.
+Mañana: medir N contra la barra.
+
+## 9. Telegram: brief de fases en lugar del digest (2026-10-24)
+
+El usuario pidió que a Telegram llegue el análisis de FASE de todos los pares
+del scanner (rango/pullback/trend/reversal, tono de trader) y no el digest
+templado de 15 min. Tres piezas: (1) `reader/phase_brief.py` — suelo
+siempre-activo bajo el supervisor: clasificación mecánica (posición rango 24h
++ mínimos/máximos crecientes 1h + corrida) de los 10 pares, envía cada 1 h;
+(2) cron del agente (ZCode, mientras la app está abierta) — versión redactada
+por el modelo en la anatomía validada; ambos comparten marcador
+`reader/phase_state.json` para no duplicar envíos; (3) el supervisor deja de
+llamar `--digest` (el aviso por CAMBIO DE SESGO sigue inmediato). Lección
+medida: paths de fapi son `/fapi/v1/...` — `/api/v1/` sobre fapi.binance.com
+da 404 silencioso; y las ráfagas de ~20 llamadas seguidas se banean ~1 min
+(pacing 0.4 s + retry en `_get`). El brief es estructura, no señal: el sesgo
+sigue siendo exclusivamente verdict.py (Reglas 6/7).
