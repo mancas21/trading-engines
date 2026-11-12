@@ -353,3 +353,20 @@ beneficio de la latencia, se vuelve a apretar con datos. No fue
 curve-fitting: la v1 demostró ser estructuralmente tarde para el propósito
 de la capa (alerta temprana), con simulación documentada antes del cambio.
 Primer disparo real de producción: LONG 1000PEPE @ 0.0045155, 2026-11-12.
+
+### 10.2 — Backtest del criterio y retune v3 (2026-11-12)
+
+Event study sobre los históricos de backtest-system (11 pares, klines 1h/15m
++ funding histórico, coste oficial 11bps RT), n=1,842 banderas v2. Veredicto:
+la capa completa NO tiene edge medio (hit neto 47%, mediana r24 -0.18%); las
+banderas SHORT no lo tienen en ninguna celda; el debate v1-vs-v2 (8h vs 2h)
+fue inmaterial para el resultado. El único cell verde: LONG con funding
+profundo — gradiente monótono 45.5% (1.5-3x) -> 48.0% (3-10x) -> 56.2% con
+mediana r24 +1.0% y MFE p75 +11.2% en >10x (n=32, muestra corta).
+Retune v3 aplicado: LONG-only con funding <= -0.001 (10x baseline), SHORT
+desactivado. Las banderas serán raras (~5-6/año) — ese es el objetivo.
+PEPE (1.7x) no dispara bajo v3: su evento vive en la celda sin edge medido.
+Motor del estudio: scripts temporales sobre data/ de backtest-system
+(solo lectura + fetch de funding/klines que faltaban vía API), CSV de
+banderas en Temp. La capa sigue midiendo en vivo: watch_flags.jsonl +
+--measure/--report siguen siendo el árbitro de si v3 vive o muere.

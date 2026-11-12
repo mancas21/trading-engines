@@ -15,19 +15,29 @@ Una bandera AMARILLA de "PREPARARSE": nunca es sesgo, nunca es señal, nunca
 entra al gate. El sesgo sigue saliendo exclusivamente de verdict.py (Reglas
 6/7). Máximo UNA bandera por par y lado cada 24h.
 
-CRITERIOS PRE-REGISTRADOS v2 (2026-11-12, revisión de la misma noche)
-=======================================================================
-  A. funding_extreme : |lastFundingRate| >= 0.00015 (1.5x el baseline 0.01%)
-                       el SIGNO define el lado (negativo -> LONG, positivo -> SHORT)
-  B. stabilized      : sin nuevo extremo de 24h en las últimas 2h, medido en
-                       barras de 15m (LONG: min(low15[-8:]) > min(low15[-104:-8]))
-                       v1 medía esto en 1h (8h de latencia mínima): simulado
-                       sobre el propio PEPE, disparaba a +5.4% del low — tarde
-                       estructural. 15m corta la latencia 4x (2.2h, +0.9%).
-                       El riesgo cuchillo que esto añade lo cuantifica MAE.
-  C. first_higher_low: swing fractal en 1h (3 barras por lado) — el último
-                       swing low es mayor que el anterior (LONG; SHORT espejo).
-Flag = A y B y C, en el mismo lado.
+CRITERIOS PRE-REGISTRADOS v3 (2026-11-12 — retune por backtest, PLAN §10.2)
+============================================================================
+BACKTEST (event study, 11 pares, 1h+15m+funding históricos, coste 11bps RT,
+n=1,842 banderas v2): la capa COMPLETA no tiene edge medio (hit neto 47%,
+mediana r24 negativa) y las banderas SHORT no lo tienen en ninguna celda.
+El edge vive SOLO en LONG con funding profundo — gradiente monótono:
+  LONG funding 1.5-3x  (n=418): hit 45.5%, med r24 -0.41%  -> ruido
+  LONG funding 3-10x   (n=123): hit 48.0%, med r24 -0.15%  -> ruido
+  LONG funding >10x    (n=32):  hit 56.2%, med r24 +1.0%, MFE p75 +11.2%
+v1 vs v2 (8h vs 2h de estabilización): idénticos (46.8 vs 47.0) — el debate
+de la ventana B fue inmaterial para el resultado; se conserva v2 (menor
+latencia, misma calidad).
+
+  A. funding_extreme : LONG-only, lastFundingRate <= -0.001 (10x baseline
+                       0.01%). Las banderas SHORT quedan DESACTIVADAS
+                       (sin edge medido en ninguna profundidad).
+  B. stabilized      : 15m — 2h sin nuevo extremo de 24h (igual v2)
+  C. first_higher_low: swing fractal 1h 3+3, último low > anterior (igual)
+Flag = A y B y C. Con el umbral a 10x, la bandera será RARA (~5-6/año en el
+universo de 12 pares) — que es exactamente el punto: menos ruido, más
+significado. PEPE (funding -0.017% = 1.7x) NO habría disparado bajo v3: su
+evento vive en la celda sin edge medido — la disciplina manda sobre la
+anécdota.
 
 DISCIPLINA DE MEDICIÓN (lo que separa esto del motor de ruido viejo)
 ====================================================================
@@ -66,7 +76,8 @@ FLAGS = HERE / "watch_flags.jsonl"
 CHECK_EVERY_S = 300.0          # el supervisor llama cada 30s; el script se
                                # auto-limita a un chequeo real cada 5 min
 FLAG_COOLDOWN_S = 86400.0      # una bandera por par y lado cada 24h
-FUNDING_EXTREME = 0.00015      # 1.5x baseline de 0.01%/intervalo
+FUNDING_EXTREME = 0.001        # v3: 10x baseline 0.01% — celda con edge medido
+ENABLE_SHORT_FLAGS = False     # v3: sin edge medido en ninguna profundidad
 SCAN = "http://127.0.0.1:8090"
 FAPI = "https://fapi.binance.com"
 
@@ -127,9 +138,11 @@ def evaluate_pair(name: str) -> dict | None:
     if not p:
         return None
     fr = float(p.get("lastFundingRate") or 0.0)
-    if abs(fr) < FUNDING_EXTREME:
+    # v3: solo LONG con funding profundo (<= -10x baseline); SHORT sin edge
+    # medido -> desactivados.
+    if fr > -FUNDING_EXTREME:
         return None
-    side = "LONG" if fr < 0 else "SHORT"
+    side = "LONG"
     # B en 15m (latencia 4x menor que la v1 en 1h): 2h sin nuevo extremo
     # contra un telón de 24h.
     k15 = _get(f"{FAPI}/fapi/v1/klines?symbol={sym}&interval=15m&limit=120")
