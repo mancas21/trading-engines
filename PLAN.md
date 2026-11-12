@@ -339,3 +339,17 @@ mínimo del desplome estaba dentro de la ventana de 8h); si la medición dice
 que nunca dispara, se ajusta con datos. Corre bajo el supervisor del reader
 (ciclo de 30s, auto-throttle 5 min) y el brief horario de fases incluye las
 banderas activas en una línea.
+
+### 10.1 — Revisión v2 del criterio B (misma noche, a petición del usuario)
+
+El usuario cuestionó las 8 barras de 1h (8h de latencia mínima). Simulación
+sobre el propio PEPE: v1 (8h sobre 1h) no había disparado aún 7h tras el low
+con el precio a +5.4%; 6h sobre 1h disparaba a +5.4%; 4h a +2.6%; y B medido
+en 15m (2h sin nuevo extremo vs telón de 24h) disparaba a 2.2h y +0.9%.
+Cambio: B pasa a medirse en 15m (ventana 8×15m=2h, telón 104×15m); C se
+queda en 1h (la estructura necesita marco grande). Riesgo cuchillo añadido
+lo cuantifica MAE en la medición — si la mediana de MAE es peor que el
+beneficio de la latencia, se vuelve a apretar con datos. No fue
+curve-fitting: la v1 demostró ser estructuralmente tarde para el propósito
+de la capa (alerta temprana), con simulación documentada antes del cambio.
+Primer disparo real de producción: LONG 1000PEPE @ 0.0045155, 2026-11-12.

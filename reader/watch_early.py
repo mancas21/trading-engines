@@ -15,14 +15,18 @@ Una bandera AMARILLA de "PREPARARSE": nunca es sesgo, nunca es señal, nunca
 entra al gate. El sesgo sigue saliendo exclusivamente de verdict.py (Reglas
 6/7). Máximo UNA bandera por par y lado cada 24h.
 
-CRITERIOS PRE-REGISTRADOS (los tres, duros y contables)
-=======================================================
+CRITERIOS PRE-REGISTRADOS v2 (2026-11-12, revisión de la misma noche)
+=======================================================================
   A. funding_extreme : |lastFundingRate| >= 0.00015 (1.5x el baseline 0.01%)
                        el SIGNO define el lado (negativo -> LONG, positivo -> SHORT)
-  B. stabilized      : sin nuevo extremo de 56 barras en las últimas 8 barras 1h
-                       (LONG: min(low[-8:]) > min(low[-64:-8]); SHORT espejo)
-  C. first_higher_low: el último swing low fractal (3 barras por lado) es mayor
-                       que el anterior (LONG); SHORT: último swing high menor
+  B. stabilized      : sin nuevo extremo de 24h en las últimas 2h, medido en
+                       barras de 15m (LONG: min(low15[-8:]) > min(low15[-104:-8]))
+                       v1 medía esto en 1h (8h de latencia mínima): simulado
+                       sobre el propio PEPE, disparaba a +5.4% del low — tarde
+                       estructural. 15m corta la latencia 4x (2.2h, +0.9%).
+                       El riesgo cuchillo que esto añade lo cuantifica MAE.
+  C. first_higher_low: swing fractal en 1h (3 barras por lado) — el último
+                       swing low es mayor que el anterior (LONG; SHORT espejo).
 Flag = A y B y C, en el mismo lado.
 
 DISCIPLINA DE MEDICIÓN (lo que separa esto del motor de ruido viejo)
@@ -45,12 +49,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# veredicto_notify vive en este dir; con python -I el script dir no entra al
+# path, así que lo garantizamos aquí (inocuo en ejecución normal).
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
 STATE = HERE / "watch_state.json"
 FLAGS = HERE / "watch_flags.jsonl"
 
@@ -121,6 +130,15 @@ def evaluate_pair(name: str) -> dict | None:
     if abs(fr) < FUNDING_EXTREME:
         return None
     side = "LONG" if fr < 0 else "SHORT"
+    # B en 15m (latencia 4x menor que la v1 en 1h): 2h sin nuevo extremo
+    # contra un telón de 24h.
+    k15 = _get(f"{FAPI}/fapi/v1/klines?symbol={sym}&interval=15m&limit=120")
+    time.sleep(0.2)
+    if not k15 or len(k15) < 104:
+        return None
+    l15 = [float(b[3]) for b in k15]
+    h15 = [float(b[2]) for b in k15]
+    # C en 1h: la estructura (swings) necesita el marco grande.
     k = _get(f"{FAPI}/fapi/v1/klines?symbol={sym}&interval=1h&limit=64")
     time.sleep(0.2)
     if not k or len(k) < 64:
@@ -129,14 +147,13 @@ def evaluate_pair(name: str) -> dict | None:
     l = [float(b[3]) for b in k]
     c = [float(b[4]) for b in k]
     price = c[-1]
-    # B: estabilización — sin nuevo extremo de 56 barras en las últimas 8
     if side == "LONG":
-        stabilized = min(l[-8:]) > min(l[-64:-8])
+        stabilized = min(l15[-8:]) > min(l15[-104:-8])
         ph, pl = swing_extremes(h, l)
         higher = len(pl) >= 2 and pl[-1] > pl[-2]
         ref = (pl[-1], pl[-2]) if len(pl) >= 2 else (None, None)
     else:
-        stabilized = max(h[-8:]) < max(h[-64:-8])
+        stabilized = max(h15[-8:]) < max(h15[-104:-8])
         ph, pl = swing_extremes(h, l)
         higher = len(ph) >= 2 and ph[-1] < ph[-2]
         ref = (ph[-1], ph[-2]) if len(ph) >= 2 else (None, None)
@@ -166,7 +183,7 @@ def compose(f: dict) -> str:
     rl = ("mínimos crecientes" if f["side"] == "LONG" else "máximos decrecientes")
     return (f"🟡 VIGILANCIA TEMPRANA — {f['side']} {f['pair']} @ {f['price']:g}\n\n"
             f"Los {'cortos' if f['side']=='LONG' else 'largos'} están apiñados "
-            f"pagando {sgn} de funding, el precio lleva 8h sin hacer "
+            f"pagando {sgn} de funding, el precio lleva 2h sin hacer "
             f"{'nuevos mínimos' if f['side']=='LONG' else 'nuevos máximos'} y "
             f"acaba de marcar {rl} ({now:g} vs {prev:g} previo). "
             f"Es la receta de {'squeeze' if f['side']=='LONG' else 'distribución'} "
