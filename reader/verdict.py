@@ -29,6 +29,9 @@ atas-bridge/rules.json v3.3, no de memoria):
   ESTE FICHERO NO TIENE NUMEROS FIJOS. Los lee todos de atas-bridge/rules.json
   al importar el modulo, y avisa por stdout si no puede leerlos. Si un numero de
   rules.json no aparece aqui, es porque no se usa.
+  El bias puede ser UNAVAILABLE ademas de NEUTRAL: dato ATAS viejo (>300s) o
+  rules.json ilegible/corrupto (T1 2026-11-12 — fail-closed: sin umbrales
+  ninguna puerta direccional puede abrirse).
   Regla 4 — Score, Don't Predict. Scorecard 0-100; >=60 alcista, <=40 bajista.
 
 LA ASIMETRÍA ES INTENCIONAL: regla 6 pide 4 niveles, regla 7 pide 3. Un footprint
@@ -52,6 +55,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -406,17 +410,17 @@ def dom_vac_eval(symbol: str, observe: bool = True) -> dict:
     sides = (("buy", RULE7), ("sell", RULE6))   # 7 = acumulación (lado bid)
     if tb is None:                              # 6 = distribución (lado ask)
         _dom_gate_tick(symbol, False, False, observe=observe)
-        return {"buy": {"state": "UNEVALUABLE",
+        return {"buy": {"state": "UNEVALUABLE", "reason": "no_data",
                         "detail": "scanner multi-venue no disponible"},
-                "sell": {"state": "UNEVALUABLE",
+                "sell": {"state": "UNEVALUABLE", "reason": "no_data",
                          "detail": "scanner multi-venue no disponible"},
                 "venues": 0}
     need = max(RULE6["vac_venues"], RULE7["vac_venues"])
     if len(tb) < need:
         _dom_gate_tick(symbol, False, False, observe=observe)
         det = (f"solo {len(tb)} venue(s) vivo(s); el consenso pide {need}")
-        return {"buy": {"state": "UNEVALUABLE", "detail": det},
-                "sell": {"state": "UNEVALUABLE", "detail": det},
+        return {"buy": {"state": "UNEVALUABLE", "reason": "no_data", "detail": det},
+                "sell": {"state": "UNEVALUABLE", "reason": "no_data", "detail": det},
                 "venues": len(tb)}
 
     # ── Normalización por venue contra su propia distribución ──
@@ -434,10 +438,13 @@ def dom_vac_eval(symbol: str, observe: bool = True) -> dict:
                + (f" (venues sin calibrar: {', '.join(sorted(uncalibrated))})"
                   if uncalibrated else "")
                + "; regenerar con build_dom_vac_calibration.py")
-        return {"buy": {"state": "UNEVALUABLE", "detail": det},
-                "sell": {"state": "UNEVALUABLE", "detail": det},
+        return {"buy": {"state": "UNEVALUABLE", "reason": "no_data", "detail": det},
+                "sell": {"state": "UNEVALUABLE", "reason": "no_data", "detail": det},
                 "venues": len(tb)}
 
+    # T4 (auditoria 2026-11-12): zthr es COMPARTIDO por diseño (max de las dos
+    # reglas). rules.json declara un z_min por regla pero el motor aplica el
+    # max — documentado aqui porque antes solo coincidian por casualidad.
     zthr = max(RULE6["vac_z"], RULE7["vac_z"])
     counts = {s: sum(1 for zv in _vac_z(tb, cal_venues).values()
                      if (zv >= zthr if s == "buy" else zv <= -zthr))
@@ -488,15 +495,18 @@ def dom_vac_eval(symbol: str, observe: bool = True) -> dict:
         # diseño: un gate que no sabe qué hace el libro no debe disparar.
         if parted:
             out[side] = {"state": _SPLIT,
+                         "reason": "split",
                          "detail": (f"mercado PARTIDO: {counts[side]} venue(s) a favor "
                                     f"y {counts[other]} en contra (z>={zthr:g}); "
                                     f"el consenso no es interpretable")}
         elif count < R["vac_venues"]:
             out[side] = {"state": "FAIL",
+                         "reason": "few_venues",
                          "detail": (f"{count} venues del lado {side} con z>={zthr:g} "
                                     f"(piden {R['vac_venues']})")}
         elif streak < R["vac_polls"]:
             out[side] = {"state": "UNEVALUABLE",
+                         "reason": "short_streak",
                          "detail": f"consenso {side} en racha {streak} de {R['vac_polls']} lecturas"}
         else:
             out[side] = {"state": "MET",
@@ -575,7 +585,10 @@ def condition_window_eval(symbol: str, states: dict, window_s: float,
             pass                                    # degrada, no truena
     out = dict(states)
     for i, k in enumerate(_COND_KEYS):
-        if out.get(k) in (_UNEVALUABLE, "MET"):
+        # T4 (auditoria 2026-11-12): SPLIT tambien esta exento — un mercado
+        # PARTIDO ahora no puede elevarse a MET por un MET de hace <60s.
+        # "SPLIT no abre la puerta" pasa a ser cierto literalmente.
+        if out.get(k) in (_UNEVALUABLE, "MET", "SPLIT"):
             continue
         if any(len(h) > i + 1 and h[i + 1] == "MET" for h in hist):
             out[k] = "MET"
@@ -1059,6 +1072,26 @@ def _scorecard_v341(rows, imbalance, ema, tape_buy_pct, volume_ratio, sell_h, bu
     return sum(parts.values()), parts, notes
 
 
+def _provenance() -> dict:
+    """T6 (auditoria 2026-11-12): versionado reproducible — todo veredicto
+    declara que umbrales y que codigo lo produjeron."""
+    out = {"rules_hash": None, "git_sha": None}
+    try:
+        out["rules_hash"] = hashlib.sha256(
+            (HERE.parent / "atas-bridge" / "rules.json").read_text(
+                encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        pass
+    try:
+        import subprocess as _sp
+        out["git_sha"] = _sp.run(["git", "rev-parse", "--short", "HEAD"],
+                                 capture_output=True, text=True, timeout=5,
+                                 cwd=str(HERE)).stdout.strip() or None
+    except Exception:
+        pass
+    return out
+
+
 def build_verdict() -> dict:
     """Un veredicto. Nunca lanza: una fuente caída produce un veredicto que la nombra."""
     now = time.time()
@@ -1074,6 +1107,7 @@ def build_verdict() -> dict:
         v["rule_coverage"] = _rule_coverage()
         v["rules_not_implemented"] = [r["id"] for r in v["rule_coverage"]
                                       if not r["implemented"]]
+        v.update(_provenance())
         return v
 
     ts = ind.get("timestamp")
@@ -1092,6 +1126,7 @@ def build_verdict() -> dict:
         v["rule_coverage"] = _rule_coverage()
         v["rules_not_implemented"] = [r["id"] for r in v["rule_coverage"]
                                       if not r["implemented"]]
+        v.update(_provenance())
         return v
 
     price = ind.get("price") or {}
@@ -1290,13 +1325,15 @@ def build_verdict() -> dict:
     }
 
     # ── El sesgo viene de la PUERTA ──
-    # Regla 6 en cuarentena desde 2026-10-11: enforcement "disabled" en
-    # rules.json por PRECAUCION, NO por anti-edge medido — su evidencia es
-    # n_eff=2,7 sobre 159 filas solapadas (autocorr +0,97), que es ruido, y es
-    # toda de la era del gate viejo. Ver el `disabled_reason` de rules.json.
-    # Se sigue EVALUANDO y se publica el detalle, pero no decide el sesgo: una
-    # senal con apariencia de analisis sin base cuesta mas que no dar ninguna.
-    # Volver a "hard" exige n_eff >= min_n sobre el gate multi-venue.
+    # T5 (auditoria 2026-11-12) — motivo unico de cuarentena de la Regla 6,
+    # idéntico en rules.json, comentario y nota publicada:
+    #   "Desactivada por falta de evidencia utilizable para el gate
+    #   multi-venue vigente. La evidencia disponible (161 disparos = 32
+    #   barras = 9 eventos, n_eff ≈ 1.8, t = +0.34) es del gate anterior y no
+    #   distingue la regla de la deriva del mercado. No es evidencia de
+    #   ausencia de edge."
+    # Volver a "hard" exige n_eff >= min_n sobre el gate MULTI-VENUE y superar
+    # el placebo en walk-forward out-of-sample.
     r6_enforcement = _rule_enforcement(6)
     # T1 (auditoria 2026-11-12): sin rules.json legible, NINGUNA puerta
     # direccional puede abrirse — bias UNAVAILABLE con motivo, nunca
@@ -1326,6 +1363,8 @@ def build_verdict() -> dict:
     #   spearman(score, forward_return) = -0.0156
     #   tercil alto ("mejor" score): winrate 32.8%, retorno medio -0.392%
     #   tercil bajo                : winrate 37.9%, retorno medio -0.382%
+    #   (T5: NO es "el mejor perdía MAS" — es NO DISTINGUIBLE del peor:
+    #    n ≈ 401 por tercil, z ≈ 1.5; retornos -0.392 vs -0.382, empate)
     #
     # No correlaciona con el retorno y el tercil alto perdia MAS que el bajo. El
     # componente de peso 50 (dom_ema = imbalance_pct_ema, el libro Binance que se
@@ -1341,6 +1380,7 @@ def build_verdict() -> dict:
     v["bias"] = bias
     v["unevaluable"] = unev
     v["probability"] = "unvalidated"
+    v.update(_provenance())
     # ── COBERTURA DE REGLAS, generada desde rules.json ────────────────────────
     # 2026-10-07. Antes havia 11 lineas de la forma
     #     v["ruleN_annotate"] = "..." + v.get("ruleN", {}).get("note", "no configurado")
