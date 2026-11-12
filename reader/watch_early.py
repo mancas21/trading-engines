@@ -39,6 +39,15 @@ significado. PEPE (funding -0.017% = 1.7x) NO habría disparado bajo v3: su
 evento vive en la celda sin edge medido — la disciplina manda sobre la
 anécdota.
 
+ESTADO: HIPOTESIS, NO EDGE (T7, auditoría 2026-11-12)
+=====================================================
+El 56.2% (n=32) del backtest NO es edge validado: depende de 2 regimenes
+(manía dic-20/ene-21 y FTX 2022-11-10), 11 episodios, p=0.21 por permutación,
+SIN meseta en el umbral (54.5/57.5/56.2/68.0/52.9 para 6x/8x/10x/12x/15x) y
+CERO banderas en 2024 y 2026. validated: false. La potencia para distinguir
+56% de 50% exige ~544 eventos independientes. Las banderas v3 se siguen
+grabando en vivo con su resultado — la medición en vivo es el árbitro.
+
 DISCIPLINA DE MEDICIÓN (lo que separa esto del motor de ruido viejo)
 ====================================================================
 Cada bandera se graba en watch_flags.jsonl con precio y funding al momento.

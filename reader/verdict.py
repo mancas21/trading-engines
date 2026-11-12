@@ -84,11 +84,42 @@ HERE = Path(__file__).resolve().parent
 # Con el dict plano no existe el error: o hay la clave o no la hay.
 # `_enforcement` lleva el prefijo para que no choque con ningun nombre de campo
 # de las condiciones.
-def _load_rule_conditions(rule_id: int) -> dict:
+# T1 (auditoria 2026-11-12): el default por fallo de lectura era "hard" —
+# FAIL-OPEN: con rules.json ausente/corrupto, la Regla 6 podia publicar
+# BEARISH sin umbrales. Ahora el default es "unavailable" (fail-closed) y la
+# puerta debe tratarlo como dato ausente, nunca como regla habilitada.
+_RULES_FAIL_CLOSED = {"_enforcement": "unavailable", "_title": "",
+                      "_present": False}
+# cache con invalidacion por mtime+size: sin re-leer el fichero en cada
+# veredicto, pero sin cachear tras un fallo de lectura.
+_RULES_CACHE = {"key": None, "raw": None}
+
+
+def _rules_raw():
+    rules_path = HERE.parent / "atas-bridge" / "rules.json"
+    try:
+        st = rules_path.stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError as _e:
+        print(f"[verdict] AVISO: rules.json ilegible: {_e}")
+        _RULES_CACHE["key"], _RULES_CACHE["raw"] = None, None
+        return None
+    if _RULES_CACHE["key"] == key and _RULES_CACHE["raw"] is not None:
+        return _RULES_CACHE["raw"]
     try:
         import json as _json
-        rules_path = HERE.parent / "atas-bridge" / "rules.json"
         raw = _json.loads(rules_path.read_text(encoding="utf-8"))
+    except Exception as _e:            # noqa: BLE001
+        print(f"[verdict] AVISO: rules.json corrupto: {_e}")
+        _RULES_CACHE["key"], _RULES_CACHE["raw"] = None, None
+        return None
+    _RULES_CACHE["key"], _RULES_CACHE["raw"] = key, raw
+    return raw
+
+
+def _load_rule_conditions(rule_id: int) -> dict:
+    raw = _rules_raw()
+    if raw is not None:
         for r in (raw.get("rules") or raw):
             if int(r.get("id", -1)) == rule_id:
                 out = dict(r.get("conditions") or {})
@@ -98,11 +129,10 @@ def _load_rule_conditions(rule_id: int) -> dict:
                 return out
         print(f"[verdict] AVISO: la regla {rule_id} NO existe en rules.json "
               f"(version {raw.get('version')}). Se usan umbrales por defecto.")
-    except Exception as _e:            # noqa: BLE001
-        print(f"[verdict] AVISO: no se pudo leer rules.json regla {rule_id}: {_e}")
-    # Sin fichero o sin esa regla: se marca _present=False para que el consumidor
-    # pueda distinguir "la regla dice que no" de "no hay regla que consultar".
-    return {"_enforcement": "hard", "_title": "", "_present": False}
+    # Sin fichero, corrupto o sin esa regla: _present=False y enforcement
+    # fail-closed (nunca "hard"). El consumidor distingue "la regla dice que
+    # no" de "no hay regla que consultar".
+    return dict(_RULES_FAIL_CLOSED)
 
 
 # Las condiciones son PLANAS: _R6["dom_vac_thr"], sin descender niveles.
@@ -309,6 +339,12 @@ def _dom_gate_tick(symbol: str, buy_met: bool, sell_met: bool,
     st = _dom_gate_load()
     rec = st.get(symbol) or {"buy": 0, "sell": 0}
     if not observe:
+        # T2 (auditoria 2026-11-12): la lectura aplica la MISMA caducidad que
+        # el tick. Antes devolvia la racha guardada sin mirar la edad: una
+        # racha vieja >= 2 + votos actuales podia dar MET sin persistencia real.
+        age = time.time() - float(rec.get("ts") or 0.0)
+        if age > _DOM_GATE_STALE_S:
+            return 0, 0
         return int(rec.get("buy", 0)), int(rec.get("sell", 0))
     now = time.time()
     ts = float(rec.get("ts") or 0.0)
@@ -1262,14 +1298,21 @@ def build_verdict() -> dict:
     # senal con apariencia de analisis sin base cuesta mas que no dar ninguna.
     # Volver a "hard" exige n_eff >= min_n sobre el gate multi-venue.
     r6_enforcement = _rule_enforcement(6)
-    if r7_met:
+    # T1 (auditoria 2026-11-12): sin rules.json legible, NINGUNA puerta
+    # direccional puede abrirse — bias UNAVAILABLE con motivo, nunca
+    # BULLISH/BEARISH con umbrales por defecto. BEARISH exige enforcement
+    # EXACTAMENTE "hard" (unavailable/unrecognized no deciden).
+    if not _R7.get("_present", False):
+        bias = "UNAVAILABLE"
+        unev = unev + ["rules.json_unavailable: umbrales de la Regla 7 ausentes"]
+    elif r7_met:
         bias = "BULLISH"
-    elif r6_met and r6_enforcement != "disabled":
+    elif r6_met and r6_enforcement == "hard":
         bias = "BEARISH"
     else:
         bias = "NEUTRAL"
     v["rule6"]["enforcement"] = r6_enforcement
-    v["rule6"]["counts_toward_bias"] = (r6_enforcement != "disabled")
+    v["rule6"]["counts_toward_bias"] = (r6_enforcement == "hard")
     if r6_met and r6_enforcement == "disabled":
         v["rule6"]["note"] = (
             "condiciones satisfechas pero la regla esta DESACTIVADA "
