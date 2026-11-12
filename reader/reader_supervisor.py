@@ -52,6 +52,12 @@ NOTIFIER = HERE / "verdict_notify.py"
 # (phase_state.json) con el cron del agente, que manda la version redactada
 # por el modelo mientras la app esta abierta; este es el suelo siempre-activo.
 PHASE_NOTIFIER = HERE / "phase_brief.py"
+# 2026-11-12 — capa de VIGILANCIA TEMPRANA: banderas AMARILLAS de
+# pre-posicionamiento (funding extremo + estabilización 8h + primer swing a
+# favor). Jamás señales ni sesgo; auto-throttle 5 min dentro del script;
+# cada bandera se graba en watch_flags.jsonl para medir hit-rate antes de
+# promover nada (misma disciplina que mató a las reglas 1/2/4 del scanner).
+WATCH_EARLY = HERE / "watch_early.py"
 
 # Ritmo de cada hijo. El grabador cada 30s (la granularidad del footprint es de
 # barra, asi que mas fino no anade nada); el notificador cada 60s.
@@ -383,6 +389,13 @@ def cycle(dry_run: bool = False) -> tuple[bool, str]:
     rc_p, out_p = run_child(PHASE_NOTIFIER, pargs, timeout=180)
     st["phase_rc"] = rc_p
     st["phase_tail"] = out_p.strip().splitlines()[-1] if out_p.strip() else ""
+
+    # Vigilancia temprana (2026-11-12): mismo patrón que el brief de fases.
+    # Fuera de la puerta `recorded`; el script decide por throttle y cooldown.
+    wargs = ["--once"] + (["--dry-run"] if dry_run else [])
+    rc_w, out_w = run_child(WATCH_EARLY, wargs, timeout=120)
+    st["watch_rc"] = rc_w
+    st["watch_tail"] = out_w.strip().splitlines()[-1] if out_w.strip() else ""
 
     # Sin dato seguido: SE VE, pero no es un crash del proceso, asi que no
     # consume el presupuesto de reintentos. Matar el servicio porque ATAS este

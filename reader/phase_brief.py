@@ -55,7 +55,7 @@ FAPI = "https://fapi.binance.com"
 PAIRS = {
     "BTC": "BTCUSDT", "ETH": "ETHUSDT", "HYPE": "HYPEUSDT", "SOL": "SOLUSDT",
     "XAU": "XAUUSDT", "XRP": "XRPUSDT", "JUP": "JUPUSDT", "NVDA": "NVDAUSDT",
-    "SPCX": "SPCXUSDT", "SUI": "SUIUSDT",
+    "SPCX": "SPCXUSDT", "SUI": "SUIUSDT", "ARB": "ARBUSDT",
 }
 
 
@@ -162,6 +162,17 @@ def compose(rows: list[dict]) -> str:
     elif live:
         con_lado = [f"{r['name']} {r['dir']}/{r['score']}" for r in live if r["dir"] != "neutral"]
         L.append("Scanner con lado: " + (", ".join(con_lado) if con_lado else "ninguno"))
+    # Banderas de vigilancia temprana activas (<24h) — una línea, si hay.
+    try:
+        wst = json.loads((HERE / "watch_state.json").read_text(encoding="utf-8"))
+        act = wst.get("active", [])
+        if act:
+            items = "; ".join(f"{a['side']} {a['pair']} @ {a['price']:g} "
+                              f"(funding {a['funding']*100:.3f}%)"
+                              for a in act[-3:])
+            L.append("Vigilancia temprana: " + items)
+    except Exception:
+        pass
     L.append("(estructura 24h en barras 1h; clasificacion mecanica, "
              "no sesgo de Reglas 6/7)")
     return "\n".join(L)

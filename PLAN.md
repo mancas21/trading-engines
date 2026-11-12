@@ -315,3 +315,27 @@ medida: paths de fapi son `/fapi/v1/...` — `/api/v1/` sobre fapi.binance.com
 da 404 silencioso; y las ráfagas de ~20 llamadas seguidas se banean ~1 min
 (pacing 0.4 s + retry en `_get`). El brief es estructura, no señal: el sesgo
 sigue siendo exclusivamente verdict.py (Reglas 6/7).
+
+## 10. Capa de VIGILANCIA TEMPRANA (2026-11-12) — banderas de pre-posicionamiento
+
+Petición del usuario tras PEPE: el gate formal (Reglas 6/7) es de confirmación
+y llega tarde siempre; el marcador que se vio temprano no era el precio sino
+el FUNDING en extremo con el precio estabilizando. `reader/watch_early.py`:
+bandera AMARILLA "PREPARARSE" cuando se cumplen TRES criterios
+pre-registrados, en el mismo lado que el signo del funding:
+
+- A. funding_extreme: |lastFundingRate| >= 0.00015 (1.5x baseline 0.01%)
+- B. stabilized: sin nuevo extremo de 56 barras 1h en las últimas 8 barras
+- C. first_higher_low (LONG) / first_lower_high (SHORT): swing fractal 3+3
+
+Máximo una bandera por par y lado cada 24h; envío inmediato a Telegram
+(reusa verdict_notify.send). JAMÁS es señal ni sesgo — el gate sigue siendo
+verdict.py. Disciplina anti-ruido: cada bandera se graba en
+`reader/watch_flags.jsonl` y `--measure` rellena r24h/r72h/mfe24h/mae24h;
+`--report` imprime hit-rate y medianas. La capa vive o muere por esa medición
+(mismo estándar que mató a las reglas 1/2/4 del scanner). Calibración
+honesta: NO se aflojó el criterio B para que PEPE disparara el día 1 (su
+mínimo del desplome estaba dentro de la ventana de 8h); si la medición dice
+que nunca dispara, se ajusta con datos. Corre bajo el supervisor del reader
+(ciclo de 30s, auto-throttle 5 min) y el brief horario de fases incluye las
+banderas activas en una línea.
