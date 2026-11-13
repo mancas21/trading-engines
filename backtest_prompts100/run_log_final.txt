@@ -1,0 +1,204 @@
+[  1] RSI mean reversion                 SOLUSDT   1h  cost=11bp net=   -87.1% dd= -89.3% pf= 0.68 n= 746 | OOS pf= 0.70 net=   -47.5% n= 247 
+[  1] RSI mean reversion                 SOLUSDT   1h  cost=22bp net=   -90.2% dd= -91.7% pf= 0.65 n= 746 | OOS pf= 0.65 net=   -53.3% n= 247 
+[  2] Bollinger + RSI                    BTCUSDT   15m cost=11bp net=  -100.0% dd=-100.0% pf= 0.54 n=5805 | OOS pf= 0.53 net=   -99.9% n=1743 
+[  2] Bollinger + RSI                    BTCUSDT   15m cost=22bp net=  -100.0% dd=-100.0% pf= 0.37 n=5805 | OOS pf= 0.33 net=  -100.0% n=1743 
+[  3] VWAP z-score                       ETHUSDT   5m  cost=11bp net=  -100.0% dd=-100.0% pf= 0.43 n=3719 | OOS pf= 0.44 net=   -99.4% n= 997 
+[  3] VWAP z-score                       ETHUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.31 n=3719 | OOS pf= 0.29 net=  -100.0% n= 997 
+[  4] Stochastic cross                   HYPEUSDT  1h  cost=11bp net=   -18.4% dd= -29.3% pf= 0.90 n= 379 | OOS pf= 0.93 net=    -4.6% n= 116 
+[  4] Stochastic cross                   HYPEUSDT  1h  cost=22bp net=   -30.0% dd= -38.8% pf= 0.82 n= 379 | OOS pf= 0.84 net=    -9.6% n= 116 
+[  5] Williams %R                        SUIUSDT   15m cost=11bp net=  -100.0% dd=-100.0% pf= 0.64 n=5352 | OOS pf= 0.64 net=   -97.5% n=1517 
+[  5] Williams %R                        SUIUSDT   15m cost=22bp net=  -100.0% dd=-100.0% pf= 0.52 n=5352 | OOS pf= 0.50 net=   -99.7% n=1517 
+[  6] CCI reversal                       JUPUSDT   1h  cost=11bp net=   -54.6% dd= -55.2% pf= 0.58 n= 381 | OOS pf= 0.54 net=   -21.3% n= 109 
+[  6] CCI reversal                       JUPUSDT   1h  cost=22bp net=   -59.2% dd= -59.7% pf= 0.54 n= 381 | OOS pf= 0.49 net=   -24.0% n= 109 
+[  7] Connors RSI(2)                     BTCUSDT   1h  cost=11bp net=   -73.0% dd= -74.7% pf= 0.79 n=1313 | OOS pf= 0.74 net=   -38.4% n= 397 
+[  7] Connors RSI(2)                     BTCUSDT   1h  cost=22bp net=   -91.1% dd= -91.3% pf= 0.63 n=1313 | OOS pf= 0.56 net=   -59.6% n= 397 
+[  8] Keltner fade                       ETHUSDT   15m cost=11bp net=  -100.0% dd=-100.0% pf= 0.52 n=9486 | OOS pf= 0.52 net=  -100.0% n=2988 
+[  8] Keltner fade                       ETHUSDT   15m cost=22bp net=  -100.0% dd=-100.0% pf= 0.39 n=9486 | OOS pf= 0.38 net=  -100.0% n=2988 
+[  9] Fast RSI                           SOLUSDT   5m  cost=11bp net=  -100.0% dd=-100.0% pf= 0.52 n=4305 | OOS pf= 0.49 net=   -99.7% n=1253 
+[  9] Fast RSI                           SOLUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.33 n=4305 | OOS pf= 0.27 net=  -100.0% n=1253 
+[ 10] Down-streak bounce                 HYPEUSDT  15m cost=11bp net=   -55.4% dd= -56.7% pf= 0.74 n= 959 | OOS pf= 0.85 net=   -12.2% n= 279 
+[ 10] Down-streak bounce                 HYPEUSDT  15m cost=22bp net=   -80.0% dd= -80.5% pf= 0.53 n= 959 | OOS pf= 0.56 net=   -33.4% n= 279 
+[ 11] EMA deviation                      SUIUSDT   1h  cost=11bp net=   -19.8% dd= -25.5% pf= 0.80 n= 276 | OOS pf= 0.93 net=    -1.5% n=  87 
+[ 11] EMA deviation                      SUIUSDT   1h  cost=22bp net=   -24.8% dd= -29.0% pf= 0.75 n= 276 | OOS pf= 0.86 net=    -3.8% n=  87 
+[ 12] Donchian fade                      JUPUSDT   15m cost=11bp net=  -100.0% dd=-100.0% pf= 0.65 n=5403 | OOS pf= 0.66 net=   -96.6% n=1570 
+[ 12] Donchian fade                      JUPUSDT   15m cost=22bp net=  -100.0% dd=-100.0% pf= 0.53 n=5403 | OOS pf= 0.52 net=   -99.5% n=1570 
+[ 13] Volume-confirmed RSI               BTCUSDT   5m  cost=11bp net=   -99.9% dd= -99.9% pf= 0.50 n=1249 | OOS pf= 0.46 net=   -90.6% n= 384 
+[ 13] Volume-confirmed RSI               BTCUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.29 n=1249 | OOS pf= 0.24 net=   -99.0% n= 384 
+[ 14] 50-EMA stretch                     ETHUSDT   1h  cost=11bp net=   -95.1% dd= -95.5% pf= 0.60 n=1074 | OOS pf= 0.56 net=   -62.7% n= 302 
+[ 14] 50-EMA stretch                     ETHUSDT   1h  cost=22bp net=   -96.8% dd= -97.0% pf= 0.56 n=1074 | OOS pf= 0.52 net=   -67.4% n= 302 
+[ 15] Bollinger %B                       SOLUSDT   15m cost=11bp net=  -100.0% dd=-100.0% pf= 0.67 n=7768 | OOS pf= 0.62 net=   -99.9% n=2317 
+[ 15] Bollinger %B                       SOLUSDT   15m cost=22bp net=  -100.0% dd=-100.0% pf= 0.55 n=7768 | OOS pf= 0.49 net=  -100.0% n=2317 
+[ 16] RSI divergence                     HYPEUSDT  5m  cost=11bp net=    -0.6% dd=  -3.8% pf= 0.87 n=   4 | OOS pf= 2.30 net=     1.7% n=   2 
+[ 16] RSI divergence                     HYPEUSDT  5m  cost=22bp net=    -1.6% dd=  -4.2% pf= 0.64 n=   4 | OOS pf= 1.58 net=     1.0% n=   2 
+[ 17] Ultimate Oscillator                SUIUSDT   5m  cost=11bp net=   -98.9% dd= -99.1% pf= 0.71 n=1409 | OOS pf= 0.67 net=   -71.5% n= 322 
+[ 17] Ultimate Oscillator                SUIUSDT   5m  cost=22bp net=   -99.9% dd=-100.0% pf= 0.58 n=1409 | OOS pf= 0.51 net=   -89.1% n= 322 
+[ 18] MFI reversal                       JUPUSDT   5m  cost=11bp net=  -100.0% dd=-100.0% pf= 0.64 n=4628 | OOS pf= 0.65 net=   -99.1% n=1446 
+[ 18] MFI reversal                       JUPUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.51 n=4628 | OOS pf= 0.50 net=  -100.0% n=1446 
+[ 19] Range fade                         BTCUSDT   15m cost=11bp net=  -100.0% dd=-100.0% pf= 0.25 n=77949 | OOS pf= 0.23 net=  -100.0% n=23005 
+[ 19] Range fade                         BTCUSDT   15m cost=22bp net=  -100.0% dd=-100.0% pf= 0.10 n=77949 | OOS pf= 0.08 net=  -100.0% n=23005 
+[ 20] Multi-timeframe RSI                ETHUSDT   5m  cost=11bp net=   -99.9% dd=-100.0% pf= 0.51 n=1576 | OOS pf= 0.53 net=   -87.9% n= 442 
+[ 20] Multi-timeframe RSI                ETHUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.38 n=1576 | OOS pf= 0.36 net=   -97.1% n= 442 
+[ 21] Trend-filtered RSI                 SOLUSDT   1h  cost=11bp net=     0.6% dd=  -9.0% pf= 1.04 n=  37 | OOS pf= 1.47 net=     4.3% n=  14 
+[ 21] Trend-filtered RSI                 SOLUSDT   1h  cost=22bp net=    -0.8% dd= -10.0% pf= 0.99 n=  37 | OOS pf= 1.37 net=     3.5% n=  14 
+[ 22] Band fade con time stop            HYPEUSDT  1h  cost=11bp net=   -11.2% dd= -21.9% pf= 0.91 n= 336 | OOS pf= 0.95 net=    -2.4% n= 103 
+[ 22] Band fade con time stop            HYPEUSDT  1h  cost=22bp net=   -22.4% dd= -29.9% pf= 0.81 n= 336 | OOS pf= 0.83 net=    -7.0% n= 103 
+[ 23] Connors RSI(3,2,100)               SUIUSDT   15m cost=11bp net=   -93.4% dd= -93.8% pf= 0.74 n=2531 | OOS pf= 0.65 net=   -69.9% n= 739 
+[ 23] Connors RSI(3,2,100)               SUIUSDT   15m cost=22bp net=   -99.5% dd= -99.6% pf= 0.54 n=2531 | OOS pf= 0.45 net=   -88.3% n= 739 
+[ 24] Failed breakdown reclaim           JUPUSDT   1h  cost=11bp net=   -70.3% dd= -72.1% pf= 0.82 n=1054 | OOS pf= 0.81 net=   -30.5% n= 302 
+[ 24] Failed breakdown reclaim           JUPUSDT   1h  cost=22bp net=   -81.3% dd= -82.3% pf= 0.76 n=1054 | OOS pf= 0.73 net=   -40.4% n= 302 
+[ 25] VWAP band                          BTCUSDT   1h  cost=11bp net=   -99.1% dd= -99.1% pf= 0.55 n=1606 | OOS pf= 0.60 net=   -73.1% n= 496 
+[ 25] VWAP band                          BTCUSDT   1h  cost=22bp net=   -99.7% dd= -99.7% pf= 0.47 n=1606 | OOS pf= 0.50 net=   -83.0% n= 496 
+[ 26] EMA cross                          ETHUSDT   1h  cost=11bp net=   444.7% dd= -29.1% pf= 1.36 n=1134 | OOS pf= 1.09 net=    15.6% n= 385 GATE
+[ 26] EMA cross                          ETHUSDT   1h  cost=22bp net=   227.5% dd= -32.0% pf= 1.25 n=1134 | OOS pf= 1.00 net=    -2.9% n= 385 GATE
+[ 27] Supertrend                         SOLUSDT   15m cost=11bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 27] Supertrend                         SOLUSDT   15m cost=22bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 28] Donchian breakout                  BTCUSDT   1h  cost=11bp net=   113.7% dd= -21.4% pf= 1.37 n= 430 | OOS pf= 1.30 net=    19.2% n= 138 GATE OOS_OK
+[ 28] Donchian breakout                  BTCUSDT   1h  cost=22bp net=    67.5% dd= -24.1% pf= 1.25 n= 430 | OOS pf= 1.16 net=     8.5% n= 138 GATE
+[ 29] MACD zero-cross                    HYPEUSDT  15m cost=11bp net=   -52.1% dd= -57.8% pf= 0.85 n= 981 | OOS pf= 0.82 net=   -24.0% n= 297 
+[ 29] MACD zero-cross                    HYPEUSDT  15m cost=22bp net=   -80.2% dd= -81.8% pf= 0.69 n= 981 | OOS pf= 0.64 net=   -44.6% n= 297 
+[ 30] ADX DI cross                       SUIUSDT   1h  cost=11bp net=   -19.6% dd= -30.9% pf= 0.85 n= 476 | OOS pf= 0.80 net=    -9.4% n= 126 
+[ 30] ADX DI cross                       SUIUSDT   1h  cost=22bp net=   -30.1% dd= -39.4% pf= 0.77 n= 476 | OOS pf= 0.71 net=   -13.3% n= 126 
+[ 31] Triple EMA pullback                JUPUSDT   15m cost=11bp net=  -100.0% dd=-100.0% pf= 0.47 n=2634 | OOS pf= 0.37 net=   -99.9% n= 750 
+[ 31] Triple EMA pullback                JUPUSDT   15m cost=22bp net=  -100.0% dd=-100.0% pf= 0.31 n=2634 | OOS pf= 0.23 net=  -100.0% n= 750 
+[ 32] HMA slope                          ETHUSDT   5m  cost=11bp net=  -100.0% dd=-100.0% pf= 0.36 n=13137 | OOS pf= 0.32 net=  -100.0% n=3932 
+[ 32] HMA slope                          ETHUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.20 n=13137 | OOS pf= 0.16 net=  -100.0% n=3932 
+[ 33] Ichimoku                           BTCUSDT   15m cost=11bp net=  -100.0% dd=-100.0% pf= 0.52 n=13854 | OOS pf= 0.45 net=  -100.0% n=4114 
+[ 33] Ichimoku                           BTCUSDT   15m cost=22bp net=  -100.0% dd=-100.0% pf= 0.32 n=13854 | OOS pf= 0.25 net=  -100.0% n=4114 
+[ 34] Regression slope                   SOLUSDT   1h  cost=11bp net=   355.0% dd= -26.5% pf= 1.26 n=1096 | OOS pf= 1.06 net=     4.8% n= 332 GATE
+[ 34] Regression slope                   SOLUSDT   1h  cost=22bp net=   177.8% dd= -30.7% pf= 1.18 n=1096 | OOS pf= 0.98 net=   -13.8% n= 332 
+[ 35] 480-bar breakout                   HYPEUSDT  1h  cost=11bp net=     8.2% dd= -13.7% pf= 1.70 n=  20 | OOS pf= 8.77 net=    13.8% n=   4 
+[ 35] 480-bar breakout                   HYPEUSDT  1h  cost=22bp net=     7.7% dd= -14.0% pf= 1.65 n=  20 | OOS pf= 8.53 net=    13.6% n=   4 
+[ 36] EMA(9/21) con ADX                  SUIUSDT   5m  cost=11bp net=  -100.0% dd=-100.0% pf= 0.72 n=3733 | OOS pf= 0.47 net=   -99.5% n=1194 
+[ 36] EMA(9/21) con ADX                  SUIUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.55 n=3733 | OOS pf= 0.33 net=  -100.0% n=1194 
+[ 37] Parabolic SAR                      JUPUSDT   1h  cost=11bp net=   -51.1% dd= -62.4% pf= 0.94 n=2113 | OOS pf= 0.96 net=   -13.3% n= 637 
+[ 37] Parabolic SAR                      JUPUSDT   1h  cost=22bp net=   -79.5% dd= -81.9% pf= 0.85 n=2113 | OOS pf= 0.87 net=   -35.5% n= 637 
+[ 38] Keltner breakout                   BTCUSDT   5m  cost=11bp net=  -100.0% dd=-100.0% pf= 0.39 n=2892 | OOS pf= 0.37 net=  -100.0% n= 903 
+[ 38] Keltner breakout                   BTCUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.21 n=2892 | OOS pf= 0.20 net=  -100.0% n= 903 
+[ 39] Aroon                              ETHUSDT   15m cost=11bp net=   -96.7% dd= -96.8% pf= 0.51 n=1910 | OOS pf= 0.51 net=   -64.4% n= 577 
+[ 39] Aroon                              ETHUSDT   15m cost=22bp net=   -99.8% dd= -99.8% pf= 0.30 n=1910 | OOS pf= 0.31 net=   -84.3% n= 577 
+[ 40] VWMA cross                         SOLUSDT   5m  cost=11bp net=  -100.0% dd=-100.0% pf= 0.59 n=11003 | OOS pf= 0.49 net=  -100.0% n=3429 
+[ 40] VWMA cross                         SOLUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.38 n=11003 | OOS pf= 0.29 net=  -100.0% n=3429 
+[ 41] Efficiency ratio filter            HYPEUSDT  5m  cost=11bp net=   -98.3% dd= -98.3% pf= 0.36 n=1255 | OOS pf= 0.36 net=   -69.4% n= 373 
+[ 41] Efficiency ratio filter            HYPEUSDT  5m  cost=22bp net=   -99.9% dd= -99.9% pf= 0.21 n=1255 | OOS pf= 0.21 net=   -86.9% n= 373 
+[ 42] KAMA slope                         SUIUSDT   15m cost=11bp net=  -100.0% dd=-100.0% pf= 0.65 n=13054 | OOS pf= 0.57 net=   -99.7% n=3945 
+[ 42] KAMA slope                         SUIUSDT   15m cost=22bp net=  -100.0% dd=-100.0% pf= 0.49 n=13054 | OOS pf= 0.41 net=  -100.0% n=3945 
+[ 43] HTF trend filter                   JUPUSDT   5m  cost=11bp net=   -99.9% dd=-100.0% pf= 0.75 n=2721 | OOS pf= 0.84 net=   -85.5% n= 808 
+[ 43] HTF trend filter                   JUPUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.59 n=2721 | OOS pf= 0.66 net=   -97.7% n= 808 
+[ 44] 168-bar breakout                   BTCUSDT   1h  cost=11bp net=   368.0% dd= -21.4% pf= 2.54 n= 161 | OOS pf= 1.52 net=    18.7% n=  52 GATE OOS_OK
+[ 44] 168-bar breakout                   BTCUSDT   1h  cost=22bp net=   322.3% dd= -23.2% pf= 2.37 n= 161 | OOS pf= 1.39 net=    14.0% n=  52 GATE OOS_OK
+[ 45] Time-series momentum               ETHUSDT   1h  cost=11bp net=     6.4% dd= -47.7% pf= 1.06 n= 467 | OOS pf= 0.89 net=   -32.3% n= 143 
+[ 45] Time-series momentum               ETHUSDT   1h  cost=22bp net=   -55.5% dd= -69.9% pf= 0.94 n= 467 | OOS pf= 0.78 net=   -48.7% n= 143 
+[ 46] Bollinger squeeze                  SOLUSDT   15m cost=11bp net=   -54.6% dd= -71.8% pf= 0.87 n= 762 | OOS pf= 0.53 net=   -53.9% n= 210 
+[ 46] Bollinger squeeze                  SOLUSDT   15m cost=22bp net=   -84.9% dd= -88.3% pf= 0.70 n= 762 | OOS pf= 0.40 net=   -69.8% n= 210 
+[ 47] Opening range breakout             BTCUSDT   5m  cost=11bp net=   -98.7% dd= -99.0% pf= 0.73 n=1216 | OOS pf= 0.64 net=   -82.7% n= 369 
+[ 47] Opening range breakout             BTCUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.52 n=1216 | OOS pf= 0.46 net=   -96.7% n= 369 
+[ 48] NR7 breakout                       HYPEUSDT  15m cost=11bp net=   -31.7% dd= -68.5% pf= 0.79 n=  83 | OOS pf= 0.00 net=    32.0% n=   0 
+[ 48] NR7 breakout                       HYPEUSDT  15m cost=22bp net=   -38.8% dd= -71.0% pf= 0.71 n=  83 | OOS pf= 0.00 net=    32.0% n=   0 
+[ 49] ATR expansion                      SUIUSDT   1h  cost=11bp net=     1.8% dd=  -9.6% pf= 1.14 n=  31 | OOS pf= 2.35 net=     5.9% n=  14 
+[ 49] ATR expansion                      SUIUSDT   1h  cost=22bp net=     1.0% dd=  -9.8% pf= 1.08 n=  31 | OOS pf= 2.18 net=     5.4% n=  14 
+[ 50] Volatility breakout                JUPUSDT   15m cost=11bp net=    71.2% dd= -95.2% pf= 1.08 n=3774 | OOS pf= 0.97 net=   -64.2% n=1150 
+[ 50] Volatility breakout                JUPUSDT   15m cost=22bp net=   -99.5% dd= -99.8% pf= 0.93 n=3774 | OOS pf= 0.82 net=   -95.4% n=1150 
+[ 51] TTM squeeze                        ETHUSDT   5m  cost=11bp net=  -100.0% dd=-100.0% pf= 0.49 n=4846 | OOS pf= 0.43 net=  -100.0% n=1450 
+[ 51] TTM squeeze                        ETHUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.30 n=4846 | OOS pf= 0.24 net=  -100.0% n=1450 
+[ 52] Range compression                  BTCUSDT   15m cost=11bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 52] Range compression                  BTCUSDT   15m cost=22bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 53] Volume breakout                    SOLUSDT   5m  cost=11bp net=   -99.4% dd= -99.5% pf= 0.67 n=1374 | OOS pf= 0.74 net=   -77.9% n= 424 
+[ 53] Volume breakout                    SOLUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.51 n=1374 | OOS pf= 0.54 net=   -95.4% n= 424 
+[ 54] Failed breakout fade               HYPEUSDT  5m  cost=11bp net=  -100.0% dd=-100.0% pf= 0.65 n=3748 | OOS pf= 0.60 net=   -96.8% n=1126 
+[ 54] Failed breakout fade               HYPEUSDT  5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.47 n=3748 | OOS pf= 0.41 net=   -99.7% n=1126 
+[ 55] Pivot breakout                     SUIUSDT   15m cost=11bp net=  -100.0% dd=-100.0% pf= 0.42 n= 978 | OOS pf= 0.42 net=   -95.8% n= 288 
+[ 55] Pivot breakout                     SUIUSDT   15m cost=22bp net=  -100.0% dd=-100.0% pf= 0.28 n= 978 | OOS pf= 0.27 net=   -99.8% n= 288 
+[ 56] Donchian chandelier                JUPUSDT   1h  cost=11bp net=    -1.6% dd= -17.0% pf= 1.01 n= 299 | OOS pf= 1.27 net=    11.7% n=  89  OOS_OK
+[ 56] Donchian chandelier                JUPUSDT   1h  cost=22bp net=    -8.4% dd= -21.0% pf= 0.95 n= 299 | OOS pf= 1.21 net=     9.2% n=  89  OOS_OK
+[ 57] Volatility-percentile breakout     ETHUSDT   15m cost=11bp net=   -67.2% dd= -88.5% pf= 0.89 n= 655 | OOS pf= 0.71 net=   -48.6% n= 187 
+[ 57] Volatility-percentile breakout     ETHUSDT   15m cost=22bp net=   -94.8% dd= -97.3% pf= 0.69 n= 655 | OOS pf= 0.53 net=   -71.7% n= 187 
+[ 58] Gap continuation                   BTCUSDT   1h  cost=11bp net=    -0.5% dd=  -0.7% pf= 0.00 n=   1 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 58] Gap continuation                   BTCUSDT   1h  cost=22bp net=    -0.5% dd=  -0.7% pf= 0.00 n=   1 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 59] Range expansion                    SOLUSDT   1h  cost=11bp net=    40.9% dd= -17.3% pf= 1.25 n= 533 | OOS pf= 1.03 net=     0.9% n= 155 GATE
+[ 59] Range expansion                    SOLUSDT   1h  cost=22bp net=    16.4% dd= -22.5% pf= 1.11 n= 533 | OOS pf= 0.89 net=    -6.3% n= 155 
+[ 60] Keltner con RSI                    HYPEUSDT  1h  cost=11bp net=    40.3% dd=  -9.9% pf= 1.60 n= 128 | OOS pf= 1.61 net=    12.2% n=  42 GATE OOS_OK
+[ 60] Keltner con RSI                    HYPEUSDT  1h  cost=22bp net=    32.6% dd= -10.4% pf= 1.48 n= 128 | OOS pf= 1.47 net=     9.7% n=  42 GATE OOS_OK
+[ 61] Opening drive                      SUIUSDT   5m  cost=11bp net=   -96.1% dd= -96.2% pf= 0.50 n= 710 | OOS pf= 0.37 net=   -73.7% n= 209 
+[ 61] Opening drive                      SUIUSDT   5m  cost=22bp net=   -99.7% dd= -99.7% pf= 0.33 n= 710 | OOS pf= 0.23 net=   -89.6% n= 209 
+[ 62] Volume spike breakout              JUPUSDT   5m  cost=11bp net=   -98.2% dd= -98.6% pf= 0.74 n=1827 | OOS pf= 0.65 net=   -84.9% n= 622 
+[ 62] Volume spike breakout              JUPUSDT   5m  cost=22bp net=  -100.0% dd=-100.0% pf= 0.54 n=1827 | OOS pf= 0.46 net=   -96.8% n= 622 
+[ 63] Bollinger breakout con ADX         BTCUSDT   15m cost=11bp net=  -100.0% dd=-100.0% pf= 0.59 n=9850 | OOS pf= 0.52 net=  -100.0% n=2934 
+[ 63] Bollinger breakout con ADX         BTCUSDT   15m cost=22bp net=  -100.0% dd=-100.0% pf= 0.41 n=9850 | OOS pf= 0.33 net=  -100.0% n=2934 
+[ 64] Consolidation breakout             ETHUSDT   1h  cost=11bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 64] Consolidation breakout             ETHUSDT   1h  cost=22bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 65] Stop-hunt reclaim                  SOLUSDT   15m cost=11bp net=  -100.0% dd=-100.0% pf= 0.65 n=6144 | OOS pf= 0.56 net=   -99.6% n=1812 
+[ 65] Stop-hunt reclaim                  SOLUSDT   15m cost=22bp net=  -100.0% dd=-100.0% pf= 0.44 n=6144 | OOS pf= 0.33 net=  -100.0% n=1812 
+[ 66] London open range                  BTCUSDT   15m cost=11bp net=  -100.0% dd=-100.0% pf= 0.42 n=5098 | OOS pf= 0.42 net=  -100.0% n=1481 
+[ 66] London open range                  BTCUSDT   15m cost=22bp net=  -100.0% dd=-100.0% pf= 0.26 n=5098 | OOS pf= 0.24 net=  -100.0% n=1481 
+[ 67] Asian range fade                   ETHUSDT   15m cost=11bp net=   -36.9% dd= -41.7% pf= 0.15 n=  22 | OOS pf= 0.00 net=    -1.1% n=   0 
+[ 67] Asian range fade                   ETHUSDT   15m cost=22bp net=   -55.6% dd= -58.9% pf= 0.10 n=  22 | OOS pf= 0.00 net=    -1.1% n=   0 
+[ 68] Weekend effect                     SOLUSDT   1h  cost=11bp net=    50.0% dd= -22.1% pf= 1.26 n= 319 | OOS pf= 0.94 net=    -4.3% n=  96 GATE
+[ 68] Weekend effect                     SOLUSDT   1h  cost=22bp net=    32.9% dd= -23.8% pf= 1.18 n= 319 | OOS pf= 0.86 net=    -8.6% n=  96 
+[ 69] US cash open fade                  HYPEUSDT  15m cost=11bp net=    -8.0% dd= -28.3% pf= 0.95 n= 185 | OOS pf= 0.96 net=    -2.3% n=  61 
+[ 69] US cash open fade                  HYPEUSDT  15m cost=22bp net=   -30.7% dd= -39.6% pf= 0.75 n= 185 | OOS pf= 0.73 net=   -12.0% n=  61 
+[ 70] Funding-window fade                SUIUSDT   15m cost=11bp net=   -95.5% dd= -95.9% pf= 0.65 n=1461 | OOS pf= 0.75 net=   -46.4% n= 435 
+[ 70] Funding-window fade                SUIUSDT   15m cost=22bp net=   -99.6% dd= -99.6% pf= 0.47 n=1461 | OOS pf= 0.51 net=   -77.2% n= 435 
+[ 71] Hour-of-day filter                 JUPUSDT   1h  cost=11bp net=    15.8% dd= -15.3% pf= 1.26 n=  97 | OOS pf= 1.38 net=    12.5% n=  30 GATE OOS_OK
+[ 71] Hour-of-day filter                 JUPUSDT   1h  cost=22bp net=    11.8% dd= -16.1% pf= 1.20 n=  97 | OOS pf= 1.31 net=    11.2% n=  30 GATE OOS_OK
+[ 72] Monday persistence                 BTCUSDT   1h  cost=11bp net=    17.9% dd= -27.3% pf= 1.09 n= 372 | OOS pf= 0.79 net=   -15.2% n= 112 
+[ 72] Monday persistence                 BTCUSDT   1h  cost=22bp net=   -15.5% dd= -33.3% pf= 0.95 n= 372 | OOS pf= 0.67 net=   -24.5% n= 112 
+[ 73] Sunday-to-Monday reversion         ETHUSDT   1h  cost=11bp net=    37.5% dd= -20.1% pf= 1.45 n= 128 | OOS pf= 1.45 net=    10.0% n=  42 GATE OOS_OK
+[ 73] Sunday-to-Monday reversion         ETHUSDT   1h  cost=22bp net=    26.2% dd= -22.6% pf= 1.32 n= 128 | OOS pf= 1.30 net=     6.8% n=  42 GATE OOS_OK
+[ 74] NY close momentum                  SOLUSDT   15m cost=11bp net=   -93.0% dd= -94.0% pf= 0.76 n=2225 | OOS pf= 0.78 net=   -52.2% n= 665 
+[ 74] NY close momentum                  SOLUSDT   15m cost=22bp net=   -99.5% dd= -99.5% pf= 0.59 n=2225 | OOS pf= 0.56 net=   -82.6% n= 665 
+[ 75] Month-end drift                    HYPEUSDT  1h  cost=11bp net=   -12.5% dd= -16.3% pf= 0.63 n=  54 | OOS pf= 1.20 net=     1.6% n=  14 
+[ 75] Month-end drift                    HYPEUSDT  1h  cost=22bp net=   -14.3% dd= -17.6% pf= 0.59 n=  54 | OOS pf= 1.12 net=     0.9% n=  14 
+[ 76] Pre-US compression                 SUIUSDT   5m  cost=11bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 76] Pre-US compression                 SUIUSDT   5m  cost=22bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 77] Asia gap fade                      JUPUSDT   15m cost=11bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 77] Asia gap fade                      JUPUSDT   15m cost=22bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 78] Session VWAP band                  BTCUSDT   5m  cost=11bp net=     4.7% dd= -59.1% pf= 1.39 n=  26 | OOS pf= 9.75 net=    26.3% n=   5 
+[ 78] Session VWAP band                  BTCUSDT   5m  cost=22bp net=    -2.6% dd= -59.7% pf= 1.14 n=  26 | OOS pf= 8.63 net=    25.5% n=   5 
+[ 79] Impulse fade                       ETHUSDT   5m  cost=11bp net=   -93.9% dd= -94.0% pf= 0.46 n=1190 | OOS pf= 0.40 net=   -66.0% n= 396 
+[ 79] Impulse fade                       ETHUSDT   5m  cost=22bp net=   -99.7% dd= -99.7% pf= 0.22 n=1190 | OOS pf= 0.15 net=   -91.2% n= 396 
+[ 80] Opening-bar momentum               SOLUSDT   5m  cost=11bp net=   -94.1% dd= -94.2% pf= 0.51 n= 718 | OOS pf= 0.54 net=   -55.5% n= 213 
+[ 80] Opening-bar momentum               SOLUSDT   5m  cost=22bp net=   -99.4% dd= -99.4% pf= 0.32 n= 718 | OOS pf= 0.29 net=   -81.3% n= 213 
+[ 81] SOL/ETH z-score                    SOL/ETH   1h  cost=11bp net=  -100.0% dd=-100.0% pf= 0.19 n=1820 | OOS pf= 0.13 net=   -99.7% n= 652 
+[ 81] SOL/ETH z-score                    SOL/ETH   1h  cost=22bp net=  -100.0% dd=-100.0% pf= 0.15 n=1820 | OOS pf= 0.09 net=   -99.9% n= 652 
+[ 82] BTC/ETH z-score                    BTC/ETH   1h  cost=11bp net=  -100.0% dd=-100.0% pf= 0.07 n=3558 | OOS pf= 0.10 net=  -100.0% n= 981 
+[ 82] BTC/ETH z-score                    BTC/ETH   1h  cost=22bp net=  -100.0% dd=-100.0% pf= 0.04 n=3558 | OOS pf= 0.06 net=  -100.0% n= 981 
+[ 83] Weekly basket rotation             6 perps   1h  cost=11bp net=    27.3% dd= -31.8% pf= 1.28 n=  74 | OOS pf= 1.56 net=    15.0% n=  22 GATE
+[ 83] Weekly basket rotation             6 perps   1h  cost=22bp net=    22.5% dd= -32.4% pf= 1.24 n=  74 | OOS pf= 1.51 net=    13.7% n=  22 GATE
+[ 84] 24-bar relative strength           6 perps   1h  cost=11bp net=   -58.4% dd= -62.3% pf= 0.79 n= 516 | OOS pf= 0.88 net=   -13.4% n= 155 
+[ 84] 24-bar relative strength           6 perps   1h  cost=22bp net=   -69.3% dd= -71.9% pf= 0.73 n= 516 | OOS pf= 0.80 net=   -21.0% n= 155 
+[ 85] HYPE/SOL Kalman hedge              HYPE/SOL  1h  cost=11bp net=   -81.4% dd= -81.4% pf= 0.12 n= 247 | OOS pf= 0.15 net=   -36.1% n=  70 
+[ 85] HYPE/SOL Kalman hedge              HYPE/SOL  1h  cost=22bp net=   -81.5% dd= -81.5% pf= 0.12 n= 247 | OOS pf= 0.15 net=   -36.2% n=  70 
+[ 86] SUI/JUP cointegration              SUI/JUP   1h  cost=11bp net=   -74.8% dd= -75.6% pf= 0.35 n= 366 | OOS pf= 0.09 net=   -50.8% n= 102 
+[ 86] SUI/JUP cointegration              SUI/JUP   1h  cost=22bp net=   -75.6% dd= -76.3% pf= 0.34 n= 366 | OOS pf= 0.08 net=   -51.1% n= 102 
+[ 87] Low-volatility rotation            6 perps   1h  cost=11bp net=   -38.9% dd= -56.3% pf= 0.71 n=  74 | OOS pf= 0.62 net=   -14.3% n=  22 
+[ 87] Low-volatility rotation            6 perps   1h  cost=22bp net=   -39.0% dd= -56.4% pf= 0.71 n=  74 | OOS pf= 0.62 net=   -14.3% n=  22 
+[ 88] Alt basket vs BTC                  basket/BTC 1h  cost=11bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 88] Alt basket vs BTC                  basket/BTC 1h  cost=22bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 89] ETH/BTC ratio breakout             ETH/BTC   15m cost=11bp net=   -87.4% dd= -88.1% pf= 0.60 n= 800 | OOS pf= 0.49 net=   -58.8% n= 243 
+[ 89] ETH/BTC ratio breakout             ETH/BTC   15m cost=22bp net=   -98.0% dd= -98.0% pf= 0.41 n= 800 | OOS pf= 0.32 net=   -79.2% n= 243 
+[ 90] Volatility-scaled momentum         6 perps   1h  cost=11bp net=    11.6% dd= -30.9% pf= 1.17 n=  74 | OOS pf= 1.68 net=    16.5% n=  22 
+[ 90] Volatility-scaled momentum         6 perps   1h  cost=22bp net=     8.9% dd= -31.4% pf= 1.15 n=  74 | OOS pf= 1.65 net=    15.8% n=  22 
+[ 91] Funding extreme fade               BTCUSDT   1h  cost=11bp net=    30.3% dd= -10.7% pf= 1.26 n= 398 | OOS pf=  inf net=     0.6% n=   1 GATE
+[ 91] Funding extreme fade               BTCUSDT   1h  cost=22bp net=     8.2% dd= -13.8% pf= 1.08 n= 398 | OOS pf=  inf net=     0.5% n=   1 
+[ 92] Funding z-score                    ETHUSDT   1h  cost=11bp net=   -36.7% dd= -54.0% pf= 0.86 n= 597 | OOS pf= 0.93 net=    -7.2% n= 189 
+[ 92] Funding z-score                    ETHUSDT   1h  cost=22bp net=   -56.4% dd= -67.0% pf= 0.76 n= 597 | OOS pf= 0.79 net=   -18.5% n= 189 
+[ 93] Negative-funding long              SOLUSDT   1h  cost=11bp net=    18.4% dd= -41.1% pf= 1.23 n= 148 | OOS pf= 0.36 net=   -21.2% n=  33 GATE
+[ 93] Negative-funding long              SOLUSDT   1h  cost=22bp net=    13.0% dd= -41.7% pf= 1.19 n= 148 | OOS pf= 0.35 net=   -22.0% n=  33 
+[ 94] Funding persistence                HYPEUSDT  1h  cost=11bp net=    -2.1% dd=  -2.4% pf= 0.19 n=   6 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 94] Funding persistence                HYPEUSDT  1h  cost=22bp net=    -2.4% dd=  -2.6% pf= 0.15 n=   6 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 95] Price-funding divergence           SUIUSDT   1h  cost=11bp net=    21.0% dd= -12.0% pf= 1.25 n= 153 | OOS pf= 1.17 net=     1.4% n=  36 GATE
+[ 95] Price-funding divergence           SUIUSDT   1h  cost=22bp net=    14.4% dd= -12.9% pf= 1.17 n= 153 | OOS pf= 1.09 net=    -0.0% n=  36 
+[ 96] Funding con trend filter           JUPUSDT   1h  cost=11bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 96] Funding con trend filter           JUPUSDT   1h  cost=22bp net=     0.0% dd=   0.0% pf= 0.00 n=   0 | OOS pf= 0.00 net=     0.0% n=   0 
+[ 97] Funding-filtered reversion         BTCUSDT   1h  cost=11bp net=   -13.6% dd= -30.6% pf= 0.93 n= 272 | OOS pf= 0.65 net=   -24.6% n= 100 
+[ 97] Funding-filtered reversion         BTCUSDT   1h  cost=22bp net=   -27.8% dd= -37.8% pf= 0.85 n= 272 | OOS pf= 0.58 net=   -30.4% n= 100 
+[ 98] Funding vs 4h RSI                  ETHUSDT   1h  cost=11bp net=   -62.9% dd= -64.9% pf= 0.58 n= 310 | OOS pf= 0.59 net=   -23.7% n=  87 
+[ 98] Funding vs 4h RSI                  ETHUSDT   1h  cost=22bp net=   -68.1% dd= -69.9% pf= 0.54 n= 310 | OOS pf= 0.54 net=   -27.3% n=  87 
+[ 99] Funding momentum                   SOLUSDT   1h  cost=11bp net=   235.5% dd= -29.1% pf= 5.89 n=  38 | OOS pf= 0.00 net=    -2.1% n=   2 GATE
+[ 99] Funding momentum                   SOLUSDT   1h  cost=22bp net=   232.1% dd= -29.1% pf= 5.73 n=  38 | OOS pf= 0.00 net=    -2.2% n=   2 GATE
+[100] Funding harvest                    HYPEUSDT  15m cost=11bp net=   -20.1% dd= -24.0% pf= 0.48 n=  66 | OOS pf= 0.48 net=    -5.6% n=  18 
+[100] Funding harvest                    HYPEUSDT  15m cost=22bp net=   -26.8% dd= -28.8% pf= 0.36 n=  66 | OOS pf= 0.34 net=    -8.1% n=  18 
+
+=== resumen coste 11 bps ===
+estrategias: 100 | GATE (PF>1.2, n>=30, net>0): 14 | ademas OOS PF>1.2 y net>0: 5
+guardado results_100.csv / results_100.pkl
