@@ -357,5 +357,4 @@ and `/cvd` publishes `warmup` / `segment_reason` so this is visible.
 19.9 signals/symbol-day before → **1.1** after. `tradingkey_movers` disabled
 (US-equities only, 0/7 crypto coverage). Polymarket fallback repointed to a live
 endpoint; macro pipeline DNS failures fixed via ThreadedResolver.
-<!-- hook-selftest 2026-11-12T20:22:53.6131157-05:00 -->
-<!-- hook-selftest 2026-11-12T20:23:19.3462508-05:00 -->
+
