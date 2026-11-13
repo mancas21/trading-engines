@@ -325,6 +325,68 @@ dom ema=+1.5% (n=53359)
 
 ---
 
+## Apéndice B — el gate ya puede dispararse también para 1000PEPE (2026-11-12)
+
+**El problema que había:** la condición (c) es el consenso multi-venue del
+scanner. El scanner no rastrea 1000PEPE, así que para el símbolo que estaba
+chartado en ATAS la (c) era **UNEVALUABLE** — y una regla que no se puede
+evaluar no es una regla que no se cumple, pero tampoco es una regla. El
+veredicto quedaba "NEUTRAL forzado" para siempre.
+
+**Lo que faltaba no era el símbolo, era el par.** `1000PEPEUSDT` es el
+contrato **1000×** y las venues no lo listan igual:
+
+| Venue | Símbolo | Multiplicador |
+|---|---|---|
+| Binance | `1000PEPEUSDT` | 1000× (fapi **no** lista el PEPE 1×) |
+| Bybit | `1000PEPEUSDT` | 1000× |
+| OKX | `PEPE-USDT-SWAP` | **1×** (precio por PEPE, tamaño en contratos de 10.000.000 PEPE) |
+| Kraken | `PEPEUSD` | **1×** spot (tamaño en PEPE) |
+
+Sin normalizar, la comparación de precios entre venues mezcla dos escalas y
+el `basis_bps` de cada venue sale multiplicado por 1000. El `book_imb_5` — que
+es lo que la (c) lee — es una **razón** y sobrevive; la comparación de
+precios no.
+
+**Lo que se hizo** (`scanner-engine/`):
+1. El registro (`pairs.py`) pasa a ser la **fuente única** del símbolo por
+   venue: los adaptadores consultan `pairs.venue_symbol` en vez de derivar
+   `base + "USDT"`. Pedirle a OKX `1000PEPE-USDT-SWAP` daba
+   `Instrument ID does not exist` (51001).
+2. `PairSpec` gana `price_mult` / `size_mult` por venue, aplicados en un
+   único punto de ingestión (`scanner.py`). Su producto conserva la
+   NOTIONAL: 17 contratos × 10.000.000 PEPE a 4,3818e-06 = **744,9 USD**, y
+   17 × 10.000 = 170.000 unidades de 1000PEPE × 0,0043818 = **744,9 USD**.
+3. Par `1000PEPE/USD` con 4 venues, suelo 4, barra 5m (≈400K USD/min, el
+   mismo criterio que puso a HYPE en 5m).
+
+**Efecto medido:** con los 4 venues vivos, la (c) de las reglas 6 y 7 pasó de
+UNEVALUABLE a evaluada de verdad — `2C/0V venues por lado (4 vivos)`, con
+detalle por lado ("2 venues del lado buy con z>=1 (piden 3)"). El veredicto
+dejó de decir "NEUTRAL forzado" y pasó a "NEUTRAL: las reglas no disparan",
+que es una afirmación distinta.
+
+**Dos hallazgos colaterales que el cambio destapó** (ver
+`scanner-engine/docs/VENUE_FACTS.md`):
+- El registro tenía el símbolo de Kraken para el ORO mal puesto (`XAUTUSDT`
+  en vez de `XAUTUSD`) y el de Bybit también (`XAUTUSDT` en vez de
+  `XAUUSDT`). No se leían — los adaptadores derivaban el suyo — así que
+  eran datos muertos; el día que el registro pasó a mandar, habrían cambiado
+  el par en silencio. Se restauraron exactamente los símbolos que el motor
+  había estado operando.
+- Binance y Bybit listan **DOS contratos de oro** (`XAUUSDT` ≈3870 y
+  `XAUTUSDT` ≈3859, ~30bps de diferencia), OKX solo el XAU y Kraken solo el
+  XAUT. No hay oro en las cuatro venues, así que el basis cross-venue de
+  XAU es una **diferencia de instrumento**, no una dislocación. Se documentó
+  como ruido estructural; no se "arregló" reetiquetando, porque no hay
+  reetiquetado posible.
+
+**Cobertura de tests:** `scanner-engine/tests/test_registry_symbols.py` (5
+tests) fija que el registro y la regla de derivación coinciden para todo par
+derivable, que los overrides están declarados, y que
+`price_mult × size_mult` conserva la notional. Suite completa del scanner:
+**249 passed**. Suite del reader: **41 passed**.
+
 ## Apéndice A — ejecución (2026-10-11 noche, auditoría de ZCode)
 
 **Orden seguido:** Fix 4 → decisión 2.3 → calibración → un commit lógico (c) +

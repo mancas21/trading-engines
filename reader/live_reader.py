@@ -242,6 +242,7 @@ def structure_block(max_age_s: float = TV_CACHE_S) -> dict:
 _CG_BY_TICKER = {
     "XRPUSDT": "ripple",
     "JUPUSDT": "jupiter-exchange-solana",
+    "ARBUSDT": "arbitrum",
     "BTCUSDT": "bitcoin",
     "ETHUSDT": "ethereum",
     "SOLUSDT": "solana",
