@@ -5,6 +5,47 @@ SQLite corpus (`quant-alert-engine/data/alerts.db`) unless stated otherwise.
 
 ---
 
+## 2026-11-12 — Altas de par en el scanner: 1000PEPE/USD y ARB/USD
+
+El registro canonico (scanner-engine/pairs.py) grew a 12 pares. Los dos
+altos de hoy salieron de medicion viva, no de la convencion de simbolos:
+
+**1000PEPE/USD** — el instrumento que estaba chartado en ATAS. Medido con
+_probe_pepe_venues.py, _probe_pepe_notional.py, _probe_pepe_liquidity.py
+y verificado con _verify_pepe_pair.py. EL MULTIPLICIO NO ES UNIFORME:
+Binance fapi lista SOLO 1000PEPEUSDT (1000x; el PEPE 1x no existe en
+fapi), Bybit 1000PEPEUSDT (1000x), OKX PEPE-USDT-SWAP (precio 1x,
+ctVal 10.000.000 PEPE por contrato) y Kraken PEPEUSD (spot 1x). Un
+adaptador que deriva el simbolo del nombre del par pide a OKX
+1000PEPE-USDT-SWAP y recibe "Instrument ID does not exist"; mezclar
+escalas haria el basis 1000x mentira. price_mult/size_mult dejan a
+OKX y Kraken en la escala 1000x conservando el nocional. Medido: 60
+barras 1m cerradas, binance 399.924 USD/min (mediana 345.129), okx
+270.271 (mediana 237.693); spread binance/okx 0,23bps, bybit y kraken
+2,28bps. Bar 5m (1m no es defendible a ~400K USD/min, el mismo criterio
+que pone HYPE en 5m). Las cuatro responden depth y trades -> suelo 4, que
+es lo que la condicion (c) de las reglas 6/7 necesita (>=3 venues con
+consenso de libro top-5). Kraken hace ~12 trades en 60s: falla el
+	rade_floor (50) y NO aporta low_by_venue, igual que JUP.
+
+**ARB/USD** — Binance ARBUSDT (PERPETUAL, underlyingSubType Layer-2),
+OKX ARB-USDT-SWAP, Bybit ARBUSDT, Kraken ARBUSD (listado, clave sin
+manglear). 60 x 1m notional USD: binance 37.209 (mediana 32.606), okx
+21.115, bybit 17.959, kraken 1.043 (mediana 57). Bar 5m. Kraken hace 2
+trades en 60s: sin low_by_venue, su ook_imb_5 si cuenta.
+
+Estado operativo de ambos: **no son operables**. El scanner los rastrea
+(para el contexto multi-venue y la VAC de las reglas 6/7), pero
+acktest_link no tiene artefacto con candidato verde para ninguno, asi
+que no entran en ALLOW_SYMBOLS ni los ejecuta el router.
+
+El puente ATAS (ridge_server.py) gana los feeds DOM/tape y derivados de
+rbusdt y 1000pepeusdt. Ojo con el simbolo: el perp de meme en
+Binance es 1000PEPEUSDT, no PEPEUSDT; con el simbolo equivocado
+/dom/1000pepeusdt respondia 404 y la lectura de PEPE se quedaba sin
+libro ni CVD de taker.
+
+---
 ## 2026-11-06 — Criba prompts100 acelerada x8 (señal una vez, caché feather, pool) — resultados idénticos bit a bit
 
 `backtest_prompts100/` fast pass (decisión conjunta con backtest-system:
@@ -359,5 +400,4 @@ and `/cvd` publishes `warmup` / `segment_reason` so this is visible.
 endpoint; macro pipeline DNS failures fixed via ThreadedResolver.
 
 
-<!-- git-sync-watchdog-selftest -->
-<!-- git-sync-watchdog-selftest2 -->
+
