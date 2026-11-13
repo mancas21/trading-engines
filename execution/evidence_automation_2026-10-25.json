@@ -1,0 +1,101 @@
+{
+  "what": "prueba end-to-end del ruteo automatico y del reconciliador contra el testnet de Binance USD-M",
+  "when_utc": "2026-10-25T16:20Z",
+  "host": "https://testnet.binancefuture.com",
+  "symbol": "XRPUSDT",
+  "scope": "plumbing, no estrategia: la senal del engine se sustituyo por una LONG fresca sintetica (XRP S10 esta plano) para ejercitar decision -> router -> bracket -> estado -> stop desaparecido -> reconciliacion -> cierre detectado. La direccion/entrada no se presentan como senal real.",
+  "limits": {
+    "max_notional_usdt": 25.0,
+    "leverage": 5,
+    "risk_target_pct": 0.25,
+    "risk_real_pct": 0.0101,
+    "binding": "nocional (el tope de 25 USDT manda; el riesgo queda por debajo del objetivo)"
+  },
+  "candidate": {
+    "id": "S10",
+    "run_id": "90ad4a5727379013",
+    "pf": 1.8308870434063733,
+    "conc_passes": false,
+    "conc_top5_share_pct": 132.58587727599874,
+    "policy": "conc_passes=false -> riesgo x0.5 (0.25%)"
+  },
+  "cycle": {
+    "entry_order_id": 3529522799,
+    "entry": {"side": "BUY", "qty": 19.2, "avg_price": 1.2997},
+    "stop": {
+      "algo_id": 1000000257338803,
+      "type": "STOP_MARKET",
+      "trigger": 1.2735,
+      "close_position": true,
+      "working_type": "MARK_PRICE"
+    },
+    "state": {
+      "status": "open", "side": "LONG", "qty": 19.2, "entry": 1.2997,
+      "stop": 1.2735, "stop_algo_id": 1000000257338803,
+      "risk_usdt": 0.497208, "risk_pct": 0.0101,
+      "equity": 4939.48046942, "opened_utc": "2026-10-25T16:20:16Z"
+    },
+    "checks": [
+      "estado open con stop_algo_id",
+      "posicion viva 19.2 en la cuenta",
+      "STOP_MARKET presente en openAlgoOrders",
+      "stop del estado == trigger del exchange"
+    ]
+  },
+  "missing_stop_recovery": {
+    "simulated": "se cancelo el algo 1000000257338803 dejando la posicion desprotegida",
+    "plan": "STOP_MARKET SELL 1.2735 closePosition=true, no enviado (DRY-RUN)",
+    "recreated_algo_id": 1000000257338981,
+    "trigger": 1.2735,
+    "state_after": "open",
+    "checks": [
+      "el plan no envio nada",
+      "el execute recreo exactamente 1 stop al mismo trigger",
+      "el estado guarda el trigger ya redondeado al tick"
+    ]
+  },
+  "close_detection": {
+    "simulated": "cierre a mercado manual sin tocar state/positions.json",
+    "manual_close_order_id": 3529522858,
+    "reconstructed": {
+      "exit_price_wavg": 1.2993,
+      "exit_qty": 19.2,
+      "realized_pnl_usdt": -0.00768,
+      "fee_entry_usdt": 0.009982,
+      "fee_exit_usdt": 0.009979,
+      "fees_usdt": 0.01996,
+      "net_usdt": -0.02764,
+      "reason_inferred": "otro (manual o mercado)"
+    },
+    "state_after": "borrado",
+    "note": "el neto incluye fees de entrada y salida; el PnL realizado no incluye funding (no se reconstruye desde userTrades)"
+  },
+  "orphan": {
+    "simulated": "posicion LONG 10.0 abierta sin estado",
+    "observed": "HUERFANA: XRPUSDT 10.0 @ 1.2997 sin estado; no se cerro",
+    "policy": "por defecto solo avisa; cerrar exige --close-orphans",
+    "cleanup_order_id": 3529522912
+  },
+  "entering_grace": {
+    "simulated": "estado entering recien escrito con posicion viva",
+    "observed": "EN VUELO: entrada escrita hace 1s; espero (margen 120s)",
+    "why": "evita que el reconciliador borre el estado mientras el router esta entrando",
+    "checks": ["posicion intacta", "estado intacto"]
+  },
+  "findings_fixed_by_this_test": [
+    "router reescribia opened_utc al final, despues del fill: el reconciliador no veia el trade de entrada y contaba solo la fee de salida",
+    "si la entrada era rechazada, la intencion quedaba como 'entering' para siempre; ahora se limpia",
+    "un error de un simbolo tumbaba el ciclo entero del auto-router; ahora se registra y el ciclo continua",
+    "el estado guardaba el stop sin redondear y el exchange lo redondeaba: al recrear se acumulaba un tick; ahora se guarda el trigger real",
+    "el tope MAX_ORDER_NOTIONAL_USD tambien bloqueaba los cierres reduceOnly: una posicion mayor que el tope no se podia aplanar. Ahora el tope solo limita exposicion nueva",
+    "para una entrada tardia el auto-router reanclaba el stop al mark actual (ETH: 2400.22 en vez del nivel del engine 2394.85), cambiando la invalidacion y el riesgo. Ahora usa sig.stop y rechaza si el precio ya lo cruzo"
+  ],
+  "scripts": {
+    "selftest": "python execution/selftest_plumbing.py (requiere ALLOW_ORDERS=1; deja la cuenta plana)",
+    "auto_router": "python execution/auto_router.py [--execute] [--loop]",
+    "reconcile": "python execution/reconcile.py [--execute] [--loop]",
+    "tests": "python -m pytest execution/tests/test_automation_logic.py -q (17 passed)"
+  },
+  "result": "PASS: 24/24 comprobaciones (ruteo, bracket, recreacion de stop, deteccion de cierre, huerfana, entering en vuelo, limpieza)"
+}
+

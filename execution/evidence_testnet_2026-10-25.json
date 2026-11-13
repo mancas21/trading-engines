@@ -1,0 +1,66 @@
+{
+  "what": "prueba de plumbing contra el testnet de Binance USD-M Futures, cuenta propia",
+  "when_utc": "2026-10-25T15:26Z",
+  "host": "https://testnet.binancefuture.com",
+  "symbol": "XRPUSDT",
+  "clock_offset_ms": -207,
+  "spread_at_test_bps": 1.54,
+  "commission_rate_endpoint": {"maker": 0.0002, "taker": 0.0004},
+  "limit_test": {
+    "order_id": 3529495024,
+    "type": "BUY LIMIT GTX (post-only)",
+    "qty": 15.9,
+    "price": 1.2567,
+    "notional_usdt": 19.98,
+    "lifecycle": ["NEW", "CANCELED"],
+    "executed_qty": 0,
+    "position_after": 0,
+    "result": "PASS: firma, filtros (tick 0.0001/step 0.1/minNotional 5), colocacion, query y cancelacion"
+  },
+  "market_roundtrip": {
+    "entry_order_id": 3529495100,
+    "entry": {"side": "BUY", "qty": 15.4, "price": 1.2958, "vs_mid_bps": 0.77, "commission_usdt": 0.00798212, "commission_bps": 4.0},
+    "exit_order_id": 3529495145,
+    "exit": {"side": "SELL", "qty": 15.4, "price": 1.2956, "vs_mid_bps": -0.77, "commission_usdt": 0.00798089, "commission_bps": 4.0, "reduce_only": true, "realized_pnl_usdt": -0.00308},
+    "notional_usdt": 19.95532,
+    "gross_cost_bps": 1.54,
+    "fees_bps_roundtrip": 8.0,
+    "total_cost_bps": 9.54,
+    "net_pnl_usdt": -0.019043,
+    "position_after": 0,
+    "open_orders_after": 0,
+    "result": "PASS: fill, posicion, cierre reduceOnly, cuenta plana"
+  },
+  "conditional_orders_endpoint": {
+    "finding": "el endpoint clasico POST /fapi/v1/order rechaza STOP_MARKET y TAKE_PROFIT_MARKET con HTTP 400 code=-4120 'Order type not supported for this endpoint. Please use the Algo Order API endpoints instead.'",
+    "first_attempt": "entrada 77 XRP @ 1.2988; el stop fue rechazado; el router cerro a mercado en el acto (orderId 3529499678, FILLED, 77.0) y dejo la cuenta plana",
+    "endpoint": "POST /fapi/v1/algoOrder",
+    "required_params": {"algoType": "CONDITIONAL", "triggerPrice": "precio de disparo", "type": "STOP_MARKET|TAKE_PROFIT_MARKET"},
+    "close_position": "closePosition=true no admite quantity ni reduceOnly, y exige posicion abierta (error -4509 si estas plano)",
+    "list": "GET /fapi/v1/openAlgoOrders (no aparecen en /fapi/v1/openOrders)",
+    "field_name": "el tipo viene en 'orderType', no en 'type'; el id en 'algoId'",
+    "cancel": "DELETE /fapi/v1/algoOrder?algoid=..."
+  },
+  "router_bracket": {
+    "signal": {"symbol": "XRPUSDT", "side": "LONG", "stop": 1.276, "take_profit": 1.335, "require_candidate": true},
+    "candidate_gate": "2 admitidos para XRPUSDT, mejor PF 1.83",
+    "sizing": {"equity": 4943.13, "risk_target_pct": 0.5, "binding": "nocional", "qty": 76.9, "notional": 99.96, "risk_usdt": 1.84, "risk_pct": 0.04, "leverage": 5},
+    "entry": {"order_id": 3529501825, "status": "FILLED", "qty": 76.9, "avg": 1.2998, "slippage_bps_vs_mark": -0.72},
+    "stop": {"algo_id": 1000000257290766, "type": "STOP_MARKET", "trigger": 1.276, "closePosition": true, "workingType": "MARK_PRICE", "algoStatus": "NEW"},
+    "take_profit": {"algo_id": 1000000257290782, "type": "TAKE_PROFIT_MARKET", "trigger": 1.335, "algoStatus": "NEW"},
+    "verification": {"position": 76.9, "open_orders": 0, "open_algo_orders": 2, "stops": 1, "tps": 1},
+    "cleanup": {"flatten": "canceladas ambas algo y cierre SELL 76.9 (orderId 3529501998, FILLED)", "final_position": 0, "final_orders": 0, "final_algo": 0},
+    "result": "PASS: una posicion por simbolo, tamano por riesgo con tope, stop y TP vivos en el exchange, cierre limpio"
+  },
+  "caveats": {
+    "testnet_fee_is_not_production": "el testnet cobra 4 pb taker / 2 pb maker en XRPUSDT (commissionRate + userTrades). Produccion USDT-M Regular es 5 pb / 2 pb. El testnet subestima 2 pb por roundtrip: NO sirve para validar el gate de 11 pb, solo el plumbing.",
+    "avg_price_zero": "las respuestas de MARKET del testnet traen avgPrice=0 y a veces cumQuote=0; el precio medio hay que reconstruirlo desde /fapi/v1/userTrades.",
+    "book": "el libro del testnet es propio y mas fino; el spread de 1,54 pb de esta prueba no es el de produccion."
+  },
+  "untouched_preexisting_state": {
+    "HYPEUSDT": {"position_amt": 10.0, "entry": 76.93181596055679, "leverage": 20, "margin": "cross"},
+    "open_order": {"order_id": 888227015, "symbol": "HYPEUSDT", "side": "SELL", "type": "LIMIT", "qty": 1, "price": 77.079, "tif": "GTX"}
+  },
+  "client": "execution/binance_testnet.py + execution/test_order.py",
+  "guard": "ALLOW_ORDERS=1 y dry_run=False; simbolo en ALLOW_SYMBOLS; tope MAX_ORDER_NOTIONAL_USD=100; aborta si el simbolo ya tiene posicion u ordenes"
+}
