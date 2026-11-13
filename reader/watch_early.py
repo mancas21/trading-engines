@@ -352,6 +352,17 @@ def do_status() -> int:
     return 0
 
 
+RETIRO (2026-11-13 — test §5.7 de sección cruzada, pre-registrado)
+====================================================================
+El mecanismo (funding extremo-negativo -> retorno forward) NO sobrevivió
+la validación en sección cruzada (60 perps, n=846 banderas >10x, 355
+episodios, criterios pre-registrados en PROTOCOL-SHADOW-MEASUREMENT.md):
+mediana r24 neta -0.052%, hit 49.5%, IC95 bootstrap [-0.516, +0.322],
+régimen INVERTIDO (deep-drawdown -0.225% vs shallow +0.191%), no robusto
+sin top-4 ni sin par dominante. VEREDICTO: NO VALIDADO -> la capa se
+RETIRA según §6 del protocolo. Los artifacts quedan en
+Temp/cross_section_test.py + xsec_cache/xsec_flags.csv.
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
@@ -367,7 +378,9 @@ def main() -> int:
         return do_measure()
     if a.report:
         return do_report()
-    return do_once(dry=a.dry_run, force=a.force)
+    print("  watch: RETIRADA 2026-11-13 — mecanismo no validado en "
+          "sección cruzada (§5.7); ver docstring. Sin banderas.")
+    return 0
 
 
 if __name__ == "__main__":

@@ -370,3 +370,21 @@ Motor del estudio: scripts temporales sobre data/ de backtest-system
 (solo lectura + fetch de funding/klines que faltaban vía API), CSV de
 banderas en Temp. La capa sigue midiendo en vivo: watch_flags.jsonl +
 --measure/--report siguen siendo el árbitro de si v3 vive o muere.
+
+
+### 10.3 — Test §5.7 de sección cruzada: la capa watch se RETIRA (2026-11-13)
+
+Test pre-registrado (docs/PROTOCOL-SHADOW-MEASUREMENT.md §7, criterios
+declarados antes de ver resultados): mecanismo funding-capitulación en
+sección cruzada de 60 perps por volumen, n=846 banderas >10x, 355 episodios.
+VEREDICTO: NO VALIDADO — 6 de 7 criterios fallan: mediana r24 neta -0.052%,
+hit 49.5%, IC95 bootstrap-fecha [-0.516, +0.322], no robusto sin top-4
+(-0.067) ni sin par dominante (BNBUSDT, +0.032 ≈ cero), y el régimen se
+INVIERTIE: flags en drawdown profundo de BTC rinden -0.225% vs +0.191% en
+drawdown superficial. Los top-8 son micro-caps con recorridos no operables
+(ARIA +667%). La celda verde del 11-pair backtest (56.2%, n=32) no
+sobrevive la sección cruzada — era régimen y concentración, no mecanismo.
+Ejecutado: watch_early.py retirada de producción (no emite banderas;
+artefactos y --measure/--report conservados). El gate NO cambia: sigue
+NEUTRAL salvo evidencia validada, y ahora también la última hipótesis de
+entrada temprana tiene veredicto de retiro.

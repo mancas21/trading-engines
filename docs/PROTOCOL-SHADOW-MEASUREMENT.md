@@ -107,3 +107,17 @@ capa watch.
 **Firma del pre-registro:** este fichero se commitea antes de ejecutar
 cualquier medición de retornos derivada de él. El primer commit que lo
 incluye es la marca temporal.
+
+
+---
+
+## RESULTADO (2026-11-13) — test §7 ejecutado: NO VALIDADO
+
+60 perps por volumen, n=846 banderas LONG funding <= -0.001, 355 episodios.
+Criterios: (1) PASS 355>=50 | (2) FAIL med -0.052% | (3) FAIL hit 49.5% |
+(4) FAIL IC95 [-0.516,+0.322] | (5) gradiente no evaluable (todas las
+banderas >10x por diseño del test) | (6) FAIL robustez (sin top-4 -0.067;
+sin par dominante +0.032) | (7) FAIL régimen INVERTIDO: deep-dd -0.225% vs
+shallow-dd +0.191%. Acción: capa watch RETIRADA (§6). Top-8 flags =
+micro-caps con recorridos no operables (ARIA +667% 24h). Detalle: PLAN.md
+§10.3.
