@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import sys
 import json
 import math
 import os
@@ -105,7 +106,7 @@ def _rules_raw():
         st = rules_path.stat()
         key = (st.st_mtime_ns, st.st_size)
     except OSError as _e:
-        print(f"[verdict] AVISO: rules.json ilegible: {_e}")
+        print(f"[verdict] AVISO: rules.json ilegible: {_e}", file=sys.stderr)
         _RULES_CACHE["key"], _RULES_CACHE["raw"] = None, None
         return None
     if _RULES_CACHE["key"] == key and _RULES_CACHE["raw"] is not None:
@@ -114,7 +115,7 @@ def _rules_raw():
         import json as _json
         raw = _json.loads(rules_path.read_text(encoding="utf-8"))
     except Exception as _e:            # noqa: BLE001
-        print(f"[verdict] AVISO: rules.json corrupto: {_e}")
+        print(f"[verdict] AVISO: rules.json corrupto: {_e}", file=sys.stderr)
         _RULES_CACHE["key"], _RULES_CACHE["raw"] = None, None
         return None
     _RULES_CACHE["key"], _RULES_CACHE["raw"] = key, raw
@@ -132,7 +133,8 @@ def _load_rule_conditions(rule_id: int) -> dict:
                 out["_present"] = True          # la regla EXISTE en el JSON
                 return out
         print(f"[verdict] AVISO: la regla {rule_id} NO existe en rules.json "
-              f"(version {raw.get('version')}). Se usan umbrales por defecto.")
+              f"(version {raw.get('version')}). Se usan umbrales por defecto.",
+              file=sys.stderr)
     # Sin fichero, corrupto o sin esa regla: _present=False y enforcement
     # fail-closed (nunca "hard"). El consumidor distingue "la regla dice que
     # no" de "no hay regla que consultar".
@@ -154,7 +156,7 @@ DOM_SOURCE = "scanner_multi_venue"
 if _R6.get("dom_source") != DOM_SOURCE or _R7.get("dom_source") != DOM_SOURCE:
     print(f"[verdict] AVISO: rules.json declara dom_source="
           f"{_R6.get('dom_source')!r}/{_R7.get('dom_source')!r} y este código "
-          f"solo implementa {DOM_SOURCE!r} — contrato roto, no evaluar en serio.")
+          f"solo implementa {DOM_SOURCE!r} — contrato roto, no evaluar en serio.", file=sys.stderr)
 
 RULE6 = {"streak": int(_R6.get("cvd_consecutive_down_min", 2)),
          "levels_min": int(_R6.get("footprint_levels_min", 4)),
@@ -238,7 +240,7 @@ COND_WINDOW_S = float(_R6.get("condition_window_s", 0) or 0)
 if float(_R7.get("condition_window_s", 0) or 0) != COND_WINDOW_S:
     print(f"[verdict] AVISO: la regla 6 declara condition_window_s="
           f"{COND_WINDOW_S:g} y la 7 {_R7.get('condition_window_s')!r}; "
-          f"se usa la de la 6.")
+          f"se usa la de la 6.", file=sys.stderr)
 
 # ── Condición (c) multi-venue: consenso de libro N-de-M del scanner ─────────
 # La fuente es scanner-engine (poller continuo, 4 venues, UNEVALUABLE declarado
@@ -614,7 +616,8 @@ def condition_window_eval(symbol: str, states: dict, window_s: float,
 #
 # La 1 no tiene codigo propio porque es la condicion (a) de las reglas 6 y 7.
 _IMPLEMENTED = {
-    1: "condicion (a) de las reglas 6 y 7: exige 2+ barras consecutivas",
+    1: "regla de conducta (2+ barras consecutivas); sin puerta direccional "
+       "desde 2026-11-13 (reglas 6/7 retiradas)",
     2: "rule2_exhaustion() sobre los deltas por barra",
     3: "solo puede emitir 'unvalidated' (lineas probability)",
     6: "3 condiciones AND, umbrales de rules.json",
@@ -676,11 +679,11 @@ for _rid, _r in ((6, _R6), (7, _R7)):
         _FP_PCT = float(_v)
     elif float(_v) != _FP_PCT:
         print(f"[verdict] AVISO: regla {_rid} declara {_v}% pero la otra declara "
-              f"{_FP_PCT}%. Se usa {_FP_PCT}%. Las reglas deben coincidir.")
+              f"{_FP_PCT}%. Se usa {_FP_PCT}%. Las reglas deben coincidir.", file=sys.stderr)
 FOOTPRINT_PCT = 70.0 if _FP_PCT is None else _FP_PCT
 if _FP_PCT is None:
     print("[verdict] AVISO: rules.json no declara footprint_sell_pct_min; "
-          "se usa el default 70/30, que puede NO cumplir rules.json.")
+          "se usa el default 70/30, que puede NO cumplir rules.json.", file=sys.stderr)
 
 if not _R6 or not _R7:
     print("[verdict] AVISO: rules.json no leido; se usan umbrales por defecto. "
@@ -1206,149 +1209,29 @@ def build_verdict() -> dict:
     v["cvd_clean"] = (cvd_state.get("continuity") == "clean"
                       and not (cvd_state.get("missing_bars") or 0))
 
-    # REGLA 1 aplicada a la condicion (a): no basta con que haya 2 barras, tienen
-    # que ser CONTIGUAS. Antes solo se comprobaba len(bd) >= 2, que cuenta barras
-    # pero no dice si estan seguidas: un hueco en medio produce una racha de dos
-    # barras que nunca fueron consecutivas.
-    _int_a = cvd_integrity(cvd_state, RULE6["streak"], CVD_INTEGRITY_WINDOW)
-    _int_b = cvd_integrity(cvd_state, RULE7["streak"], CVD_INTEGRITY_WINDOW)
-    v["cvd"]["integrity"] = {"rule6_window": _int_a, "rule7_window": _int_b}
-    v["cvd"]["integrity_ok"] = _int_a["ok"] and _int_b["ok"]
-
-    if not _int_a["ok"]:
-        a6 = "UNEVALUABLE"
-    else:
-        a6 = "UNEVALUABLE" if len(bd) < 2 else ("MET" if dn >= RULE6["streak"] else "FAIL")
-    if not _int_b["ok"]:
-        a7 = "UNEVALUABLE"
-    else:
-        a7 = "UNEVALUABLE" if len(bd) < 2 else ("MET" if up >= RULE7["streak"] else "FAIL")
-    b6 = "MET" if sell_h >= RULE6["levels_min"] else "FAIL"
-    b7 = "MET" if buy_h >= RULE7["levels_min"] else "FAIL"
-    # 2026-10-07 — BUG ARREGLADO: la condicion (c) se evaluaba SOLO con el valor
-    # del EMA. rules.json v3.3 exige ademas `dom_persistence_polls_min: 3` en las
-    # reglas 6 Y 7: el imbalance debe hold 3+ lecturas antes de contar. El puente
-    # ya publicaba ese contador (`imbalance_pct_ema_n`) y el veredicto lo leia para
-    # IMPRIMIRLO, pero no lo usaba para decidir MET/FAIL — es decir, se evaluaba
-    # un gate con menos datos de los que la regla pide.
-    #
-    # Consecuencia real medida: con n=1 la EMA todavia no se ha asentado y su
-    # valor es practicamente el instantaneo. Una regla "hard" evaluada sobre una
-    # muestra unica no es una regla hard.
-    #
-    # Ahora, si no hay 3+ muestras, la condicion es UNEVALUABLE — igual que ya
-    # se hacia cuando el EMA era None. Y como las reglas son AND estricto,
-    # UNEVALUABLE hace que la regla entera NO se cumpla: neutral, no direccion.
-    # ── Condición (c): consenso de libro multi-venue (Fix 2-A) ──
-    # ANTES: imbalance_pct_ema del libro Binance WS — std 7.5, el gate cambiaba
-    # de estado 19-23 veces/día. AHORA: N venues del scanner fuera de banda,
-    # sostenido P lecturas. La EMA se SIGUE PUBLICANDO como contexto (v["dom"])
-    # pero ya no decide nada — un número que se muestra y un número que gatean
-    # dejan de ser el mismo por accidente.
-    gate = dom_vac_eval(v["symbol"], observe=False)   # la observación es del
-    c6 = gate[RULE6_SIDE]["state"]                    # grabador, no de aquí
-    c7 = gate[RULE7_SIDE]["state"]
-
-    # Ventana de persistencia: (a), (b) y (c) deben coincidir DENTRO de la
-    # ventana, no en el mismo tick de 30 s. Ver condition_window_eval().
-    # observe=False: el grabador es quien anota; aquí solo se lee.
-    _eff = condition_window_eval(
-        v["symbol"],
-        {k: s for k, s in zip(_COND_KEYS, (a6, b6, c6, a7, b7, c7))},
-        COND_WINDOW_S, observe=False)
-    a6, b6, c6 = _eff["r6_a"], _eff["r6_b"], _eff["r6_c"]
-    a7, b7, c7 = _eff["r7_a"], _eff["r7_b"], _eff["r7_c"]
-
-    v["persistence"] = {
-        "window_s": COND_WINDOW_S,
-        "note": ("las condiciones valen MET si lo estuvieron en los ultimos "
-                 f"{COND_WINDOW_S:g}s; la ventana NO anade evidencia, solo deja "
-                 "de descartar la que ya habia"),
-    }
-
-    # Estructura del chart (TradingView). CONTEXTO, NO señal: no entra en el
-    # sesgo. Existe para que el silencio sea auditable. Import perezoso y
-    # protegido: la puerta tiene que seguir funcionando aunque live_reader o el
-    # chart no esten.
-    try:
-        import live_reader as _lr
-        v["structure"] = _lr.structure_block()
-    except Exception as _e:                             # noqa: BLE001
-        v["structure"] = {"ok": False,
-                          "error": f"{type(_e).__name__}: {str(_e)[:60]}",
-                          "validated": False}
-
-    v["dom_vac"] = {
-        "symbol": v["symbol"],
-        # Cada lado con LOS SUYOS: antes ambos reportaban los de la regla 7
-        # mientras las claves de conditions (mas abajo) citaban los de la 6.
-        # Coincidian solo porque rules.json hoy pone lo mismo en las dos.
-        "thr": {"sell": RULE6["vac_thr"], "buy": RULE7["vac_thr"]},
-        "z": {"sell": RULE6["vac_z"], "buy": RULE7["vac_z"]},
-        "venues_min": {"sell": RULE6["vac_venues"], "buy": RULE7["vac_venues"]},
-        "polls_min": {"sell": RULE6["vac_polls"], "buy": RULE7["vac_polls"]},
-        "buy": gate["buy"], "sell": gate["sell"],
-        "detail": gate.get("detail", ""),
-    }
-
-    r6 = [a6, b6, c6]
-    r7 = [a7, b7, c7]
-    r6_met = all(x == "MET" for x in r6)
-    r7_met = all(x == "MET" for x in r7)
-    unev = [x for x in (r6 + r7) if x == "UNEVALUABLE"]
-
-    v["rule6"] = {
-        "conditions": {"a_cvd_down_2plus": a6,
-                       f"b_footprint_{RULE6['levels_min']}_sell_heavy": b6,
-                       f"c_vac_sell_{RULE6['vac_venues']}deM_z{RULE6['vac_z']:g}": c6},
-        "met": r6_met}
-    v["rule7"] = {
-        "conditions": {"a_cvd_up_2plus": a7,
-                       f"b_footprint_{RULE7['levels_min']}_buy_heavy": b7,
-                       f"c_vac_buy_{RULE7['vac_venues']}deM_z{RULE7['vac_z']:g}": c7},
-        "met": r7_met}
-
-    # ── Regla 5: No Pattern Anchoring ──
-    # Validation: verify the verdict does not reference prior bar patterns as evidence.
-    # The engine uses only current bar footprint, DOM, CVD, and tape — no lagged patterns.
-    # HONESTO (2026-10-11 audit): None, no True. Un flag que no puede fallar no
-    # es un control — era True por construccion mientras la cobertura de reglas
-    # declara la 5 como "no comprobable por codigo". Lo que SI es cierto: las
-    # entradas del veredicto son solo de la barra/lectura actual (arquitectura),
-    # y eso se dice como tal en vez de simularse como chequeo pasado.
-    v["rule5"] = {
-        "anchoring_ok": None,       # no computable; ver _rule_coverage()
-        "note": "Regla de conducta: no verificable por codigo. Cubierta por "
-                "diseno — las entradas del veredicto son solo la lectura actual "
-                "(footprint/DOM/CVD/tape de esta barra); ningun estado de "
-                "analisis anterior entra como evidencia."
-    }
-
-    # ── El sesgo viene de la PUERTA ──
-    # T5 (auditoria 2026-11-12) — motivo unico de cuarentena de la Regla 6,
-    # idéntico en rules.json, comentario y nota publicada:
-    #   "Desactivada por falta de evidencia utilizable para el gate
-    #   multi-venue vigente. La evidencia disponible (161 disparos = 32
-    #   barras = 9 eventos, n_eff ≈ 1.8, t = +0.34) es del gate anterior y no
-    #   distingue la regla de la deriva del mercado. No es evidencia de
-    #   ausencia de edge."
-    # Volver a "hard" exige n_eff >= min_n sobre el gate MULTI-VENUE y superar
-    # el placebo en walk-forward out-of-sample.
-    r6_enforcement = _rule_enforcement(6)
-    # T1 (auditoria 2026-11-12): sin rules.json legible, NINGUNA puerta
-    # direccional puede abrirse — bias UNAVAILABLE con motivo, nunca
-    # BULLISH/BEARISH con umbrales por defecto. BEARISH exige enforcement
-    # EXACTAMENTE "hard" (unavailable/unrecognized no deciden).
-    if not _R7.get("_present", False):
-        bias = "UNAVAILABLE"
-        unev = unev + ["rules.json_unavailable: umbrales de la Regla 7 ausentes"]
-    elif r7_met:
-        bias = "BULLISH"
-    elif r6_met and r6_enforcement == "hard":
-        bias = "BEARISH"
-    else:
-        bias = "NEUTRAL"
-    v["rule6"]["enforcement"] = r6_enforcement
+    # ── REGLAS 6/7 RETIRADAS (2026-11-13) ──
+    # Decisión del usuario tras la auditoría (T1-T7 ejecutados; cero
+    # reglas direccionales con edge medido en toda la historia del
+    # sistema; el gate disparó 4 veces desde mid-Oct, todas tarde y sin
+    # edge) y el veredicto §5.7 del protocolo pre-registrado contra la
+    # última hipótesis de entrada temprana (sección cruzada: 6/7
+    # criterios fallaron, régimen invertido). Las reglas 6 y 7 ya NO
+    # EXISTEN en rules.json v3.5.0. El bias es NEUTRAL POR CONSTRUCCIÓN:
+    # no hay puerta direccional que pueda abrirse. La telemetría
+    # multi-venue (dom_vac raw/counts) se conserva como contexto; el
+    # ledger mantiene las columnas r6_*/r7_* con estado "RETIRED".
+    r6 = ["RETIRED"] * 3
+    r7 = ["RETIRED"] * 3
+    r6_met = r7_met = False
+    unev = []
+    v["rule6"] = {"retired": True,
+                  "note": "Regla 6 eliminada 2026-11-13 (PLAN §11)"}
+    v["rule7"] = {"retired": True,
+                  "note": "Regla 7 eliminada 2026-11-13 (PLAN §11)"}
+    v["gate"] = "RETIRED"
+    bias = "NEUTRAL"
+    v["rule6"]["enforcement"] = "retired"
+    v["rule7"]["enforcement"] = "retired"
     v["rule6"]["counts_toward_bias"] = (r6_enforcement == "hard")
     if r6_met and r6_enforcement == "disabled":
         v["rule6"]["note"] = (

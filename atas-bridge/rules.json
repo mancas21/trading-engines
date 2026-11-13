@@ -42,65 +42,6 @@
       "enforcement": "hard"
     },
     {
-      "id": 6,
-      "title": "Distribution Threshold",
-      "description": "ALL required: (a) CVD drops 2+ consecutive bars AND (b) footprint shows 4+ levels with >=65% bid-side selling AND (c) multi-venue book consensus: 3+ venues with top-5 book loaded on the SELL side beyond band 0.25, held 2+ reader polls (scanner_multi_venue). Only then output bearish bias. NOTE: umbrales alineados con conditions{} el 2026-10-12; antes decian 70% y +5%. NOTE 2026-11-12 (auditoria, T4): (1) la decision usa SOLO z >= dom_vac_z_min por venue (calibrada); la banda dom_vac_thr 0.25 es INFORMATIVA, no decide. (2) VETO: si alguna venue vota al lado contrario (|z| >= 1), el estado es SPLIT y la puerta no abre. (3) Los niveles thin (bid==0 o ask==0, 100% por construccion) CUENTAN en (b) — no hay volumen minimo por nivel. (4) La ventana de 60s NO eleva SPLIT a MET (T4: 'SPLIT no abre la puerta' es literal).",
-      "enforcement": "disabled",
-      "disabled_reason": "Desactivada por falta de evidencia utilizable para el gate multi-venue vigente. La evidencia disponible (161 disparos = 32 barras = 9 eventos, n_eff ~1.8, t = +0.34) es del gate anterior y no distingue la regla de la deriva del mercado. No es evidencia de ausencia de edge. Reactivar exige n_eff >= min_n sobre el gate MULTI-VENUE y superar el placebo en walk-forward out-of-sample.",
-      "conditions": {
-        "cvd_consecutive_down_min": 2,
-        "footprint_levels_min": 4,
-        "footprint_sell_pct_min": 65,
-        "dom_source": "scanner_multi_venue",
-        "dom_vac_venues_min": 3,
-        "dom_vac_polls_min": 2,
-        "dom_vac_thr": 0.25,
-        "condition_window_s": 60,
-        "condition_window_note": "2026-10-15. Las condiciones (a)/(b)/(c) deben coincidir DENTRO de esta ventana, no en la misma lectura de 30s del reader. MEDIDO durante el rally de JUP (08:54 0.2903 -> 10:17 0.3151, +8.55%): el motor emitio 86 NEUTRAL y 1 solo BULLISH, a las 10:06 con el rally ya hecho. No faltaba evidencia -- (a) estuvo MET 34 veces, (b) 41 y (c) 10 en esa ventana -- pero exigirlas en el MISMO tick descartaba los near-miss: a las 09:37 (a)=MET (b)=MET (c)=FAIL, y (c) habia estado MET a las 09:35. Con 60s el primer disparo es 09:35 @ 0.3022 (31 min antes, +4.3% de recorrido por delante en vez de +1.2%). El valor NO esta optimizado: la hora del primer disparo es IDENTICA a 60/180/300/600s, o sea 60s es la intervencion minima suficiente, no un ajuste fino. La ventana NO anade evidencia, solo deja de descartar la que ya habia, y nunca eleva un UNEVALUABLE. NO VALIDADO COMO EDGE: que dispare antes esta medido; que esos disparos ganen NO, y no se puede medir con 209h de registro al 13% de cobertura (~35 observaciones independientes a 60 min).",
-        "dom_vac_z_min": 1.0,
-        "condition_c_note": "2026-10-15 — CONSENSO NORMALIZADO POR VENUE. Antes la (c) comparaba book_imb_5 de cada venue contra un umbral ABSOLUTO (0.25). Medido sobre la muestra historica de reader.db, eso media 'que venue vive fuera de su propia banda', no acuerdo: okx tiene media -0.199 y cruza +0.25 solo el 1.5% de las veces (por estructura no puede votar compra), kraken tiene std 0.499 y cruza el umbral el 42% con puro ruido. Ahora cada venue se compara contra SU propia media/std (dom_vac_calibration.json, generado por reader/build_dom_vac_calibration.py) y un voto significa z>=dom_vac_z_min. Selectividad conservada: 6.0% de ciclos con consenso antes, 5.7% ahora. Si falta la calibracion o un venue no esta calibrado, la condicion es UNEVALUABLE — no se vuelve al umbral absoluto en silencio. Ademas existe el estado SPLIT: si hay venues votando a ambos lados el consenso se declara NO INTERPRETABLE en vez de FAIL, que antes era indistinguible de 'no hay senal' (27.8% de ciclos medidos)."
-      },
-      "condition_c_note": "2026-10-11 Fix 2-A (docs/FIXES-gate-DOM.md): la condicion (c) deja de leer imbalance_pct_ema (libro Binance WS top-15, std 7.5, 19-23 cambios de estado/dia) y pasa a consenso multi-venue del scanner: N venues con book_imb_5 del lado sell mas alla de la banda, sostenido dom_vac_polls_min lecturas del reader. polls = lecturas del reader (~30s), no ciclos del scanner. UNEVALUABLE si el scanner no responde o hay menos de dom_vac_venues_min venues vivos.",
-      "dom_vac_calibration": {
-        "date": "2026-10-11",
-        "sample": "50 ciclos del scanner (~10 min), 8 pares x ~4 venues = 1470 valores de book_imb_5; 49 ciclos de XRP para la simulacion de estados",
-        "method": "thr al p58 de |imb5| (excursion por venue 61%); el touch de mejor nivel se DESCARTO como base del consenso: medido, es estructuralmente unilateral (mediana |x-0.5|=0.275) y desacoplado entre venues (consenso 3-de-4 en 0 de 480 ciclos)",
-        "consensus_freq": "3+/mismo lado en 19.1% de ciclos-pair a thr 0.25 (pooled)",
-        "simulated": "0 transiciones MET<->no-MET de la puerta en los 10 min muestreados, en TODO el rango de umbrales probados (el churn del gate viejo era entre estados no-MET)",
-        "acceptance_bar": "PRE-REGISTRADO (doc §7.1, antes de medir): N=10 transiciones MET<->no-MET por dia en r7_c/r6_c de reader.db. Verificar manana con: SELECT y contar cambios de estado; si N>10, el gate sigue sin servir y se vuelve a disenar",
-        "pending": "re-calibrar a 7 dias de datos cuando el ledger acumule"
-      }
-    },
-    {
-      "id": 7,
-      "title": "Accumulation Threshold",
-      "description": "ALL required: (a) CVD rises 2+ consecutive bars AND (b) footprint shows 3+ levels with >=65% ask-side buying AND (c) multi-venue book consensus: 3+ venues with top-5 book loaded on the BUY side beyond band 0.25, held 2+ reader polls (scanner_multi_venue). Only then output bullish bias. NOTE: umbrales alineados con conditions{} el 2026-10-12; antes decian 70% y +10%. NOTE 2026-11-12 (auditoria, T4): (1) la decision usa SOLO z >= dom_vac_z_min por venue (calibrada); la banda dom_vac_thr 0.25 es INFORMATIVA, no decide. (2) VETO: si alguna venue vota al lado contrario (|z| >= 1), el estado es SPLIT y la puerta no abre. (3) Los niveles thin (bid==0 o ask==0, 100% por construccion) CUENTAN en (b) — no hay volumen minimo por nivel. (4) La ventana de 60s NO eleva SPLIT a MET (T4: 'SPLIT no abre la puerta' es literal).",
-      "enforcement": "hard",
-      "conditions": {
-        "cvd_consecutive_up_min": 2,
-        "footprint_levels_min": 3,
-        "footprint_buy_pct_min": 65,
-        "dom_source": "scanner_multi_venue",
-        "dom_vac_venues_min": 3,
-        "dom_vac_polls_min": 2,
-        "dom_vac_thr": 0.25,
-        "condition_window_s": 60,
-        "condition_window_note": "2026-10-15. Las condiciones (a)/(b)/(c) deben coincidir DENTRO de esta ventana, no en la misma lectura de 30s del reader. MEDIDO durante el rally de JUP (08:54 0.2903 -> 10:17 0.3151, +8.55%): el motor emitio 86 NEUTRAL y 1 solo BULLISH, a las 10:06 con el rally ya hecho. No faltaba evidencia -- (a) estuvo MET 34 veces, (b) 41 y (c) 10 en esa ventana -- pero exigirlas en el MISMO tick descartaba los near-miss: a las 09:37 (a)=MET (b)=MET (c)=FAIL, y (c) habia estado MET a las 09:35. Con 60s el primer disparo es 09:35 @ 0.3022 (31 min antes, +4.3% de recorrido por delante en vez de +1.2%). El valor NO esta optimizado: la hora del primer disparo es IDENTICA a 60/180/300/600s, o sea 60s es la intervencion minima suficiente, no un ajuste fino. La ventana NO anade evidencia, solo deja de descartar la que ya habia, y nunca eleva un UNEVALUABLE. NO VALIDADO COMO EDGE: que dispare antes esta medido; que esos disparos ganen NO, y no se puede medir con 209h de registro al 13% de cobertura (~35 observaciones independientes a 60 min).",
-        "dom_vac_z_min": 1.0,
-        "condition_c_note": "2026-10-15 — CONSENSO NORMALIZADO POR VENUE. Antes la (c) comparaba book_imb_5 de cada venue contra un umbral ABSOLUTO (0.25). Medido sobre la muestra historica de reader.db, eso media 'que venue vive fuera de su propia banda', no acuerdo: okx tiene media -0.199 y cruza +0.25 solo el 1.5% de las veces (por estructura no puede votar compra), kraken tiene std 0.499 y cruza el umbral el 42% con puro ruido. Ahora cada venue se compara contra SU propia media/std (dom_vac_calibration.json, generado por reader/build_dom_vac_calibration.py) y un voto significa z>=dom_vac_z_min. Selectividad conservada: 6.0% de ciclos con consenso antes, 5.7% ahora. Si falta la calibracion o un venue no esta calibrado, la condicion es UNEVALUABLE — no se vuelve al umbral absoluto en silencio. Ademas existe el estado SPLIT: si hay venues votando a ambos lados el consenso se declara NO INTERPRETABLE en vez de FAIL, que antes era indistinguible de 'no hay senal' (27.8% de ciclos medidos)."
-      },
-      "condition_c_note": "2026-10-11 Fix 2-A (docs/FIXES-gate-DOM.md): la condicion (c) deja de leer imbalance_pct_ema (libro Binance WS top-15, std 7.5, 19-23 cambios de estado/dia) y pasa a consenso multi-venue del scanner: N venues con book_imb_5 del lado buy mas alla de la banda, sostenido dom_vac_polls_min lecturas del reader. polls = lecturas del reader (~30s), no ciclos del scanner. UNEVALUABLE si el scanner no responde o hay menos de dom_vac_venues_min venues vivos.",
-      "dom_vac_calibration": {
-        "date": "2026-10-11",
-        "sample": "50 ciclos del scanner (~10 min), 8 pares x ~4 venues = 1470 valores de book_imb_5; 49 ciclos de XRP para la simulacion de estados",
-        "method": "thr al p58 de |imb5| (excursion por venue 61%); el touch de mejor nivel se DESCARTO como base del consenso: medido, es estructuralmente unilateral (mediana |x-0.5|=0.275) y desacoplado entre venues (consenso 3-de-4 en 0 de 480 ciclos)",
-        "consensus_freq": "3+/mismo lado en 19.1% de ciclos-pair a thr 0.25 (pooled)",
-        "simulated": "0 transiciones MET<->no-MET de la puerta en los 10 min muestreados, en TODO el rango de umbrales probados (el churn del gate viejo era entre estados no-MET)",
-        "acceptance_bar": "PRE-REGISTRADO (doc §7.1, antes de medir): N=10 transiciones MET<->no-MET por dia en r7_c/r6_c de reader.db. Verificar manana con: SELECT y contar cambios de estado; si N>10, el gate sigue sin servir y se vuelve a disenar",
-        "pending": "re-calibrar a 7 dias de datos cuando el ledger acumule"
-      }
-    },
-    {
       "id": 8,
       "title": "Audit On Loss",
       "description": "After a call that fails (price moves against by more than conditions.loss_pct within 2 bars), record loss with root cause at START of next analysis. El fichero es reader/audit_losses.jsonl (una linea JSON por perdida, append; ver verdict.py _audit_record_loss). NOTE 2026-10-15: decia 'audit.log.json', que es el fichero de un subsistema /calls ya BORRADO — verdict.py corrigio la ruta el 2026-10-07 y la declara ahora aqui.",
@@ -137,8 +78,8 @@
     "funding_crowding": 1.5,
     "ls_ratio_crowding": 1.5
   },
-  "version": "3.4.2",
-  "changelog": "3.4.1 (2026-10-07): Parameter adjustments for Rules 2, 6, 7. spike_multiple 2.0->1.5, dom_imbalance_max 5->3, dom_imbalance_min 10->8, footprint thresholds 70->65, dom_persistence_polls_min 3->2. Enhanced sensitivity without changing rule structure. | 3.4.2 (2026-11-12, auditoria): descripciones 6/7 alineadas con el codigo (z-only decide, veto SPLIT, thin levels cuentan, ventana no eleva SPLIT); motivo unico de cuarentena de la Regla 6; scorecard sin sobrestimar; regla 6 sigue disabled. Cambios de codigo en verdict.py: fail-closed del enforcement (T1), caducidad de racha en lectura (T2), rules_hash/git_sha por veredicto (T6).",
+  "version": "3.5.0",
+  "changelog": "3.4.1 (2026-10-07): Parameter adjustments for Rules 2, 6, 7. spike_multiple 2.0->1.5, dom_imbalance_max 5->3, dom_imbalance_min 10->8, footprint thresholds 70->65, dom_persistence_polls_min 3->2. Enhanced sensitivity without changing rule structure. | 3.4.2 (2026-11-12, auditoria): descripciones 6/7 alineadas con el codigo (z-only decide, veto SPLIT, thin levels cuentan, ventana no eleva SPLIT); motivo unico de cuarentena de la Regla 6; scorecard sin sobrestimar; regla 6 sigue disabled. Cambios de codigo en verdict.py: fail-closed del enforcement (T1), caducidad de racha en lectura (T2), rules_hash/git_sha por veredicto (T6). | 3.5.0 (2026-11-13): Reglas 6 y 7 ELIMINADAS — decision del usuario tras la auditoria T1-T7 (cero reglas direccionales con edge medido; el gate disparo 4 veces desde mid-Oct, todas tarde y sin edge; el test §5.7 pre-registrado retiro la ultima hipotesis de entrada temprana, 6/7 criterios fallaron). bias = NEUTRAL por construccion. Las columnas r6_*/r7_* del ledger conservan estado 'RETIRED' para continuidad historica.",
   "namespace": "atas",
   "namespace_note": "Namespace de reglas. EXISTEN DOS rules.json EN ESTE REPO con IDs numericos que se solapan (atas-bridge: reglas 1-8 de CVD/footprint/DOM; scanner-engine: reglas 1-4 de flujo cross-venue). Citar una regla sin su namespace es citar el numero equivocado. Ver docs/FIXES-gate-DOM.md Fix 4."
 }

@@ -47,10 +47,20 @@ def test_t1_fail_closed(content, tmp_path, monkeypatch):
 
 
 def test_t1_valid_file_still_hard():
-    """El fichero real (presente) sigue dando 'hard' para la 7."""
+    """El fichero real (presente) sigue dando 'hard' para la 2 (regla viva)."""
     v = _reload_module()
-    assert v._rule_enforcement(7) == "hard"
-    assert v._R7.get("_present") is True
+    assert v._rule_enforcement(2) == "hard"
+    assert v._R2.get("_present") is True
+
+
+def test_rules67_retired():
+    """Reglas 6/7 eliminadas 2026-11-13: no existen, enforcement
+    'unavailable', y la puerta no puede publicar direccional."""
+    v = _reload_module()
+    for rid in (6, 7):
+        assert v._rule_enforcement(rid) == "unavailable"
+        assert v._load_rule_conditions(rid).get("_present") is False
+    assert v.RULE7.get("enforcement") in ("unavailable", "retired", None)
 
 
 # ---------- T2: caducidad en la lectura de racha ----------

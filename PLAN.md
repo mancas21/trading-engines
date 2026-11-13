@@ -388,3 +388,25 @@ Ejecutado: watch_early.py retirada de producción (no emite banderas;
 artefactos y --measure/--report conservados). El gate NO cambia: sigue
 NEUTRAL salvo evidencia validada, y ahora también la última hipótesis de
 entrada temprana tiene veredicto de retiro.
+
+## 11. Reglas 6 y 7 ELIMINADAS (2026-11-13) — bias NEUTRAL por construcción
+
+Decisión del usuario tras la auditoría externa (T1-T7 ejecutados) y el
+veredicto §5.7: cero reglas direccionales con edge medido en TODA la historia
+del sistema; el gate disparó 4 veces desde mid-Oct (XRP/JUP/HYPE/ARB, todas
+tarde y sin edge) y la 5ª (BTC 19-oct) nunca llegó a Telegram (defecto del
+notificador con cambios <60s — pendiente fix). Ejecutado:
+
+- rules.json v3.5.0: entradas 6 y 7 ELIMINADAS. Columnas r6_*/r7_* del ledger
+  conservadas con estado "RETIRED" (continuidad histórica, esquema intacto).
+- verdict.py: la puerta direccional es un stub retirado — bias = NEUTRAL por
+  construcción (no hay código que pueda publicar BULLISH/BEARISH). La
+  telemetría multi-venue (dom_vac raw/counts) se conserva como contexto.
+- verdict_recorder.py: ya no tickea el gate ni la ventana (la maquinaria
+  dom_gate_state/condition_window_state queda congelada como histórico).
+- Avisos de rules.json a stderr (el stdout de --json vuelve a ser JSON puro).
+- test_contract_json_matches_code invertido: ahora DETIENE cualquier
+  reintroducción de las reglas 6/7 sin el protocolo §5 superado. 28 tests OK.
+
+Pendiente: fix del notificador (<60s), D4 (calibración por venue-par), y la
+medición shadow §5 en el tiempo si el usuario quiere medir algo nuevo.

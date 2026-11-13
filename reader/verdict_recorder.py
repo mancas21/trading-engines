@@ -307,46 +307,13 @@ def read_live():
     # decision — la clase de fallo que este propio modulo documenta en su
     # docstring como ya ocurrida con los umbrales. Encima, esa muestra
     # inflaba rule6_fired_resolved y toda la medicion de la regla 6.
-    int_a = verdict.cvd_integrity(cvd_state, verdict.RULE6["streak"],
-                                  verdict.CVD_INTEGRITY_WINDOW)
-    int_b = verdict.cvd_integrity(cvd_state, verdict.RULE7["streak"],
-                                  verdict.CVD_INTEGRITY_WINDOW)
-    if not int_a["ok"]:
-        cond_a6 = "UNEVALUABLE"
-    else:
-        cond_a6 = ("UNEVALUABLE" if len(bd) < 2 else
-                   ("MET" if dn >= verdict.RULE6["streak"] else "FAIL"))
-    if not int_b["ok"]:
-        cond_a7 = "UNEVALUABLE"
-    else:
-        cond_a7 = ("UNEVALUABLE" if len(bd) < 2 else
-                   ("MET" if up >= verdict.RULE7["streak"] else "FAIL"))
-
-    cond_b6 = "MET" if sell_h >= verdict.RULE6["levels_min"] else "FAIL"
-    cond_b7 = "MET" if buy_h >= verdict.RULE7["levels_min"] else "FAIL"
-
-    # (c) multi-venue: LA MISMA funcion que evalua la puerta (verdict.py).
-    # Cada lectura del grabador es un ciclo del gate — ver verdict.dom_vac_eval.
-    _gate = verdict.dom_vac_eval(str(i.get("ticker")).upper())
-    cond_c6 = _gate["sell"]["state"]     # distribucion = lado vendedor del libro
-    cond_c7 = _gate["buy"]["state"]      # acumulacion = lado comprador del libro
-
-    # 2026-10-15 — VENTANA DE PERSISTENCIA (rules.json -> condition_window_s).
-    # El grabador es el OBSERVADOR: es SU lectura del ciclo la que se anota, y
-    # la puerta solo lee. Contar la misma lectura dos veces por ciclo es el
-    # fallo que ya se arreglo en la condicion (c).
-    _eff = verdict.condition_window_eval(
-        str(i.get("ticker")).upper(),
-        {"r6_a": cond_a6, "r6_b": cond_b6, "r6_c": cond_c6,
-         "r7_a": cond_a7, "r7_b": cond_b7, "r7_c": cond_c7},
-        verdict.COND_WINDOW_S, observe=True)
-    cond_a6, cond_b6, cond_c6 = _eff["r6_a"], _eff["r6_b"], _eff["r6_c"]
-    cond_a7, cond_b7, cond_c7 = _eff["r7_a"], _eff["r7_b"], _eff["r7_c"]
-
-    r6 = [cond_a6, cond_b6, cond_c6]
-    r7 = [cond_a7, cond_b7, cond_c7]
-    r6_ok = all(x == "MET" for x in r6)
-    r7_ok = all(x == "MET" for x in r7)
+    # REGLAS 6/7 RETIRADAS (2026-11-13): decisión del usuario tras la auditoría. Las
+    # columnas del ledger se conservan con estado "RETIRED" para no
+    # romper el esquema ni la continuidad histórica. El dom_vac_eval ya
+    # NO se tickea: la maquinaria del gate está retirada.
+    cond_a6 = cond_b6 = cond_c6 = "RETIRED"
+    cond_a7 = cond_b7 = cond_c7 = "RETIRED"
+    r6_ok = r7_ok = False
 
     # El sesgo viene de la PUERTA, y la puerta respeta `enforcement`.
     #
