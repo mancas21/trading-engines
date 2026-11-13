@@ -358,3 +358,5 @@ and `/cvd` publishes `warmup` / `segment_reason` so this is visible.
 (US-equities only, 0/7 crypto coverage). Polymarket fallback repointed to a live
 endpoint; macro pipeline DNS failures fixed via ThreadedResolver.
 
+
+<!-- git-sync-watchdog-selftest -->
