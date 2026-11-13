@@ -117,3 +117,4 @@ reader/reader.db.*
 quant-alert-engine/card_live/raw/
 .hermes/
 .zcode/
+.git_sync_watchdog_pause
