@@ -103,3 +103,17 @@ reader/_diag_rule8.py
 # llama a scorecard() y la carga de _CAL es codigo muerto.
 reader/scorecard_calibration.json
 reader/tv_structure_cache.json
+
+# 2026-11-12 - estado de runtime y carpetas de herramientas ajenas al repo.
+# Anadidos al revisar el estado tras 2 meses sin push: el arbol sin versionar
+# traia locks, estados de runtime y planes de otras herramientas.
+# OJO: un patron con barra interior esta ANCLADO al directorio del .gitignore,
+# asi que 'card_live/raw/' NO cubria 'quant-alert-engine/card_live/raw/'.
+# Para rutas anidadas hace falta la ruta completa o '**/'.
+execution/state/
+reader/phase_state.json
+reader/watch_state.json
+reader/reader.db.*
+quant-alert-engine/card_live/raw/
+.hermes/
+.zcode/

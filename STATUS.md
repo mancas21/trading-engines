@@ -5,6 +5,111 @@ SQLite corpus (`quant-alert-engine/data/alerts.db`) unless stated otherwise.
 
 ---
 
+## 2026-11-06 — Criba prompts100 acelerada x8 (señal una vez, caché feather, pool) — resultados idénticos bit a bit
+
+`backtest_prompts100/` fast pass (decisión conjunta con backtest-system:
+*idea → veredicto validado* en unos treinta minutos, motores y convenciones
+intactos):
+
+- `run_all.py`: `run_one` construye la señal UNA vez y la puntúa a 11 y 22 bps
+  (antes re-ejecutaba todo el stack de indicadores por coste); `--workers N`
+  lanza las estrategias en pool reordenando a orden STRATS (CSV idéntico);
+  `--eq oos` (por defecto) guarda solo el tramo OOS de cada curva en
+  `eqs.npy` — `make_charts10.py` necesita curvas completas: regenerar con
+  `--eq full --solo <nums>`.
+- `btlib.py`: caché feather en `data/_csv_cache` (clave nombre+mtime_ns+tamaño
+  de cada CSV fuente; el frame cacheado es el parse crudo, el post-proceso
+  dtype/astype/dedupe/sort corre en ambos caminos → DataFrame bit-idéntico).
+  backtest-system/data sigue read-only.
+- Indicadores vectorizados con verificación de igualdad EXACTA contra las
+  versiones de bucle en BTCUSDT 1h y SOLUSDT 5m: aroon (argmax de ventana
+  invertida), percentrank y el streak/percentrank de connors_rsi — incluida
+  la regla NaN de pandas (ventana con NaN → NaN; descubierta porque la
+  primera versión falló la igualdad y la prueba la cazó). wma/hma/kama/
+  supertrend/psar quedan en bucle: una estrategia cada uno y el orden de
+  suma flotante no es demostrablemente idéntico.
+- Igualdad old-vs-new por cada camino de código (signal, tuple, flip, xs,
+  funding): cero diferencias. Pantalla completa (doscientas corridas): 39 s
+  frente a 5 min 08 s; el DataFrame de 200 filas es idéntico entre la
+  corrida pre y post vectorización del mismo día.
+- El enlace con backtest-system no cambia (solo lectura); su capa de
+  validación ganó cortes de datos y `bt.py` — ver
+  `docs/BACKTEST-SYSTEM-LINK.md` sección ocho.
+
+---
+
+## 2026-10-29 — Segunda pata de ejecución: Alpaca (acciones US) vía CLI
+
+El `execution/` deja de ser solo Binance: hay un cliente de Alpaca orquestando
+su CLI oficial (`alpaca.exe`, v0.0.15, instalado y autenticado ese día). La
+cuenta es **paper** (PA3KTTITR0AF, $100k, opciones nivel 3, crypto activo).
+Las claves NO van en el `.env`: la autenticación vive en el perfil del CLI
+(`alpaca profile login`).
+
+| pieza | estado |
+|---|---|
+| `execution/alpaca_broker.py` | cliente: localiza el binario, envuelve el CLI en JSON, lista blanca `ALLOW_ALPACA_SYMBOLS`, tope `MAX_ALPACA_NOTIONAL_USD`, dry-run por defecto + gate `ALLOW_ALPACA_ORDERS`, log `logs/alpaca_orders.jsonl` |
+| `execution/alpaca_check.py` | chequeo solo lectura con los códigos 0/2/3/4 de `check_testnet.py` |
+| `execution/alpaca_router.py` | señal → bracket protegido: mismas decisiones del operador (una posición por símbolo, sizing por riesgo, stop en el exchange) |
+| `execution/tests/test_alpaca_broker.py` | 22 tests offline de la política (dry-run gate, whitelist, sizing, lados del stop, envelope de error del CLI) |
+
+Evidencia: 22/22 tests (`python -m pytest execution/tests/test_alpaca_broker.py -q`)
+y chequeo vivo solo-lectura de `alpaca_check.py` (exit 0: clock, asset, cuenta,
+posiciones, bracket en seco como `not_sent`). El router en modo plan contra la
+cuenta real produce el PLAN con sizing correcto (0.5% riesgo → tope de nocional
+manda con shares enteras → AVISO de riesgo por debajo del objetivo).
+
+Diferencias declaradas con la pata crypto: bracket **atómico** de Alpaca
+(entrada+stop+TP juntos, verificación pos-fill igual), **shares enteras**
+(brackets fraccionales fuera), caja sin apalancamiento (`cash`, no
+`buying_power`), **mercado cerrado no entra** (órdenes `day` en cola llenarían
+con el stop de hoy), sin `--require-candidate` (no hay gate de backtest para
+acciones US: quien ejecuta responde de la señal) y sin `state/positions.json`
+(el reconciliador crypto no debe ver AAPL; trazabilidad en
+`logs/alpaca_router.jsonl`).
+
+Límite que no se disimula: **paper no prueba costes ni fills reales**, y no hay
+señal con evidencia para acciones US en este repo — esto es plumbing, igual que
+el testnet. En reposo, `ALLOW_ALPACA_ORDERS=0`.
+
+Mismo día, capa de agente: el **MCP server oficial de Alpaca**
+(`alpaca-mcp-server` vía uvx, 65 herramientas) queda registrado en
+`~/.zcode/cli/config.json` → `mcp.servers.alpaca`, leyendo las claves del
+`execution/.env` por `--env-file` (la config de ZCode no guarda secretos) con
+`ALPACA_PAPER_TRADE=true` y toolsets recortados a
+`account,trading,watchlists,stock-data,news`. Queda `enabled: false` hasta que
+el operador genere claves API en el dashboard (el login OAuth del CLI no sirve
+para la REST API) y corra `execution/set_alpaca_mcp.py`. Es consola interactiva
+del agente, no parte del bucle del engine: no pasa por los topes de
+`alpaca_broker.py`.
+
+---
+
+Esto **no reabre** el veredicto de abajo. El motor de alertas del QAE sigue sin
+edge demostrado y no se enruta. Lo que se conectó es otra cosa: los candidatos
+`cbpackf` del backtest-system que sí pasan el gate del repo (PF>1.2 ex-costes,
+n≥30, 2/3 tercios verdes, vecindad estable, WF/OOS, vs buy&hold) y que se
+re-corrieron a **11 pb** roundtrip (5 pb fee + 0,5 pb slip por lado, medidos).
+
+| pieza | estado |
+|---|---|
+| `execution/live_signal.py` | señal viva con el **mismo** engine auditado (paridad exacta con los artefactos: trades/PF/net) |
+| `execution/router.py` | tamaño por riesgo 0,5% (haircut a 0,25% por concentración) + bracket `STOP_MARKET closePosition=true` |
+| `execution/auto_router.py` | señal → abrir/cerrar/revertir/mantener, una posición por símbolo, sin perseguir entradas >24 barras |
+| `execution/reconcile.py` | recrea el stop si desaparece, detecta cierres vía `userTrades`, avisa de huérfanas |
+| claves + cliente | testnet cargado, `check_testnet.py` OK, Algo Order API (`-4120`) resuelta |
+
+Evidencia: `execution/evidence_testnet_2026-10-25.json` (firma, filtros, fills,
+fees 4 pb del testnet) y `execution/evidence_automation_2026-10-25.json` (24/24
+comprobaciones end-to-end: bracket, stop recreado, cierre detectado, huérfana,
+`entering` en vuelo). Tests: 17 offline de decisión/reconciliación + 10 del gate.
+
+Límite que no se disimula: el testnet cobra 4 pb (no 5) y su libro es otro, así
+que **ningún PnL de testnet es evidencia de edge**. Solo prueba el plumbing. La
+cuenta quedó plana y `ALLOW_ORDERS=0` en reposo.
+
+---
+
 ## 2026-10-06 (Fase 6) — REDISEÑO COMPLETADO: el motor es ahora un LECTOR
 
 Las seis fases de `PLAN_REDESIGN.md` están ejecutadas. Resumen del estado final.

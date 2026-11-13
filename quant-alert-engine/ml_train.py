@@ -14,6 +14,16 @@ on the train fold as a quantile of predicted probability and then applied
 untouched to the held-out fold, so "kept 50%" really means the model ranked
 50% of the train distribution above the cut.
 
+Two additions that the overlapping windows demand (2026-10-11 audit):
+  * PURGE + EMBARGO — a signal's label window is forward_bars long, and a
+    contiguous index fold cuts through open windows. Train rows whose window
+    reaches into the test fold are PURGED; test rows that start before the
+    last train label closes are EMBARGOED. Both are keyed on
+    fired_ts + horizon_s, never on row counts.
+  * NET OF COST — every kept mean_ret is reported alongside its net figure at
+    the same 12bps round trip the scanner-engine auditor charges. A gross
+    edge below the cost line is not an edge.
+
 Run:
     python ml_backfill.py          # first: reconstruct features for history
     python ml_train.py             # walk-forward report + save model bundle
@@ -37,6 +47,24 @@ from ml_filter import BUNDLE_VERSION, MetaLabelFilter, build_columns, build_desi
 
 KEEP_FRACTIONS = (1.0, 0.75, 0.5, 0.25)
 
+# Round-trip cost charged to every kept signal's mean return, matching the
+# scanner-engine auditor's model (5bps taker fee + 0.5bps slippage per side,
+# x2, + 1bps spread = 12bps). "keep 50% mean_ret=+2bps" without this line is a
+# filter that loses money the moment it trades; the two engines must report on
+# the same basis or their conclusions cannot be compared.
+COST_BPS_RT = 12.0
+COST_FRAC = COST_BPS_RT / 10_000.0
+
+# Bar length per timeframe, used ONLY to turn a signal's `forward_bars` into a
+# wall-clock horizon for the fold purge/embargo below. Duplicated locally
+# rather than imported from quant_alert_engine: that module builds exchange
+# sessions on import, and the trainer must run offline.
+TF_MS = {
+    "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+    "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "6h": 21_600_000,
+    "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000,
+}
+
 
 # ---------------------------------------------------------------------------
 # data
@@ -47,7 +75,8 @@ def load_dataset(db: str, exclude_neutral: bool = False) -> Dict[str, Any]:
     conn = sqlite3.connect(db, timeout=30)
     rows = conn.execute(
         """SELECT o.signal_id, o.symbol, o.timeframe, o.signal_name, o.signal_type,
-                  o.direction, o.fired_ts, o.forward_return, f.features_json
+                  o.direction, o.fired_ts, o.forward_return, o.forward_bars,
+                  f.features_json
            FROM signal_outcomes o
            JOIN signal_features f ON f.signal_id = o.signal_id
            WHERE o.resolved = 1
@@ -57,8 +86,9 @@ def load_dataset(db: str, exclude_neutral: bool = False) -> Dict[str, Any]:
         return {"n": 0}
 
     feats, stypes, dirs, y, ret = [], [], [], [], []
-    syms, tfs, names, ts = [], [], [], []
-    for (_sid, sym, tf, name, stype, direction, fired_ts, fret, fjson) in rows:
+    syms, tfs, names, ts, hz = [], [], [], [], []
+    for (_sid, sym, tf, name, stype, direction, fired_ts, fret, fbars,
+         fjson) in rows:
         if fret is None:
             continue
         d = int(direction or 0)
@@ -79,6 +109,11 @@ def load_dataset(db: str, exclude_neutral: bool = False) -> Dict[str, Any]:
         tfs.append(tf)
         names.append(name)
         ts.append(float(fired_ts or 0.0))
+        # The label window in wall-clock seconds. This is what the fold
+        # purge/embargo needs: two signals whose windows overlap are not
+        # independent, and a train/test boundary that cuts through the middle
+        # of an open window leaks the label across the split.
+        hz.append(int(fbars or 0) * TF_MS.get(str(tf), 300_000) / 1000.0)
 
     return {
         "n": len(feats),
@@ -89,6 +124,7 @@ def load_dataset(db: str, exclude_neutral: bool = False) -> Dict[str, Any]:
         "ret": np.asarray(ret, dtype=np.float64),
         "symbol": syms, "timeframe": tfs, "signal_name": names,
         "fired_ts": np.asarray(ts, dtype=np.float64),
+        "horizon_s": np.asarray(hz, dtype=np.float64),
     }
 
 
@@ -113,17 +149,26 @@ def brier(prob, label) -> float:
 
 
 def take_metrics(prob: np.ndarray, ret: np.ndarray, y: np.ndarray,
-                 thr: float) -> Dict[str, float]:
+                 thr: float, cost_frac: float = 0.0) -> Dict[str, float]:
     m = prob >= thr
     k = int(m.sum())
     if k == 0:
         return {"kept": 0, "kept_pct": 0.0, "mean_ret": float("nan"),
-                "sum_ret": 0.0, "hit_rate": float("nan")}
+                "mean_ret_net": float("nan"),
+                "sum_ret": 0.0, "sum_ret_net": 0.0,
+                "hit_rate": float("nan")}
+    gross_mean = float(ret[m].mean())
     return {
         "kept": k,
         "kept_pct": 100.0 * k / len(prob),
-        "mean_ret": float(ret[m].mean()),
+        "mean_ret": gross_mean,
+        # What each kept signal actually nets after a round trip at the same
+        # cost model the scanner auditor uses. A positive gross mean below
+        # cost_frac is a losing filter, and this is the only number a sizing
+        # decision may read.
+        "mean_ret_net": gross_mean - cost_frac,
         "sum_ret": float(ret[m].sum()),
+        "sum_ret_net": float(ret[m].sum()) - cost_frac * k,
         "hit_rate": float(y[m].mean()),
     }
 
@@ -203,8 +248,9 @@ def walk_forward(data: Dict[str, Any], meta: Dict[str, Any], kind: str,
               f"mean directional return={ret.mean():+.5%}  "
               f"features={len(meta['feature_names'])}  columns={len(meta['columns'])}")
         print(f"walk-forward folds: {len(folds)} "
-              f"(expanding window, no shuffle, threshold chosen on train only)\n")
-        hdr = (f"{'fold':>6} {'n_tr':>6} {'n_te':>5} {'AUC':>6} {'brier':>6} "
+              f"(expanding, no shuffle, threshold from train only, "
+              f"purge+embargo on label windows, costs {COST_BPS_RT:.0f}bps RT)\n")
+        hdr = (f"{'fold':>6} {'n_tr':>6} {'n_te':>5} {'cut':>5} {'AUC':>6} {'brier':>6} "
                f"{'base':>6} | " +
                " ".join(f"{'keep '+str(int(k*100))+'%':>16}" for k in KEEP_FRACTIONS))
         print(hdr)
@@ -213,8 +259,33 @@ def walk_forward(data: Dict[str, Any], meta: Dict[str, Any], kind: str,
     per_fold: List[Dict[str, Any]] = []
     all_prob, all_y, all_ret, all_te_idx = [], [], [], []
     for fi, (a, b) in enumerate(folds):
-        Xtr, ytr = X[:a], y[:a]
-        Xte, yte, rte = X[a:b], y[a:b], ret[a:b]
+        Xtr_full, ytr_full = X[:a], y[:a]
+        if len(np.unique(ytr_full)) < 2:
+            continue
+
+        # ── purge + embargo (the overlap this data volume actually has) ────
+        # A signal's label window is `horizon_s` long. A TRAIN row whose
+        # window reaches past the test fold's start shares its label with
+        # test rows; a TEST row that starts before the last train label
+        # closes leaks in the other direction. Time-ordered contiguous folds
+        # alone do NOT fix this — the boundary cuts through open windows.
+        # Purge = drop offending train rows. Embargo = drop offending test
+        # rows. Both keyed on fired_ts + horizon_s, never on row count.
+        t_test_start = float(data["fired_ts"][a])
+        tr_end = data["fired_ts"][:a] + data["horizon_s"][:a]
+        tr_keep = tr_end <= t_test_start
+        if not tr_keep.any():
+            continue
+        t_train_close = float(tr_end[tr_keep].max())
+        te_keep = data["fired_ts"][a:b] >= t_train_close
+        if not te_keep.any():
+            continue
+        n_purged = int((~tr_keep).sum()) + int((~te_keep).sum())
+
+        Xtr, ytr = Xtr_full[tr_keep], ytr_full[tr_keep]
+        te_mask = np.zeros(len(y), dtype=bool)
+        te_mask[a:b] = te_keep
+        Xte, yte, rte = X[te_mask], y[te_mask], ret[te_mask]
         if len(np.unique(ytr)) < 2:
             continue
         params, predict = (fit_lightgbm(Xtr, ytr) if kind == "lightgbm"
@@ -227,19 +298,21 @@ def walk_forward(data: Dict[str, Any], meta: Dict[str, Any], kind: str,
         rows = {}
         for kf in KEEP_FRACTIONS:
             thr = (-np.inf if kf >= 1.0 else float(np.quantile(ptr, 1.0 - kf)))
-            rows[kf] = take_metrics(pte, rte, yte, thr)
+            rows[kf] = take_metrics(pte, rte, yte, thr, cost_frac=COST_FRAC)
         per_fold.append({"fold": fi + 1, "n_train": a, "n_test": len(yte),
+                         "n_purged": n_purged,
                          "auc": f_auc, "brier": f_brier,
                          "base_hit": float(yte.mean()),
                          "base_mean_ret": float(rte.mean()),
                          "keep": {str(k): v for k, v in rows.items()}})
         all_prob.append(pte); all_y.append(yte); all_ret.append(rte)
-        all_te_idx.append(np.arange(a, b))
+        all_te_idx.append(np.where(te_mask)[0])
         if verbose:
             cells = " ".join(
-                f"{rows[k]['kept_pct']:>4.0f}% {rows[k]['mean_ret']:>+8.4%}"
+                f"{rows[k]['kept_pct']:>4.0f}% {rows[k]['mean_ret_net']:>+8.4%}"
                 for k in KEEP_FRACTIONS)
-            print(f"{fi+1:>6} {a:>6} {len(yte):>5} {f_auc:>6.3f} {f_brier:>6.3f} "
+            print(f"{fi+1:>6} {a:>6} {len(yte):>5} ({n_purged:>3} cut) "
+                  f"{f_auc:>6.3f} {f_brier:>6.3f} "
                   f"{yte.mean():>6.3f} | {cells}")
 
     if not all_prob:
@@ -248,17 +321,18 @@ def walk_forward(data: Dict[str, Any], meta: Dict[str, Any], kind: str,
     P = np.concatenate(all_prob)
     Y = np.concatenate(all_y)
     R = np.concatenate(all_ret)
-    T = np.concatenate(all_te_idx)
+    T = np.concatenate(all_te_idx)          # kept for provenance; OOS rows only
 
     # Aggregate: threshold from the pooled TRAIN portion of each fold, i.e. the
     # pooled out-of-sample probability distribution is not used to pick the cut.
     agg = {"n_oos": int(len(P)), "auc": auc(P, Y), "brier": brier(P, Y),
            "base_hit": float(Y.mean()), "base_mean_ret": float(R.mean()),
+           "base_mean_ret_net": float(R.mean()) - COST_FRAC,
            "keep": {}}
     for kf in KEEP_FRACTIONS:
         # pooled cut: rank-based, so it never depends on the test distribution
         thr = -np.inf if kf >= 1.0 else float(np.quantile(P, 1.0 - kf))
-        agg["keep"][str(kf)] = take_metrics(P, R, Y, thr)
+        agg["keep"][str(kf)] = take_metrics(P, R, Y, thr, cost_frac=COST_FRAC)
 
     # quintile table — the honest read on whether the model ranks
     order = np.argsort(P)
@@ -273,20 +347,40 @@ def walk_forward(data: Dict[str, Any], meta: Dict[str, Any], kind: str,
     # engine's current gate, evaluated the same way it runs at runtime: the mute
     # set is derived from TRAIN rows only (never the held-out fold), so this is a
     # fair like-for-like benchmark against the model's out-of-sample numbers.
+    # The SAME purge/embargo masks the model folds use are applied here, or the
+    # benchmark would train its mute sets on rows the model was not allowed to
+    # see — an unfair comparison in the gate's favor.
     names_arr = np.asarray(data["signal_name"])
+    fold_masks = []
+    for a_, b_ in folds:
+        t_test_start = float(data["fired_ts"][a_])
+        tr_end = data["fired_ts"][:a_] + data["horizon_s"][:a_]
+        tr_keep = tr_end <= t_test_start
+        if not tr_keep.any():
+            fold_masks.append(None)
+            continue
+        t_train_close = float(tr_end[tr_keep].max())
+        te_keep = data["fired_ts"][a_:b_] >= t_train_close
+        mask = np.zeros(len(y), dtype=bool)
+        mask[a_:b_] = te_keep
+        fold_masks.append((a_, b_, tr_keep, mask))
     gate_bench: Dict[str, Any] = {}
     for min_n in (5, 30):
         kept = np.zeros(len(y), dtype=bool)
         seen = np.zeros(len(y), dtype=bool)
         muted_last: set = set()
-        for a_, b_ in folds:
+        for a_, b_, tr_keep, te_mask in fold_masks:
+            if te_mask is None:
+                continue
             per_name: Dict[str, List[float]] = {}
-            for nm, r in zip(names_arr[:a_], ret[:a_]):
+            tr_idx = np.where(tr_keep)[0]
+            for nm, r in zip(names_arr[tr_idx], ret[tr_idx]):
                 per_name.setdefault(nm, []).append(float(r))
             muted_f = {nm for nm, v in per_name.items()
                        if len(v) >= min_n and float(np.mean(v)) < 0}
-            kept[a_:b_] = np.array([nm not in muted_f for nm in names_arr[a_:b_]])
-            seen[a_:b_] = True
+            te_idx = np.where(te_mask)[0]
+            kept[te_idx] = np.array([nm not in muted_f for nm in names_arr[te_idx]])
+            seen[te_idx] = True
             muted_last = muted_f
         if not seen.any():
             continue
@@ -306,11 +400,18 @@ def walk_forward(data: Dict[str, Any], meta: Dict[str, Any], kind: str,
 
     # permutation sanity check: shuffle labels, the same pipeline must land at ~0.5
     rng = np.random.default_rng(0)
+    valid_masks = [m for m in fold_masks if m is not None]
     perm = []
     for _ in range(3):
         yp = rng.permutation(y)
-        Xtr, ytr = X[:folds[-1][0]], yp[:folds[-1][0]]
-        Xte, yte = X[folds[-1][0]:folds[-1][1]], yp[folds[-1][0]:folds[-1][1]]
+        if valid_masks:
+            a_, b_, tr_keep, te_mask = valid_masks[-1]
+        else:
+            a_, b_, tr_keep, te_mask = folds[-1][0], folds[-1][1], None, None
+        tr_idx = np.where(tr_keep)[0] if tr_keep is not None else np.arange(a_)
+        te_idx = np.where(te_mask)[0] if te_mask is not None else np.arange(a_, b_)
+        Xtr, ytr = X[tr_idx], yp[tr_idx]
+        Xte, yte = X[te_idx], yp[te_idx]
         if len(np.unique(ytr)) < 2:
             continue
         _p, predict = fit_logreg(Xtr, ytr)
@@ -370,16 +471,20 @@ def main() -> int:
             continue
         print(f"\n[{kind}] AUC={ag['auc']:.3f}  brier={ag['brier']:.3f}  "
               f"permuted AUC={ag['permuted_auc']:.3f}  base hit={ag['base_hit']:.3f}")
-        print(f"  all signals:        n={ag['n_oos']:>5}  mean_ret={ag['base_mean_ret']:+.5%}"
-              f"  hit={ag['base_hit']:.1%}")
+        print(f"  all signals:        n={ag['n_oos']:>5}  "
+              f"mean_ret={ag['base_mean_ret']:+.5%}  "
+              f"net={ag['base_mean_ret_net']:+.5%}  hit={ag['base_hit']:.1%}")
         for kf in KEEP_FRACTIONS:
             m = ag["keep"][str(kf)]
             if not m.get("kept"):
                 continue
             edge = (m["mean_ret"] - ag["base_mean_ret"])
+            edge_net = (m["mean_ret_net"] - ag["base_mean_ret_net"])
             print(f"  keep {int(kf*100):>3}% (n={m['kept']:>4}): "
-                  f"mean_ret={m['mean_ret']:+.5%}  hit={m['hit_rate']:.1%}  "
-                  f"edge_vs_all={edge:+.5%}  sum={m['sum_ret']:+.4f}")
+                  f"mean_ret={m['mean_ret']:+.5%}  "
+                  f"NET={m['mean_ret_net']:+.5%}  hit={m['hit_rate']:.1%}  "
+                  f"edge_vs_all={edge:+.5%} (net {edge_net:+.5%})  "
+                  f"sum={m['sum_ret']:+.4f}")
         gb = rep.get("engine_gate_benchmark")
         if gb:
             print("  ENGINE'S CURRENT GATE (mute signal names with negative train "

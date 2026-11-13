@@ -311,12 +311,16 @@ class StrategyBacktester:
                 exit_price = None
                 if pos['side'] == 'long':
                     if l[i] <= pos['stop']:
-                        exit_price, reason = pos['stop'], 'stop'
+                        # Gap-through: if the bar OPENED past the stop, the real
+                        # fill is the open, not the stop price. Filling at the
+                        # stop on a gapped bar books a price that never traded
+                        # and understates exactly the losses that hurt most.
+                        exit_price, reason = min(pos['stop'], float(o[i])), 'stop'
                     elif h[i] >= pos['target']:
                         exit_price, reason = pos['target'], 'target'
                 else:
                     if h[i] >= pos['stop']:
-                        exit_price, reason = pos['stop'], 'stop'
+                        exit_price, reason = max(pos['stop'], float(o[i])), 'stop'
                     elif l[i] <= pos['target']:
                         exit_price, reason = pos['target'], 'target'
                 if reason is None and (i - pos['entry_bar']) >= max_hold:
