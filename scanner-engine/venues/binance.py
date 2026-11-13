@@ -24,6 +24,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking proxy)
 import outcomes as OUT  # noqa: E402  shared exit-bar selection (ceil semantics)
+import pairs as P  # noqa: E402  the registry owns the venue symbols
 
 import json
 import time
@@ -60,9 +61,21 @@ def is_tradable_contract_type(contract_type: str) -> bool:
 def symbol_for(pair: str) -> str:
     """Binance venue symbol for a canonical pair.
 
+    The REGISTRY decides. Deriving the symbol from the pair name is a
+    guess, and for a pair whose contract is a multiplier of the underlying
+    (1000PEPE -> 1000PEPEUSDT) the guess and the listing can disagree in
+    either direction. The derivation below stays only as the fallback for
+    pairs that are not in the registry.
+
     XAU -> XAUT: Binance lists gold as XAUTUSDT. Verified live 2026-10-08
     (underlyingSubType includes 'RWA').
     """
+    try:
+        s = P.venue_symbol(pair, "binance")
+    except KeyError:
+        s = None
+    if s:
+        return s
     base, _, _ = pair.partition("/")
     if base == "XAU":
         base = "XAUT"

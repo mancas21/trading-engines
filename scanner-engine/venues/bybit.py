@@ -16,6 +16,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking proxy)
 import outcomes as OUT  # noqa: E402  shared exit-bar selection (ceil semantics)
+import pairs as P  # noqa: E402  the registry owns the venue symbols
 
 import json
 import time
@@ -32,7 +33,18 @@ def _get(path: str, timeout: float = 15.0):
 
 
 def symbol_for(pair: str) -> str:
-    """'BTC/USD' -> 'BTCUSDT'. Bybit lists gold as XAUUSDT."""
+    """Bybit venue symbol for a canonical pair.
+
+    The REGISTRY decides (see the other adapters). Bybit lists gold as
+    XAUUSDT; the derivation below is only the fallback for pairs outside
+    the registry.
+    """
+    try:
+        s = P.venue_symbol(pair, "bybit")
+    except KeyError:
+        s = None
+    if s:
+        return s
     base, _, _ = pair.partition("/")
     return base + "USDT"
 

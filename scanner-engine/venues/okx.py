@@ -21,6 +21,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking proxy)
 import outcomes as OUT  # noqa: E402  shared exit-bar selection (ceil semantics)
+import pairs as P  # noqa: E402  the registry owns the venue symbols
 
 import json
 import time
@@ -34,7 +35,20 @@ def _get(path: str, timeout: float = 15.0):
 
 
 def symbol_for(pair: str) -> str:
-    """'BTC/USD' -> 'BTC-USDT-SWAP'. XAU maps to its own listing."""
+    """OKX venue symbol for a canonical pair.
+
+    The REGISTRY decides. OKX lists PEPE as PEPE-USDT-SWAP (1x) while the
+    pair the ATAS chart is on is 1000PEPEUSDT (1000x) — deriving the symbol
+    from the pair name asks OKX for 1000PEPE-USDT-SWAP and gets
+    `Instrument ID does not exist` (51001). The derivation below is only
+    the fallback for pairs outside the registry.
+    """
+    try:
+        s = P.venue_symbol(pair, "okx")
+    except KeyError:
+        s = None
+    if s:
+        return s
     base, _, _ = pair.partition("/")
     return f"{base}-USDT-SWAP"
 

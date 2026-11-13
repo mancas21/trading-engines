@@ -100,6 +100,17 @@ and fixed — several in this repo's sibling engine.
    (1m pair → 5 bars, 5m pair → 1 bar), because a fixed bar count makes a 5m pair
    a 5× longer horizon and its expectancy non-comparable.
 
+9b. **A venue may quote the same underlying under a different contract
+   multiplier.** Binance and Bybit list `1000PEPEUSDT` (1000×); OKX lists
+   `PEPE-USDT-SWAP` (1× price, size in contracts of 10,000,000 PEPE); Kraken
+   lists `PEPEUSD` (1× spot, size in PEPE). The registry's `price_mult` /
+   `size_mult` bring every venue onto the pair's reference scale before any
+   cross-venue comparison. Their product preserves notional. Without it the
+   cross-venue mid is a blend of two scales and every venue's basis is off by
+   1000×. The venue symbols come from the registry too — deriving them from the
+   pair name asks OKX for an instrument that does not exist. Measured detail:
+   `docs/VENUE_FACTS.md`.
+
 10. **One venue's failure cannot starve another.** A permanent rejection
     (`EQuery:Unknown asset pair`) does not open a venue-wide cooldown. This was a
     real bug: SPCX's permanent Kraken rejection silently removed Kraken evidence

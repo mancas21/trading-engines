@@ -46,6 +46,7 @@ import outcomes as OUT       # noqa: E402
 import promotion as PROM     # noqa: E402  (the retirement half of the loop)
 import recorder as RC        # noqa: E402
 import rules_eval as RE      # noqa: E402
+import backtest_link as BTL  # noqa: E402  (capa de validacion: backtest-system)
 from poller import Poller    # noqa: E402
 
 DEFAULT_POLL_S = 15.0
@@ -168,13 +169,23 @@ class Scanner:
         import venues.bybit as bb
         from flow import window_cvd, DEFAULT_WINDOW_S
 
-        def wrap(fetch_book, fetch_trades=None):
+        def wrap(venue, fetch_book, fetch_trades=None):
             def fn(pair):
                 book = fetch_book(pair)
                 tape = None
+                # Bring this venue onto the PAIR's reference scale before
+                # anything compares it with another venue. See pairs.py.
+                try:
+                    pm = P.venue_price_mult(pair, venue)
+                    sm = P.venue_size_mult(pair, venue)
+                except KeyError:
+                    pm = sm = 1.0
                 if fetch_trades is not None:
                     try:
-                        w = window_cvd(fetch_trades(pair), window_s=DEFAULT_WINDOW_S)
+                        trades = fetch_trades(pair)
+                        if pm != 1.0 or sm != 1.0:
+                            trades = _scale_trades(trades, pm, sm)
+                        w = window_cvd(trades, window_s=DEFAULT_WINDOW_S)
                         if w is not None:
                             tape = {"delta_ratio": w.delta_ratio,
                                     "coverage_s": w.coverage_s,
@@ -183,14 +194,16 @@ class Scanner:
                                     "price_delta_bps": w.price_delta_bps}
                     except Exception:                      # noqa: BLE001
                         tape = None
+                if pm != 1.0 or sm != 1.0:
+                    book = _scale_book(book, pm, sm)
                 return book, tape
             return fn
 
         return {
-            "binance": wrap(bn.fetch_depth, bn.fetch_trades),
-            "okx": wrap(okx.fetch_depth, okx.fetch_trades),
-            "kraken": wrap(kr.fetch_depth, kr.fetch_trades),
-            "bybit": wrap(bb.fetch_depth, bb.fetch_trades),
+            "binance": wrap("binance", bn.fetch_depth, bn.fetch_trades),
+            "okx": wrap("okx", okx.fetch_depth, okx.fetch_trades),
+            "kraken": wrap("kraken", kr.fetch_depth, kr.fetch_trades),
+            "bybit": wrap("bybit", bb.fetch_depth, bb.fetch_trades),
         }
 
     def _install_bar_fetchers(self) -> None:
@@ -455,6 +468,11 @@ class Scanner:
                         ],
                         # reglas medidas a DROP: observadas, no candidatas
                         "retired_rules": sorted(self._retired),
+            # Puente a la capa de VALIDACION (backtest-system). Dice que par
+            # tiene una estrategia que pasa los gates del repo con artefacto
+            # verificado. No lleva metricas: /health se lee mucho y las
+            # metricas viven en el artefacto (run_id). Detalle: `for_pair()`.
+            "backtest_link": BTL.link_summary(),
         })
         return h
 
@@ -552,6 +570,50 @@ class Scanner:
         self.stopped_cleanly = True
 
 
+def _scale_book(book, price_mult: float, size_mult: float):
+    """Bring a venue's book onto the pair's reference scale.
+
+    A venue may quote the same underlying under a different contract
+    multiplier: Binance and Bybit list 1000PEPEUSDT (the price is per 1000
+    PEPE), OKX lists PEPE-USDT-SWAP (the price is per PEPE, the size in
+    CONTRACTS of 10,000,000 PEPE) and Kraken lists PEPEUSD (the price is per
+    PEPE, the size in PEPE).
+
+    Price and size move TOGETHER so NOTIONAL is preserved: the registry
+    picks m and n such that m*n is the number of tokens one price unit
+    represents. Checked on a measured OKX touch: 17 contracts x 10,000,000
+    PEPE at 4.3818e-06 = $744.9, and 17 x 10,000 = 170,000 units of 1000PEPE
+    x 0.0043818 = $744.9. Same money.
+
+    A ratio such as book_imb_5 is invariant under this transform; the price
+    comparison in basis_bps is not, which is why it has to happen here and
+    not be left to each consumer.
+    """
+    from types_ import Book
+
+    if price_mult == 1.0 and size_mult == 1.0:
+        return book
+
+    bids = [(p * price_mult, q * size_mult) for p, q in book.bids]
+    asks = [(p * price_mult, q * size_mult) for p, q in book.asks]
+    return Book(bid=bids[0][0], bids=bids, asks=asks)
+
+
+def _scale_trades(trades, price_mult: float, size_mult: float):
+    """Same scale transform, applied to the raw trade list.
+
+    Applied BEFORE the tape is aggregated so the tape's volumes and prices
+    are in the same unit as the book — a tape that counts contracts next to
+    a book that counts tokens is a unit bug waiting to be read as a signal.
+    """
+    if price_mult == 1.0 and size_mult == 1.0:
+        return trades
+    return [{"ts": t["ts"],
+             "price": t["price"] * price_mult,
+             "size": t["size"] * size_mult,
+             "taker_side": t["taker_side"]} for t in trades]
+
+
 def _coverage_for(pairs: list[str]) -> dict:
     """Registry coverage for the configured pairs, plus any pair that is not
     in the registry (reported honestly rather than omitted)."""
@@ -611,6 +673,14 @@ def _serve(sc: Scanner, port: int) -> None:
             elif u.path == "/features":
                 q = parse_qs(u.query)
                 body = sc.features_payload(q.get("pair", [None])[0])
+            elif u.path == "/backtest":
+                # Capa de validacion: candidatos con artefacto verificado.
+                #   /backtest                -> resumen por par
+                #   /backtest?pair=XRP%2FUSD -> candidatos + run_id + metricas
+                q = parse_qs(u.query)
+                pair = q.get("pair", [None])[0]
+                body = (BTL.for_pair(pair) if pair
+                        else BTL.link_summary())
             else:
                 self.send_error(404, "unknown endpoint")
                 return

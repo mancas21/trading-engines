@@ -49,12 +49,87 @@ TRADABLE_CONTRACT_TYPES = frozenset({"PERPETUAL", "TRADIFI_PERPETUAL"})
 | SOL/USD | `SOLUSDT` | `SOL-USDT-SWAP` | `SOLUSD` | `SOLUSDT` |
 | HYPE/USD | `HYPEUSDT` | `HYPE-USDT-SWAP` | `HYPEUSD` | `HYPEUSDT` |
 | ETH/USD | `ETHUSDT` | `ETH-USDT-SWAP` | `ETHUSD` | `ETHUSDT` |
-| XAU/USD | `XAUTUSDT` | `XAU-USDT-SWAP` | `XAUTUSDT` | `XAUUSDT` |
+| XAU/USD | `XAUTUSDT` | `XAU-USDT-SWAP` | `XAUTUSD` | `XAUUSDT` |
 | SPCX/USD | `SPCXUSDT` | `SPCX-USDT-SWAP` | **absent** | `SPCXUSDT` |
 | NVDA/USD | `NVDAUSDT` | `NVDA-USDT-SWAP` | **absent** | `NVDAUSDT` |
+| ARB/USD | `ARBUSDT` | `ARB-USDT-SWAP` | `ARBUSD` | `ARBUSDT` |
+| 1000PEPE/USD | `1000PEPEUSDT` | `PEPE-USDT-SWAP` | `PEPEUSD` | `1000PEPEUSDT` |
+
+Kraken lists gold under BOTH `XAUTUSD` (ZUSD-quoted) and `XAUTUSDT`
+(USDT-quoted); both answer on the Depth endpoint. This engine trades
+`XAUTUSD` and the registry records that, because the registry did not
+exist as an authority until 2026-11-12 and had recorded the other one.
 
 Kraken rejects SPCX/NVDA with `EQuery:Unknown asset pair` — genuinely absent,
 not a discovery bug. XAU maps to **`XAUT`** on Binance (`underlyingSubType` includes `RWA`).
+
+### XAU/USD — two gold contracts, and this pair mixes them
+
+Measured live 2026-11-12 (touches, same instant):
+
+| Venue | Symbol | Touch | Cluster |
+|---|---|---|---|
+| Binance | `XAUUSDT` | 3870.38 | XAU |
+| Binance | `XAUTUSDT` | 3860.04 | XAUT |
+| Bybit | `XAUUSDT` | 3870.71 | XAU |
+| Bybit | `XAUTUSDT` | 3859.24 | XAUT |
+| OKX | `XAU-USDT-SWAP` | 3871.1 | XAU (the only one it lists) |
+| Kraken | `XAUTUSD` | 3858.6 | XAUT (the only one it lists) |
+| Kraken | `XAUTUSDT` | 3863.7 | XAUT |
+
+**No gold contract exists on all four venues.** OKX only lists the XAU
+quote and Kraken only the XAUT quote, so the XAU pair's cross-venue
+basis is structurally ~23-32bps of *instrument difference*, not a
+dislocation. Read that pair's basis as noise, never as rule-1 evidence.
+
+The registry now records exactly what the adapters traded before it
+became authoritative: binance `XAUTUSDT`, okx `XAU-USDT-SWAP`, kraken
+`XAUTUSD`, bybit `XAUUSDT`. It had recorded kraken=`XAUTUSDT` and
+bybit=`XAUTUSDT`; neither was ever read, and both would have silently
+changed the pair on the day the registry took over.
+
+### 1000PEPE/USD (added 2026-11-12)
+### 1000PEPE/USD (added 2026-11-12) — THE MULTIPLIER IS NOT UNIFORM
+
+Measured live with `_probe_pepe_venues.py`, `_probe_pepe_notional.py`,
+`_probe_pepe_liquidity.py`; verified through the engine's own machinery with
+`_verify_pepe_pair.py`.
+
+| Fact | Detail |
+|---|---|
+| Why this pair exists | It is the instrument the ATAS chart was showing (`1000PEPEUSDT`). Without it the ATAS reader's rule AT-6/AT-7 condition (c) — the multi-venue book consensus — was **UNEVALUABLE** for this symbol, because the scanner did not track it. |
+| Binance listing | fapi lists **`1000PEPEUSDT` only**. `PEPEUSDT` (1x) is NOT listed on the futures API — only on spot. This adapter is fapi-only. |
+| Bybit listing | `1000PEPEUSDT` and `1000PEPEPERP` (both 1000x, `qtyStep=100`, `priceScale=7`). |
+| OKX listing | `PEPE-USDT-SWAP` only — **1x price**, and `ctVal=10,000,000` PEPE per contract. There is no 1000x OKX instrument. |
+| Kraken listing | `PEPEUSD` — **1x spot** (also PEPECOINUSD). Kraken has no 1000x pair and no PEPE perp. |
+| Consequence | A naive "derive the symbol from the pair name" adapter asks OKX for `1000PEPE-USDT-SWAP` and Kraken for `1000PEPEUSD`; both answer `does not exist`. The registry's per-venue `symbols` is now authoritative (`pairs.venue_symbol`), and the adapters consult it. |
+| Price scale | The reference scale is the **1000x** contract (Binance/Bybit quote per 1000 PEPE). OKX and Kraken quote per PEPE → `price_mult` 1000 on both. |
+| Size unit | Binance/Bybit quote size in 1000PEPE (`size_mult` 1). OKX quotes size in **CONTRACTS** → 1 contract = 10,000,000 PEPE = 10,000 units of 1000PEPE (`size_mult` 10000). Kraken quotes in PEPE → `size_mult` 0.001. |
+| Notional preserved | Measured OKX touch: 17 contracts x 10,000,000 PEPE at 4.3818e-06 = **$744.9**; on the reference scale 17 x 10,000 = 170,000 units of 1000PEPE x 0.0043818 = **$744.9**. Same money — the product `price_mult * size_mult` is the token count per price unit. |
+| Why the scale has to be fixed | `book_imb_5` is a RATIO and survives untouched; `basis_bps` compares PRICES and does not. Unscaled, the cross-venue mid becomes a blend of 0.00435 and 4.38e-06 and every venue's basis is off by 1000x. Measured after the fix: binance +1.87bps, bybit +0.15, kraken −2.15, okx +0.26 — single-digit bps, which is a cross-venue spread, not a scale error. |
+| 60 x 1m notional USD | binance **399,924** (median 345,129) · okx 270,271 (median 237,693). |
+| Bar interval | `5m`. 1m is not defensible at ~400K USD/min — the same standard that puts HYPE (435K) on 5m. |
+| Tape in a 60s window | binance ~975 trades · okx ~489 (11s span) · bybit ~620 · **kraken ~12**. Kraken fails the rules' `trade_floor` (50) and contributes **no** `flow_by_venue` — the same situation as ARB and JUP. Its `book_imb_5` is unaffected (that reads the book, not the tape). Do NOT lower the floor to make PEPE produce flow. |
+| Spreads | binance/okx 0.23bps · bybit 2.31bps · **kraken 2.3–4.6bps**. Kraken is a thin spot book, so any cross-venue basis must be read against each venue's OWN spread. |
+| Kraken is spot | Not a perp. It is still a valid book to read for the top-5 imbalance; it is NOT a valid fill venue, which is why `ref_venue` is `binance`. |
+| Condition (c) outcome | Live on the reader after the pair went in service: `2C/2V venues por lado (4 vivos)` → state **SPLIT**, i.e. the consensus is genuinely split rather than absent. Rule 6/7 no longer report `UNEVALUABLE` for this symbol. |
+
+### ARB (added 2026-11-10)
+
+Measured live with `_probe_arb.py`, `_probe_arb_venues.py`, `_probe_arb_tape.py`.
+
+| Fact | Detail |
+|---|---|
+| Binance contract type | `PERPETUAL` (`underlyingSubType` = `['Layer-2','Crypto']`), tick 0.000010, onboard 2022-03-23. Not TRADIFI. |
+| OKX | `ARB-USDT-SWAP`, `state=live`, ctVal 10, tick 0.00001, lot 0.1. |
+| Bybit | `ARBUSDT`, `LinearPerpetual`, tick 0.00001. |
+| Kraken | `ARBUSD` — listed and answers, and the key comes back **unmangled** (like `SUIUSD`/`JUPUSD`). |
+| 60 x 1m notional USD | binance **37,209** (median 32,606) · okx 21,115 (median 17,917) · bybit 17,959 (median 12,377) · kraken 1,043 (median 57). |
+| Bar interval | `5m`. 1m is only defensible for ETH/SOL/XRP; ARB's own 1m book is ~37K USD/min. |
+| Tape in a 60s window | binance 133 trades (86 taker-buy) · okx 100 (61 buy) · bybit 60 (50 buy) · **kraken 2**. Kraken therefore fails the rules' `trade_floor` (50) and contributes **no** `flow_by_venue` for ARB — same situation as JUP. Its `book_imb_5` is unaffected (that reads the book, not the tape). Do NOT lower the floor to make ARB produce flow. |
+| Spreads | binance/okx/bybit 0.63bps · **kraken 6.32bps**. Kraken is a thin spot book, so any cross-venue basis must be read against each venue's OWN spread. |
+| Kraken depth | top5 bid 721,852 ARB vs ask 145,186 — large but thin in turnover; the imbalance is real but low-conviction. |
+
 
 ## Rate-limit budget
 
@@ -66,16 +141,22 @@ measured **2.256s, 0 failures** (~282ms/pair). Ceiling 2400/8 = 300 cycles/min.
 
 **`poll_interval_s: 15` is validated** — 4 cycles/min, 1/75 of headroom.
 
+**After 1000PEPE was added (2026-11-12):** 9 pairs × 1 weight = 9 weight/cycle,
+so the ceiling is 2400/9 = 266 cycles/min and the same 4 cycles/min is 1/66 of
+headroom. The headroom did not change materially and the interval is still
+validated.
+
 ## 1m liquidity (avg 1m notional, Binance)
 
 ```
 ETH  $24.8M   SOL $3.6M   XRP  $969K
 HYPE   $435K  SUI  $345K  XAU  $126K
-SPCX  ~$10K   NVDA ~$18K     <- 1m not viable
+1000PEPE $400K
+ARB   $37.2K  NVDA ~$18K  SPCX ~$10K     <- 1m not viable
 ```
 
-1m is viable for ETH/SOL/XRP, marginal for HYPE/SUI/XAU, not viable for
-SPCX/NVDA. Decide the bar from **measured notional**, not a hand-written list.
+1m is viable for ETH/SOL/XRP, marginal for HYPE/SUI/XAU/1000PEPE, not viable
+for ARB/NVDA/SPCX. Decide the bar from **measured notional**, not a hand-written list.
 
 ## In-progress bars
 

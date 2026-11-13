@@ -39,6 +39,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import http_io  # noqa: E402  shared transport (bypasses the local TLS-breaking proxy)
 import outcomes as OUT  # noqa: E402  shared exit-bar selection (ceil semantics)
+import pairs as P  # noqa: E402  the registry owns the venue symbols
 
 import json
 import time
@@ -54,11 +55,23 @@ def _get(path: str, timeout: float = 20.0):
 def symbol_for(pair: str) -> str:
     """Kraken venue symbol for a canonical pair.
 
+    The REGISTRY decides. Kraken lists PEPE as PEPEUSD (1x spot) while the
+    pair the ATAS chart is on is 1000PEPEUSDT (1000x) — deriving the symbol
+    from the pair name asks Kraken for 1000PEPEUSD and gets
+    `EQuery:Unknown asset pair`. The derivation below is only the fallback
+    for pairs outside the registry.
+
     Two non-obvious mappings, both verified live:
       BTC -> XBT   Kraken uses XBT, not BTC.
       XAU -> XAUT  Gold is XAUTUSD / XAUTUSDT. Plain XAUUSD returns
                    EQuery:Unknown asset pair.
     """
+    try:
+        s = P.venue_symbol(pair, "kraken")
+    except KeyError:
+        s = None
+    if s:
+        return s
     base, _, _ = pair.partition("/")
     if base == "BTC":
         base = "XBT"
