@@ -37,7 +37,7 @@
 
 ```
 ATAS X (LiveExporter C# indicator)
-    ↓ writes to _live_indicators.json every 300ms
+    ↓ writes to _live_indicators_<SYMBOL>.json every 300ms (schema_version: 2)
 ATAS X (DOM/BigTrade alerts)
     ↓ POST /alerta-atas
 Binance (WebSocket depth+trades)
@@ -56,6 +56,44 @@ Bridge (FastAPI on :8000)
       then first touch of T1/SL; MFE/MAE tracked in R; events appended to
       _calls_log.jsonl, registry rebuilt by replay on startup)
 ```
+
+## LiveExporter payload — schema 2 (2026-11-12)
+
+El payload es **aditivo**: `schema_version: 2` lo marca. Ninguna clave existente
+cambió de significado y ninguna se eliminó — un lector de schema 1 sigue
+funcionando. Contrato verificado en `tests/test_live_exporter_schema.py`.
+
+**Bloques nuevos:**
+
+- `open_interest`, `vwap`, `max_delta`, `min_delta`, `max_volume_level`,
+  `max_tick_level` — por barra.
+- `closed_bars[]` — footprint de las últimas 20 barras **cerradas**. Antes el
+  puente solo veía la barra en formación, así que no había contexto histórico
+  de order flow en absoluto. Va en **resumen** (`imbalance_pct`,
+  `stacked_buy_levels`, `stacked_sell_levels`, `poc`, value area); el detalle
+  por nivel solo con el ajuste `Publish closed-bar levels` del exportador.
+- `session_value_area` — área de valor de la sesión, calculada dentro de ATAS
+  a partir de la unión de las barras cerradas.
+
+**El tape tiene dos verdades y no son la misma:**
+
+| Campos | Qué son |
+|---|---|
+| `tape.buy_vol` / `sell_vol` / `net_vol` / `buy_count_pct` | **Ventana de los últimos 30 prints** de la barra. Semántica histórica, conservada a propósito para que el track record viejo siga siendo comparable. |
+| `tape.bar_buy_vol` / `bar_sell_vol` / `bar_net_vol` / `bar_trade_count` | **Totales reales de la barra**, todos los prints. |
+
+La ventana puede apuntar al revés que la barra. MEDIDO 1000PEPEUSDT
+2026-11-12: ventana = "net +1.115.935 COMPRA" sobre 30 prints, barra = "net
+−6.603.441 VENTA" sobre 457 prints. Otra vez: ventana = 30 ventas seguidas
+(`buy_count: 0`) con la barra en 3.792 compras / 3.549 ventas.
+
+**Para la dirección del tape, lee `tape.bar_*`.** `signal_engine.Snapshot`
+expone los dos juegos con nombres distintos (`tape_buy_vol` vs
+`tape_bar_buy_vol`) para que no se puedan confundir.
+
+> `signal_engine._data_coverage` sigue mirando los campos de ventana a
+> propósito: no se toca, para que la puerta de cobertura no cambie de
+> comportamiento por un cambio de esquema.
 
 ## Quant Analysis Rules (audited after 10-call track record — 50% raw, NOT signal-validated; pre-fix entries lack snapshots)
 
@@ -88,13 +126,18 @@ Every trade plan delivered in analysis MUST be logged via `POST /calls` (outcome
 - `bridge_supervisor.bat` — Auto-restart loop (runs inside detached cmd console)
 - `launch_bridge.vbs` — WScript launcher that fully detaches the supervisor from any parent shell
 - `_integrated_analysis.py` — Multi-source analysis script
-- `_live_indicators.json` — LiveExporter output (consumed by bridge)
+- `_live_indicators_<SYMBOL>.json` — LiveExporter output (consumed by bridge)
 - `_cvd_state.json` — CVD tracker persistence (written by bridge on bar close)
 - `_calls_log.jsonl` — Trade call event log (open/activated/resolved; replayed on startup)
 - `decision_engine.py` — Quant context engine (value area / vol regime / expected move from Binance klines)
 - `quant_engine/` — Vendored engine subpackage (volume + volatility + core modules)
-- `atas-exporter/LiveExporter.cs` — C# indicator source
-- `atas-exporter/AtasExporter.csproj` — .NET project file
+- `atas-exporter/LiveExporter.cs` — C# indicator source (data feed)
+- `atas-exporter/LiveOrderFlowIndicator.cs` — C# indicator source (on-chart visual; writes nothing)
+- `atas-exporter/FootprintMath.cs` — Shared footprint maths (levels, stacked imbalance, value area)
+- `atas-exporter/AtasExporter.csproj` — .NET project file (net10.0-windows)
+- `atas-exporter/README.md` — Schema, install, env vars
+- `atas-exporter/ATAS_NOTES.md` — **ATAS platform gotchas — read before touching the C#**
+- `tests/test_live_exporter_schema.py` — schema 1 vs 2 contract (the tape-window trap lives here)
 - `rules.json` — 10 hard rules for quant analysis (must-follow)
 - `audit.log.json` — Track record of every call with outcome
 

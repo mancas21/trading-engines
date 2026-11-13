@@ -165,7 +165,7 @@ async def _dom_feeds():
     """Background task: maintain live DOM snapshots + trade flow."""
     if not HAS_WEBSOCKETS:
         return
-    symbols = ["solusdt", "suiusdt", "hypeusdt", "xrpusdt", "jupusdt", "btcusdt", "ethusdt", "spcxusdt", "nvdausdt", "xauusdt"]
+    symbols = ["solusdt", "suiusdt", "hypeusdt", "xrpusdt", "jupusdt", "arbusdt", "1000pepeusdt", "btcusdt", "ethusdt", "spcxusdt", "nvdausdt", "xauusdt"]
     # P6: DOM persistence tracking — require wall to persist across consecutive reads
     dom_persist: dict[str, dict] = {}
     DOM_PERSIST_REQUIRED = 3
@@ -1343,7 +1343,7 @@ def _derivatives_fetch_sync(symbol: str) -> dict | None:
     return {"symbol": sym, "openInterest": oi, "fundingRate": funding, "longShortRatio": ls_ratio, "updated_ts": time.time()}
 
 async def _derivatives_feed():
-    symbols = ["SOLUSDT", "SUIUSDT", "HYPEUSDT", "XRPUSDT", "JUPUSDT", "BTCUSDT", "ETHUSDT", "SPCXUSDT", "NVDAUSDT", "XAUUSDT"]
+    symbols = ["SOLUSDT", "SUIUSDT", "HYPEUSDT", "XRPUSDT", "JUPUSDT", "ARBUSDT", "1000PEPEUSDT", "BTCUSDT", "ETHUSDT", "SPCXUSDT", "NVDAUSDT", "XAUUSDT"]
     log.info("Derivatives feed started (poll %ss)", _DERIVATIVES_POLL_SECONDS)
     while True:
         try:
@@ -1703,8 +1703,17 @@ async def live_indicators():
             delta = data.get("delta")
             if ticker != "?" and price is not None and delta is not None:
                 bar_id = data.get("bar_index")
-                bar_delta = data.get("bar_delta")
+                # The exporter payload has no "bar_delta" key — its per-bar
+                # delta IS "delta". The old line recorded None forever.
+                bar_delta = data.get("delta")
                 cvd_st = _cvd_get(ticker) or {}
+                tape = data.get("tape") or {}
+                # Schema 2. The corpus keeps the TRUE per-bar tape totals and
+                # the most recently CLOSED bar's footprint summary. Only the
+                # newest closed bar is logged: the full 20-bar list would add
+                # ~1 KB per row at 5 Hz and triple the tick-history file.
+                closed_bars = data.get("closed_bars") or []
+                newest_closed = closed_bars[0] if closed_bars else None
                 asyncio.ensure_future(_append_tick_history({
                     "ts": time.time(),
                     "ticker": ticker,
@@ -1716,7 +1725,16 @@ async def live_indicators():
                     "cvd_bars": cvd_st.get("bars", 0),
                     "dom_imbalance": data.get("dom", {}).get("imbalance_pct"),
                     "volume": data.get("volume", {}),
-                    "tape_buy_pct": data.get("tape", {}).get("buy_count_pct"),
+                    "tape_buy_pct": tape.get("buy_count_pct"),
+                    # ── schema 2 ──
+                    "tape_bar_buy_vol": tape.get("bar_buy_vol"),
+                    "tape_bar_sell_vol": tape.get("bar_sell_vol"),
+                    "tape_bar_trade_count": tape.get("bar_trade_count"),
+                    "tape_prints_sampled": tape.get("prints_sampled"),
+                    "open_interest": data.get("open_interest"),
+                    "vwap": data.get("vwap"),
+                    "session_value_area": data.get("session_value_area"),
+                    "closed_bar": newest_closed,
                 }))
             return data
         return {"status": "no_data", "message": "LiveExporter indicator not active on chart"}
@@ -1898,27 +1916,60 @@ async def health():
 def _atas_target_status() -> dict:
     """Declared ATAS target symbol vs the symbol actually charted.
 
-    Reads atas_target.json written by atas-bridge/atas_target.py. Never raises:
-    an unreadable or missing target must not break /health.
+    AUTO-SYNC: when a live symbol is detected on the bridge, atas_target.json is
+    updated to reflect it, so the report always follows whatever is live instead
+    of staying locked to a single declared symbol. Never raises: an unreadable
+    or missing target must not break /health.
     """
     out = {"target": None, "reason": None, "set_at": None,
            "chart": None, "match": None}
+    tpath = os.path.join(os.path.dirname(__file__), "atas_target.json")
     try:
         import json as _j
-        tpath = os.path.join(os.path.dirname(__file__), "atas_target.json")
+        d = {}
         if os.path.exists(tpath):
             with open(tpath, "r", encoding="utf-8") as f:
                 d = _j.load(f)
-            out["target"] = d.get("symbol")
-            out["reason"] = d.get("reason")
-            out["set_at"] = d.get("set_at")
+        out["target"] = d.get("symbol")
+        out["reason"] = d.get("reason")
+        out["set_at"] = d.get("set_at")
     except Exception as e:  # noqa: BLE001
         out["error"] = str(e)[:80]
     try:
         live = _live_indicator_symbols()
-        out["chart"] = sorted(live.keys())[0] if live else None
-        out["match"] = (out["target"] == out["chart"]
-                        if out["target"] and out["chart"] else None)
+        # Pick the FRESHEST live symbol (smallest age), not alphabetically first,
+        # so the report follows whatever is actually being charted right now.
+        if live:
+            chart = min(live, key=lambda k: live[k])
+        else:
+            chart = None
+        out["chart"] = chart
+        # Auto-sync: if a live symbol is detected, update the target to match
+        # so the report always reflects what is live (not a stale lock).
+        if chart:
+            if out["target"] != chart:
+                try:
+                    from datetime import datetime, timezone
+                    new_d = {
+                        "symbol": chart,
+                        "reason": "auto-sync: charted symbol detected by bridge",
+                        "set_at": datetime.now(timezone.utc).isoformat(),
+                        "previous_symbol": out["target"],
+                        "note": "Auto-updated by bridge to match the live chart. "
+                                "Override manually with atas_target.py set if needed.",
+                    }
+                    with open(tpath, "w", encoding="utf-8") as f:
+                        _j.dump(new_d, f, indent=2, ensure_ascii=False)
+                        f.write("\n")
+                    out["target"] = chart
+                    out["reason"] = new_d["reason"]
+                    out["set_at"] = new_d["set_at"]
+                except Exception:
+                    pass
+            out["match"] = True
+        else:
+            out["match"] = (out["target"] == out["chart"]
+                            if out["target"] and out["chart"] else None)
     except Exception:
         pass
     return out
@@ -2228,7 +2279,9 @@ async def process_atas_alert(request: Request):
                     ticker = parsed["ticker"]
                     entry = {
                         "volumen": parsed["volumen"],
-                        "delta": parsed.get("delta", "?"),
+                        # NOTE: no "delta" key — _parse_atas_message never
+                        # produces one, so this used to store a constant "?"
+                        # that looked like data and never was.
                         "precio": parsed["precio"],
                         "raw": text,
                         "ts": now,
@@ -2390,6 +2443,32 @@ def _classify_alert(a: dict) -> dict:
     }
 
 
+def _fmt_price(p) -> str:
+    """Format a price with enough decimals for the instrument.
+
+    The old hardcoded `:.2f` printed every PEPE price as $0.00 — 0.004377
+    rounded to two decimals is zero, so the POC / value area of the live
+    instrument were literally unreadable. Scale the precision to the
+    magnitude instead.
+    """
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return "?"
+    if p == 0:
+        return "0"
+    a = abs(p)
+    if a >= 1000:
+        return f"{p:,.2f}"
+    if a >= 1:
+        return f"{p:,.4f}"
+    if a >= 0.01:
+        return f"{p:,.5f}"
+    if a >= 0.0001:
+        return f"{p:,.6f}"
+    return f"{p:,.8f}"
+
+
 def _build_fast_analysis(ticker: str) -> str:
     """Build a full analysis from LiveExporter data using deterministic signal engine."""
     live = _read_live_data()
@@ -2416,32 +2495,41 @@ def _build_fast_analysis(ticker: str) -> str:
     largest = tape.get("largest_trade", 0)
     largest_side = tape.get("largest_trade_side", "?")
 
+    # Schema 2: TRUE per-bar tape totals. `net_vol`/`buy_count_pct` describe a
+    # 30-PRINT WINDOW and can point the opposite way from the bar it came from
+    # (measured on 1000PEPEUSDT: window net +1.1M BUY while the bar was net
+    # -6.6M SELL across 457 prints). Direction must come from the bar totals.
+    bar_net = tape.get("bar_net_vol")
+    bar_buy = tape.get("bar_buy_vol")
+    bar_sell = tape.get("bar_sell_vol")
+    bar_count = tape.get("bar_trade_count")
+    has_bar_totals = bar_net is not None
+
+    # Schema 2: session value area (the live bar's VA is NOT the session's).
+    sva = live.get("session_value_area") or {}
+
     # DOM
     imb = dom.get("imbalance_pct", 0)
     bid_cum = dom.get("cumulative_bid_vol", 0)
     ask_cum = dom.get("cumulative_ask_vol", 0)
 
-    # Deterministic signal engine
+    # Deterministic rule checks (NO scoring: the weighted bias was removed —
+    # its v3.4.1 weights measured anti-predictive; the only scoring authority
+    # is the percentile scorecard in reader/verdict.py).
     from signal_engine import build_snapshot_from_live, compute_signal
     cvd_st = _cvd_get(ticker)
     snap = build_snapshot_from_live(live, cvd_st)
     sig = compute_signal(snap) if snap else None
 
+    rule_lines = ""
     if sig:
-        bias_icon = "🟢" if sig.bias_label == "bullish" else ("🔴" if sig.bias_label == "bearish" else "🟡")
-        score = sig.bias_score
-        bias_str = f"{bias_icon} {sig.bias_label.upper()}"
         extra = []
         if sig.rule_2_exhaustion:
             extra.append("⚠️ Rule 2: CVD exhaustion — no continuation call")
-        if sig.rule_6_active:
-            extra.append("📉 Rule 6: Distribution active")
-        if sig.rule_7_active:
-            extra.append("📈 Rule 7: Accumulation active")
-        rule_lines = "\n".join(f"<i>{r}</i>" for r in extra) if extra else ""
+        if sig.data_coverage < 0.75:
+            extra.append(f"🌫 Coverage {sig.data_coverage:.2f} — sin datos para apoyar un plan")
+        rule_lines = "\n".join(f"<i>{r}</i>" for r in extra)
     else:
-        score = 50
-        bias_str = "🟡 NEUTRAL"
         rule_lines = ""
 
     # CVD display
@@ -2461,27 +2549,40 @@ def _build_fast_analysis(ticker: str) -> str:
         cvd_line = "⚪ no closed bars yet"
 
     fp_icon = "🟢" if buy_levels > sell_levels else ("🔴" if sell_levels > buy_levels else "⚪")
+
+    if has_bar_totals:
+        tape_line = (f"Bar: {bar_buy:,.0f} buy / {bar_sell:,.0f} sell | "
+                     f"Net: {bar_net:+,.0f} ({bar_count} prints)")
+    else:
+        tape_line = (f"Buy {buy_pct:.0f}% / Sell {100-buy_pct:.0f}% | "
+                     f"Net: {net_vol:+.1f} | Lg: {largest:.0f} {largest_side.upper()}")
+
+    session_line = ""
+    if sva.get("poc"):
+        session_line = (f" | Session POC {_fmt_price(sva.get('poc', 0))} "
+                        f"VA {_fmt_price(sva.get('value_area_low', 0))}-{_fmt_price(sva.get('value_area_high', 0))} "
+                        f"({sva.get('bars_used', 0)} bars)")
+
     lines = [
         f"<b>📊 {ticker} — QUANT ANALYSIS</b>",
-        f"💵 <b>${last_price}</b> | Delta: {'🟢' if delta >=0 else '🔴'}{delta:+.1f} | Vol: {total_vol:,.0f}",
+        f"💵 <b>{_fmt_price(last_price)}</b> | Delta: {'🟢' if delta >=0 else '🔴'}{delta:+.1f} | Vol: {total_vol:,.0f}",
         f"",
         f"<b>🏛 FOOTPRINT</b>",
-        f"POC: ${fp.get('poc', 0):.2f} | VA {fp.get('value_area_low',0):.2f}-{fp.get('value_area_high',0):.2f}",
+        f"POC: {_fmt_price(fp.get('poc', 0))} | VA {_fmt_price(fp.get('value_area_low',0))}-{_fmt_price(fp.get('value_area_high',0))}{session_line}",
         f"Levels: {len(levels)} ({buy_levels}🟢/{sell_levels}🔴) | Direction: {fp_icon}",
         f"",
         f"<b>📊 DOM</b>",
         f"Imbalance: {'+' if imb >= 0 else ''}{imb:.1f}% | Bids: {bid_cum:,.0f} / Asks: {ask_cum:,.0f}",
         f"",
         f"<b>📼 TAPE</b>",
-        f"Buy {buy_pct:.0f}% / Sell {100-buy_pct:.0f}% | Net: {net_vol:+.1f} | Lg: {largest:.0f} {largest_side.upper()}",
+        tape_line,
         f"",
         f"<b>📈 CVD</b>",
         cvd_line,
-        f"",
-        f"<b>⚖️ SIGNAL: {score:.0f}/100 — {bias_str}</b>",
     ]
     if rule_lines:
         lines.append("")
+        lines.append("<b>⚖️ REGLAS (rules.json)</b>")
         lines.append(rule_lines)
     return "\n".join(lines)
 
@@ -2591,12 +2692,12 @@ def _build_analysis(ticker: str, alerts: list[dict]) -> str:
         pass
     if live_price_for_header:
         lines.append(f"📌 {' | '.join(parts)}")
-        lines.append(f"💰 Precio LIVE: ${live_price_for_header:.2f} | Rango buffer: ${low:.2f} – ${high:.2f} (rango ${rng:.2f})")
+        lines.append(f"💰 Precio LIVE: {_fmt_price(live_price_for_header)} | Rango buffer: {_fmt_price(low)} – {_fmt_price(high)} (rango {_fmt_price(rng)})")
         if abs(live_price_for_header - high) > high * 0.05 or abs(live_price_for_header - low) > low * 0.05:
-            lines.append(f"⚠️ Buffer desactualizado — plan anclado a LIVE ${live_price_for_header:.2f}, no a buffer")
+            lines.append(f"⚠️ Buffer desactualizado — plan anclado a LIVE {_fmt_price(live_price_for_header)}, no a buffer")
     else:
         lines.append(f"📌 {' | '.join(parts)}")
-        lines.append(f"💰 Precio: ${low} – ${high} (rango ${rng:.2f})")
+        lines.append(f"💰 Precio: {_fmt_price(low)} – {_fmt_price(high)} (rango {_fmt_price(rng)})")
 
     try:
         sym = ticker.lower()
@@ -2606,7 +2707,7 @@ def _build_analysis(ticker: str, alerts: list[dict]) -> str:
             ask = d["best_ask"]
             spr = ask - bid
             imb = d.get("imbalance_pct", 0)
-            lines.append(f"💧 Spread ${spr:.2f} | Imbalance DOM {imb:+.1f}%")
+            lines.append(f"💧 Spread {_fmt_price(spr)} | Imbalance DOM {imb:+.1f}%")
     except Exception:
         pass
 
@@ -2654,7 +2755,7 @@ def _build_analysis(ticker: str, alerts: list[dict]) -> str:
             o = live["price"]["open"]
             c = live_current_price
             bar_dir = "🟢" if c >= o else "🔴"
-            lines.append(f"  Barra actual: {bar_dir} Open ${o:.2f} → Close ${c:.2f} | Delta {delta_icon} {live_delta:+.1f}")
+            lines.append(f"  Barra actual: {bar_dir} Open {_fmt_price(o)} → Close {_fmt_price(c)} | Delta {delta_icon} {live_delta:+.1f}")
             # Delta confirming or rejecting bar
             if (c >= o and live_delta > 0) or (c < o and live_delta < 0):
                 lines.append(f"  ✅ Delta CONFIRMA dirección del precio")

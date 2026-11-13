@@ -1,6 +1,6 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
@@ -28,6 +28,13 @@
     </Reference>
     <Reference Include="OFT.Rendering">
       <HintPath>C:\Program Files\ATAS X\OFT.Rendering.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <!-- System.Drawing.Common carries StringAlignment / DashStyle, which
+         OFT.Rendering's public signatures (RenderStringFormat, RenderPen)
+         expose. ATAS ships it, so reference the same copy the platform runs. -->
+    <Reference Include="System.Drawing.Common">
+      <HintPath>C:\Program Files\ATAS X\System.Drawing.Common.dll</HintPath>
       <Private>False</Private>
     </Reference>
   </ItemGroup>

@@ -13,8 +13,65 @@ import os
 
 
 # ---------------------------------------------------------------------------
-# Types
+# rules.json — the ONLY source of rule thresholds
 # ---------------------------------------------------------------------------
+# 2026-10-11 audit finding, line-by-line pass: every threshold below used to be
+# hardcoded (spike 2.0 vs declared 1.5, footprint 70% vs declared 65, DOM
+# +5/+10 vs declared +3/+8), dom_persistence_polls_min was not checked at all,
+# and rule 6's "disabled" enforcement was ignored — the quarantined rule kept
+# vetoing plans. That is the exact transcription-bug class verdict.py fixed on
+# 2026-10-07 ("los umbrales estaban transcritos a mano"). Everything is read
+# from atas-bridge/rules.json now; the old literals survive only as fallbacks
+# for the no-file case, and a missing file warns instead of guessing silently.
+_RULES_PATH = os.path.join(os.path.dirname(__file__), "rules.json")
+
+
+def _load_rules_raw() -> dict:
+    try:
+        with open(_RULES_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:  # noqa: BLE001
+        print(f"[signal_engine] AVISO: rules.json no legible ({e}); "
+              f"se usan umbrales por defecto que pueden NO cumplir rules.json.")
+        return {}
+
+
+_RULES_RAW = _load_rules_raw()
+
+
+def _load_rule_conditions(rule_id: int) -> dict:
+    """Flat conditions dict for one rule id, or _present=False when missing.
+
+    Mirrors reader/verdict.py's loader: rules.json nests conditions under
+    rules["rules"][i]["conditions"] with the rules as a LIST here. A flat dict
+    means a consumer either finds the key or it doesn't — there is no wrong
+    level to read from.
+    """
+    for r in (_RULES_RAW.get("rules") or []):
+        try:
+            if int(r.get("id", -1)) == rule_id:
+                out = dict(r.get("conditions") or {})
+                out["_enforcement"] = r.get("enforcement", "hard")
+                out["_present"] = True
+                return out
+        except (TypeError, ValueError):
+            continue
+    return {"_enforcement": "hard", "_present": False}
+
+
+_R2 = _load_rule_conditions(2)
+
+RULE2 = {"spike_multiple": float(_R2.get("spike_multiple", 2.0)),
+         "min_prior_bars": int(_R2.get("min_prior_bars", 3))}
+if not _R2.get("_present"):
+    print("[signal_engine] AVISO: regla 2 incompleta en rules.json; "
+          "los defaults sustituyen lo que falte.")
+# AT-6/AT-7 NO se evaluan aqui (2026-10-11, Fix 2-A): su condicion (c) es
+# consenso multi-venue del scanner con persistencia entre lecturas, y este
+# modulo es puro (sin I/O, sin memoria entre llamadas). Su UNICO evaluador es
+# la puerta del reader: reader/verdict.py dom_vac_eval. Duplicarlos aqui con
+# otra fuente de datos es el fallo de contrato que este repo ya pago dos veces.
+
 
 @dataclass
 class Snapshot:
@@ -36,6 +93,11 @@ class Snapshot:
     # audit C-3 action 3, 2026-09-17 — with raw fallback when EMA unavailable)
     dom_imbalance_pct: float = 0.0
     dom_imbalance_ema: float = 0.0
+    # Sample count behind the EMA. rules.json's dom_persistence_polls_min makes
+    # it part of conditions (c): a hard rule evaluated on a single sample is
+    # not a hard rule. The bridge attaches imbalance_pct_ema_n in
+    # _attach_dom_context; backtester snapshots predate the field and send 0.
+    dom_imbalance_ema_n: int = 0
     cumulative_bid_vol: float = 0.0
     cumulative_ask_vol: float = 0.0
 
@@ -54,120 +116,61 @@ class Snapshot:
     cvd_bar_deltas: list[float] = field(default_factory=list)
     cvd_continuity: str = "clean"   # "clean" | "post-gap" | "unknown"
 
+    # ── LiveExporter schema 2 (2026-11-12) ────────────────────────────────
+    # TRUE per-bar tape totals. The `tape_buy_vol`/`tape_sell_vol` above are
+    # the 30-PRINT WINDOW and keep that meaning on purpose: old track-record
+    # rows must stay comparable. These are every print of the bar, so a 30-print
+    # window can no longer be mistaken for the bar (measured on 1000PEPEUSDT:
+    # window said net +1.1M BUY while the bar was net -6.6M SELL over 457
+    # prints). Always read these for direction, not the window fields.
+    tape_bar_buy_vol: float = 0.0
+    tape_bar_sell_vol: float = 0.0
+    tape_bar_trade_count: int = 0
+    tape_prints_sampled: int = 0
+
+    # Per-bar order flow
+    open_interest: float = 0.0
+    vwap: float = 0.0
+    max_delta: float = 0.0
+    min_delta: float = 0.0
+
+    # Session value area, computed inside ATAS from the closed-bar footprint
+    # union. Before schema 2 the bridge only ever saw the FORMING bar's value
+    # area, so there was no session context at all.
+    session_poc: float = 0.0
+    session_value_area_high: float = 0.0
+    session_value_area_low: float = 0.0
+    session_value_area_bars: int = 0
+
+    # Closed-bar footprint summary, newest first. Each entry carries the bar's
+    # POC / value area / delta / imbalance plus stacked-imbalance counts.
+    # The per-level detail is only present when the exporter's
+    # "Publish closed-bar levels" setting is on.
+    closed_bars: list[dict] = field(default_factory=list)
+
 
 @dataclass
 class SignalResult:
     """Deterministic output from compute_signal()."""
-    bias_score: float
-    bias_label: str  # "bullish" / "bearish" / "neutral"
-    sub_scores: dict[str, float]
     trade_plan_allowed: bool
     rule_2_exhaustion: bool
-    rule_6_active: bool
-    rule_7_active: bool
     data_coverage: float = 1.0     # 0-1: fraction of scoring weight backed by real data
     plan_blocked_reasons: list[str] = field(default_factory=list)
     # Audit H-1/H-2 action 4 (2026-09-17): explicit footprint verifiability for
-    # rules 6/7 — "ok" (4+ levels: both evaluable), "partial" (1-3: only rule 7
-    # structurally evaluable), "absent" (0: neither evaluable, NOT neutral).
+    # the footprint legs — "ok" (4+ levels: evaluable), "partial" (1-3),
+    # "absent" (0: NOT neutral — unknowable).
     footprint_status: str = "absent"
 
 
 # ---------------------------------------------------------------------------
-# Load rules.json weights
+# Rule checks
 # ---------------------------------------------------------------------------
-
-_RULES_PATH = os.path.join(os.path.dirname(__file__), "rules.json")
-
-
-def _load_weights() -> dict:
-    try:
-        with open(_RULES_PATH, "r") as f:
-            rules = json.load(f)
-        return rules.get("scoring_weights", {
-            "footprint_depth": 25, "dom_imbalance": 25,
-            "tape_ratio": 20, "volume_climax": 15, "footprint_confirmation": 15
-        })
-    except Exception:
-        return {"footprint_depth": 25, "dom_imbalance": 25,
-                "tape_ratio": 20, "volume_climax": 15, "footprint_confirmation": 15}
-
-
-# ---------------------------------------------------------------------------
-# Sub-scores (each 0-10)
-# ---------------------------------------------------------------------------
-
-def _score_footprint_depth(s: Snapshot) -> float:
-    """Score footprint: ratio of buying vs selling levels."""
-    if not s.footprint_levels:
-        return 5.0
-    buy_levels = sum(1 for lv in s.footprint_levels if lv.get("delta", 0) > 0)
-    sell_levels = sum(1 for lv in s.footprint_levels if lv.get("delta", 0) < 0)
-    total = buy_levels + sell_levels
-    if total == 0:
-        return 5.0
-    ratio = buy_levels / total
-    # 0.0 → score 0, 0.5 → 5, 1.0 → 10
-    return ratio * 10.0
-
 
 def _dom_ema(s: Snapshot) -> float:
     """45s-averaged DOM imbalance; raw fallback when EMA unavailable
     (backtester/validator snapshots predate the EMA field)."""
     return s.dom_imbalance_ema if s.dom_imbalance_ema != 0.0 else s.dom_imbalance_pct
 
-
-def _score_dom_imbalance(s: Snapshot) -> float:
-    """Score DOM imbalance: centered at 5, soft-saturated via sigmoid so the
-    full observed crypto range (±40%..±75%) keeps discriminating instead of
-    clipping at ±40 (audit C3). imb=0 -> 5, asymptotes 0/10 at extreme tails."""
-    imb = _dom_ema(s)
-    # scale: 1.0 at imb≈±75 maps to ~8.8/1.2; 10/0 only in pathological tails
-    try:
-        x = imb / 40.0
-        score = 5.0 + 5.0 * (2.0 / (1.0 + math.exp(-x)) - 1.0)
-    except Exception:  # noqa: BLE001
-        return 5.0
-    return max(0.0, min(10.0, round(score, 2)))
-
-
-def _score_tape_ratio(s: Snapshot) -> float:
-    """Volume-weighted tape ratio: 70% USD volume + 30% trade count."""
-    total_vol = s.tape_buy_vol + s.tape_sell_vol
-    total_cnt = s.tape_buy_count + s.tape_sell_count
-    vol_ratio = (s.tape_buy_vol / total_vol) if total_vol > 0 else 0.5
-    cnt_ratio = (s.tape_buy_count / total_cnt) if total_cnt > 0 else 0.5
-    combined = (0.70 * vol_ratio) + (0.30 * cnt_ratio)
-    return round(combined * 10.0, 2)
-
-
-def _score_volume_climax(s: Snapshot) -> float:
-    """SIGNED climax score (audit C1): strong one-sided flow is directional —
-    heavy buying raises the score, heavy selling lowers it. Previously the
-    score used |delta|/volume so a huge sell bar read as bullish flow.
-
-    ratio = delta/volume in [-1, 1]:
-      +1.0 (all buying)  -> 10.0
-       0.0 (absorbed)    ->  5.0  (no directional edge — exhaustion/absorption)
-      -1.0 (all selling) ->  0.0
-    """
-    if s.volume_total <= 0 or s.delta == 0:
-        return 5.0
-    ratio = s.delta / s.volume_total
-    ratio = max(-1.0, min(1.0, ratio))
-    return round(5.0 + 5.0 * math.tanh(ratio / 0.25), 2)
-
-
-def _score_footprint_confirmation(s: Snapshot) -> float:
-    """Score footprint confirmation: 2+ levels with volume = pattern confirmed."""
-    if s.footprint_levels and len(s.footprint_levels) >= 2:
-        return 10.0  # confirmed
-    return 5.0  # insufficient data
-
-
-# ---------------------------------------------------------------------------
-# Rule checks
-# ---------------------------------------------------------------------------
 
 def _cvd_consecutive(deltas: list[float]) -> tuple[int, int]:
     """Count consecutive same-sign deltas from the end. Returns (consec_up, consec_down)."""
@@ -187,72 +190,26 @@ def _cvd_consecutive(deltas: list[float]) -> tuple[int, int]:
 
 
 def _check_rule_2_exhaustion(s: Snapshot) -> bool:
-    """Rule 2: one-bar CVD spike >2x prior max 1-bar spike = exhaustion, not continuation.
+    """Rule 2: one-bar CVD spike > spike_multiple x prior max 1-bar spike =
+    exhaustion, not continuation. Thresholds from rules.json (v3.4.1 declares
+    spike_multiple 1.5, min_prior_bars 3 — the code used to hardcode 2.0, so a
+    1.5x-2.0x spike that rules.json calls exhaustion was read as continuation).
     Only evaluated on a clean CVD series (post-gap deltas are unreliable)."""
-    if len(s.cvd_bar_deltas) < 4:
+    need = RULE2["min_prior_bars"]
+    if len(s.cvd_bar_deltas) < need + 1:
         return False
     if s.cvd_continuity == "post-gap":
         return False
     last = abs(s.cvd_bar_deltas[-1])
     prior_max = max(abs(d) for d in s.cvd_bar_deltas[:-1])
-    return prior_max > 0 and last > 2.0 * prior_max
-
-
-def _check_rule_6_distribution(s: Snapshot) -> bool:
-    """Rule 6: ALL of: (a) CVD drops 2+ consecutive bars AND (b) 4 levels 70%+ selling AND (c) DOM <+5%.
-    Only on a clean CVD series (audit C2/H3: post-gap deltas must not fire hard rules)."""
-    if s.cvd_continuity == "post-gap":
-        return False
-    _, consec_down = _cvd_consecutive(s.cvd_bar_deltas)
-    if consec_down < 2:
-        return False
-    levels = s.footprint_levels
-    if len(levels) < 4:
-        return False
-    sell_dominated = 0
-    for lv in levels:
-        bid_vol = lv.get("bid", 0)
-        ask_vol = lv.get("ask", 0)
-        total_level_vol = bid_vol + ask_vol
-        if total_level_vol > 0 and bid_vol / total_level_vol >= 0.70:
-            sell_dominated += 1
-    if sell_dominated < 4:
-        return False
-    if _dom_ema(s) >= 5:
-        return False
-    return True
-
-
-def _check_rule_7_accumulation(s: Snapshot) -> bool:
-    """Rule 7: ALL of: (a) CVD rises 2+ consecutive bars AND (b) 3 levels 70%+ buying AND (c) DOM >+10%.
-    Only on a clean CVD series."""
-    if s.cvd_continuity == "post-gap":
-        return False
-    consec_up, _ = _cvd_consecutive(s.cvd_bar_deltas)
-    if consec_up < 2:
-        return False
-    levels = s.footprint_levels
-    if len(levels) < 3:
-        return False
-    buy_dominated = 0
-    for lv in levels:
-        bid_vol = lv.get("bid", 0)
-        ask_vol = lv.get("ask", 0)
-        total_level_vol = bid_vol + ask_vol
-        if total_level_vol > 0 and ask_vol / total_level_vol >= 0.70:
-            buy_dominated += 1
-    if buy_dominated < 3:
-        return False
-    if _dom_ema(s) <= 10:
-        return False
-    return True
+    return prior_max > 0 and last > RULE2["spike_multiple"] * prior_max
 
 
 # ---------------------------------------------------------------------------
 # Main function
 # ---------------------------------------------------------------------------
 
-def _data_coverage(s: Snapshot, weights: dict) -> float:
+def _data_coverage(s: Snapshot) -> float:
     """Fraction of total scoring weight backed by REAL data (audit C4).
 
     Missing footprint/tape/volume currently fall back to neutral 5.0, which
@@ -261,7 +218,9 @@ def _data_coverage(s: Snapshot, weights: dict) -> float:
     reported on every SignalResult."""
     real = 0.0
     total = 0.0
-    for k, w in weights.items():
+    WEIGHTS = {"footprint_depth": 25, "footprint_confirmation": 15,
+                    "dom_imbalance": 25, "tape_ratio": 20, "volume_climax": 15}
+    for k, w in WEIGHTS.items():
         total += w
         if k == "footprint_depth" and s.footprint_levels:
             real += w
@@ -280,42 +239,19 @@ def _data_coverage(s: Snapshot, weights: dict) -> float:
 
 
 def compute_signal(snapshot: Snapshot) -> SignalResult:
-    """Deterministic signal computation. Pure function, no side effects."""
-    weights = _load_weights()
+    """Rule checks + data-coverage verdict. Deterministic, no scoring.
 
-    sub_scores = {
-        "footprint_depth": _score_footprint_depth(snapshot),
-        "dom_imbalance": _score_dom_imbalance(snapshot),
-        "tape_ratio": _score_tape_ratio(snapshot),
-        "volume_climax": _score_volume_climax(snapshot),
-        "footprint_confirmation": _score_footprint_confirmation(snapshot),
-    }
-
-    # Weighted sum — sub-scores are 0-10, weights sum to ~100.
-    # Normalize to 0-100 so Rule 4 thresholds (>=60 bullish, <=40 bearish) apply.
-    total_weight = sum(weights.values())
-    if total_weight == 0:
-        bias_score = 50.0
-    else:
-        bias_score = sum(
-            sub_scores[k] * weights.get(k, 5) for k in sub_scores
-        ) / total_weight * 10.0
-
-    # Bias label (Rule 4)
-    if bias_score >= 60:
-        bias_label = "bullish"
-    elif bias_score <= 40:
-        bias_label = "bearish"
-    else:
-        bias_label = "neutral"
-
-    # Rule checks
+    The weighted bias_score was REMOVED (2026-10-11): its v3.4.1 weights were
+    measured ANTI-PREDICTIVE (spread -4.0 on 1,205 resolved outcomes) and its
+    percentile successor lives in reader/verdict.py, which is the single
+    scoring authority. What survives here is the part that measured clean:
+    the data-coverage and footprint-verifiability honesty. Rules AT-6/AT-7
+    moved to the reader's door the same day (Fix 2-A, docs/FIXES-gate-DOM.md):
+    their condition (c) is scanner multi-venue book consensus with
+    cross-reading persistence, which a pure module cannot judge.
+    """
     rule_2_exhaustion = _check_rule_2_exhaustion(snapshot)
-    rule_6_active = _check_rule_6_distribution(snapshot)
-    rule_7_active = _check_rule_7_accumulation(snapshot)
-
-    coverage = _data_coverage(snapshot, weights)
-    reasons: list[str] = []
+    coverage = _data_coverage(snapshot)
 
     # Footprint verifiability for rules 6/7 (audit H-1: ATAS charts one symbol;
     # for the rest the legs cannot be evaluated at all — report it, don't
@@ -323,39 +259,19 @@ def compute_signal(snapshot: Snapshot) -> SignalResult:
     _fp_n = len(snapshot.footprint_levels)
     footprint_status = "ok" if _fp_n >= 4 else ("partial" if _fp_n >= 1 else "absent")
 
-    # Rule 10 DELETED (audit C-1 action 1, 2026-09-17): the composite score no
-    # longer permits or forbids plans — it only ranks. trade_plan_allowed
-    # defaults True; the hard vetoes below can still block.
-    trade_plan_allowed = True
-    # Rule 2 (hard): exhaustion spike is NOT a continuation call (audit C2).
-    if rule_2_exhaustion:
-        trade_plan_allowed = False
-        reasons.append("rule_2_exhaustion_veto")
-    # Rule 6 (hard): confirmed distribution contradicts a bullish plan.
-    if rule_6_active and bias_label == "bullish":
-        trade_plan_allowed = False
-        reasons.append("rule_6_distribution_contradicts_long")
-    # Rule 7 (hard): confirmed accumulation contradicts a bearish plan.
-    if rule_7_active and bias_label == "bearish":
-        trade_plan_allowed = False
-        reasons.append("rule_7_accumulation_contradicts_short")
+    reasons: list[str] = []
     # C4/H-2: no phantom plans from single-source / missing-data scores.
     # Gate raised 0.5 -> 0.75 (audit H-2 action 4): with no footprint at all
     # coverage is 0.60, which must NOT pass.
-    if coverage < 0.75:
-        trade_plan_allowed = False
+    trade_plan_allowed = coverage >= 0.75
+    if not trade_plan_allowed:
         reasons.append(f"low_data_coverage_{coverage:.2f}")
-    if footprint_status != "ok" and not trade_plan_allowed:
+    if footprint_status != "ok":
         reasons.append(f"rules_67_unverifiable_footprint_{footprint_status}")
 
     return SignalResult(
-        bias_score=round(bias_score, 1),
-        bias_label=bias_label,
-        sub_scores=sub_scores,
         trade_plan_allowed=trade_plan_allowed,
         rule_2_exhaustion=rule_2_exhaustion,
-        rule_6_active=rule_6_active,
-        rule_7_active=rule_7_active,
         data_coverage=round(coverage, 2),
         plan_blocked_reasons=reasons,
         footprint_status=footprint_status,
@@ -366,12 +282,20 @@ def build_snapshot_from_live(live: dict, cvd: dict | None = None) -> Snapshot | 
     """Build a Snapshot from LiveExporter dict + optional bridge CVD state."""
     if not live:
         return None
-    price = live.get("price", {})
-    vol = live.get("volume", {})
-    fp = live.get("footprint", {})
-    dom = live.get("dom", {})
-    tape = live.get("tape", {})
+    # `or {}` on every block, not just a default: a key that EXISTS with a
+    # null value (a torn read, a hand-edited file) makes `live.get(k, {})`
+    # return None and the next `.get` raises AttributeError. The reader must
+    # survive a half-written snapshot, not crash on it.
+    price = live.get("price") or {}
+    vol = live.get("volume") or {}
+    fp = live.get("footprint") or {}
+    dom = live.get("dom") or {}
+    tape = live.get("tape") or {}
     cvd = cvd or {}
+    # Schema 2 blocks. Every one of them is optional: a v1 payload (an old
+    # exporter file, or a backtester snapshot) must still build a Snapshot.
+    sva = live.get("session_value_area") or {}
+    closed_bars = live.get("closed_bars") or []
 
     return Snapshot(
         ticker=live.get("ticker", "?"),
@@ -386,6 +310,7 @@ def build_snapshot_from_live(live: dict, cvd: dict | None = None) -> Snapshot | 
         value_area_low=fp.get("value_area_low", 0),
         dom_imbalance_pct=dom.get("imbalance_pct", 0),
         dom_imbalance_ema=dom.get("imbalance_pct_ema", 0),
+        dom_imbalance_ema_n=int(dom.get("imbalance_pct_ema_n", 0) or 0),
         cumulative_bid_vol=dom.get("cumulative_bid_vol", 0),
         cumulative_ask_vol=dom.get("cumulative_ask_vol", 0),
         tape_buy_vol=tape.get("buy_vol", 0),
@@ -399,4 +324,18 @@ def build_snapshot_from_live(live: dict, cvd: dict | None = None) -> Snapshot | 
         cvd_bars=cvd.get("bars", 0),
         cvd_bar_deltas=list(cvd.get("bar_deltas", [])),
         cvd_continuity=cvd.get("continuity", "clean"),
+        # ── schema 2 ──
+        tape_bar_buy_vol=tape.get("bar_buy_vol") or 0,
+        tape_bar_sell_vol=tape.get("bar_sell_vol") or 0,
+        tape_bar_trade_count=int(tape.get("bar_trade_count") or 0),
+        tape_prints_sampled=int(tape.get("prints_sampled") or 0),
+        open_interest=live.get("open_interest") or 0,
+        vwap=live.get("vwap") or 0,
+        max_delta=live.get("max_delta") or 0,
+        min_delta=live.get("min_delta") or 0,
+        session_poc=sva.get("poc") or 0,
+        session_value_area_high=sva.get("value_area_high") or 0,
+        session_value_area_low=sva.get("value_area_low") or 0,
+        session_value_area_bars=int(sva.get("bars_used") or 0),
+        closed_bars=list(closed_bars),
     )
