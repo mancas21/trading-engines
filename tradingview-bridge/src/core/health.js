@@ -161,7 +161,8 @@ export async function uiState() {
 
 export async function launch({ port, kill_existing } = {}) {
   const cdpPort = port || 9222;
-  const killFirst = kill_existing !== false;
+  // audit 1.2: matar el terminal de trading exige decision explicita; el default ya no es true.
+  const killFirst = kill_existing === true;
   const platform = process.platform;
 
   const pathMap = {
