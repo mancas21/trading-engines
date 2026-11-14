@@ -247,6 +247,15 @@ python orderflow_calls.py monitor --atas-max-age 30
 
 ### The rule that matters: never attach the wrong symbol's footprint
 
+**Cobertura 2026-11-14 (decisión del usuario):** los pares SIN chart ya no
+quedan sin flujo — el motor sintético (`synthetic_flow.py`, alimentado por el
+stream @trade que `_dom_feeds` ya mantiene para los 12 pares) computa delta
+por barra, tape, footprint-DELTA por nivel, VWAP y session VA para todos.
+Endpoints: `GET /indicators/{symbol}` (exporter real si hay archivo fresco de
+ESE símbolo, si no sintético, siempre con `source` explícito) y
+`GET /indicators_all` (los 12). El footprint sintético es delta por nivel de
+agresor, NO bid/ask por nivel — eso sigue siendo exclusivo del L2 de ATAS.
+
 The LiveExporter reflects **whichever chart ATAS is on**. One chart = one instrument,
 so at any instant at most ONE of the tracked symbols can legitimately carry footprint.
 `atas_features()` returns no attach — with the reason recorded — when:

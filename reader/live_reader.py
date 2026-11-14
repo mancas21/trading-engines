@@ -14,8 +14,11 @@ escrito en la salida, no assumptions silenciosas.
 LAS 4 FUENTES
 =============
   1. ATAS L2   footprint/DOM/tape — el ÚNICO símbolo con L2 real
-  2. TradingView  estructura: EMA/RSI/ATR vía CDP :9222
-  3. Binance   precio 24h + breadth de 9 símbolos
+  2. Estructura klines — EMA/RSI/ATR/posición computados de velas Binance
+     (2026-11-14: sustituye a TradingView/CDP, que se midió SIN señal
+     t≈0.13/-0.14/-0.92 y era la dependencia frágil del pipeline; ahora
+     cubre TODOS los pares, no solo el chart)
+  3. Binance   precio 24h + breadth
   4. Macro     contexto CMC/CoinGecko vía /health del motor
 
 Las reglas 6/7 (Fase 3) solo usan ATAS, porque son reglas de order flow. Las
@@ -31,7 +34,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import time
 import urllib.request
 from pathlib import Path
@@ -41,19 +43,12 @@ ROOT = HERE.parent
 BRIDGE = "http://127.0.0.1:8000"
 # 2026-10-11: ENGINE (:8081, Quant Alert Engine) eliminado de este modulo.
 # QAE es manual-only y no es fuente de nada. src_macro() va a CoinGecko directo.
-CDP = "http://127.0.0.1:9222"
-TV_SCRIPT = ROOT / "tradingview-bridge" / "tv_live.mjs"
 STALE_S = 300.0
-# 2026-10-15 — Cache del chart.
-#
-# `_tradingview_read()` lanza node y puede tardar hasta 120 s. El notificador lo
-# llamaba en CADA ciclo (30 s) y ademas el veredicto necesita la estructura para
-# publicarla: hacerlo dos veces por ciclo es caro y arriesga el ritmo del reader.
-# Se cachea en disco; las lecturas dentro de la ventana devuelven la copia CON SU
-# EDAD, para que quien la lea sepa si es fresca. Y si node/CDP fallan de forma
-# puntual no se pierde la ultima lectura buena: se devuelve marcada.
-TV_CACHE_S = 240.0
-_TV_CACHE = HERE / "tv_structure_cache.json"
+FAPI = "https://fapi.binance.com"
+# 2026-11-14 — la cache de disco de TradingView (tv_structure_cache.json) queda
+# obsoleta: la fuente 2 ya no lanza node/CDP (que podía tardar 120 s y colgó el
+# notificador); ahora es un fetch de klines con cache en memoria de 60s.
+TV_CACHE_S = 60.0
 
 
 def _json(url: str, timeout: float = 20.0):
@@ -88,104 +83,134 @@ def src_atas() -> dict:
     return out
 
 
-# ── Fuente 2: TradingView (estructura, NUNCA order flow) ──
-def _tradingview_read() -> dict:
-    """Estructura desde el chart real.
+# ── Fuente 2: estructura desde klines de Binance ──
+# 2026-11-14: ANTES era TradingView vía CDP (tv_live.mjs). Se midió sin señal
+# (t=+0.13/-0.14/-0.92, ver structure_block) y era la dependencia frágil del
+# pipeline (node+CDP colgó el notificador una vez). Las mismas métricas se
+# computan de velas 5m de Binance para TODOS los pares — sin chart, sin CDP.
 
-    OJO: el nivel gratuito de TradingView NO tiene feed L2, así que cualquier
-    'delta' o 'order flow' de un Pine es un proxy de OHLC. Aquí sólo se leen
-    EMA/RSI/ATR/posición en rango — estructura. La orden de flujo viene de ATAS.
-    """
+_KL_CACHE_S = 60.0
+_KL_CACHE: dict = {}
+
+
+def _target_symbol() -> str | None:
     try:
-        with urllib.request.urlopen(f"{CDP}/json/version", timeout=10) as r:
-            ver = json.loads(r.read().decode())
-        ua = ver.get("User-Agent", "")
-        if "TVDesktop/" not in ua:
-            return {"ok": False, "error": f"no es TradingView Desktop: {ua[:60]}"}
-    except Exception as e:
-        return {"ok": False, "error": f"CDP no disponible: {type(e).__name__}"}
+        raw = (ROOT / "atas-bridge" / "atas_target.json").read_text(encoding="utf-8")
+        return json.loads(raw).get("symbol")
+    except Exception:                               # noqa: BLE001
+        return None
+
+
+def _ema(vals: list[float], n: int) -> float:
+    k = 2.0 / (n + 1)
+    e = vals[0]
+    for v in vals[1:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def _wilder_rsi(closes: list[float], n: int) -> float:
+    if len(closes) < n + 1:
+        return float("nan")
+    gains = losses = 0.0
+    for i in range(1, n + 1):
+        d = closes[i] - closes[i - 1]
+        gains += max(d, 0.0)
+        losses += max(-d, 0.0)
+    ag, al = gains / n, losses / n
+    for i in range(n + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        ag = (ag * (n - 1) + max(d, 0.0)) / n
+        al = (al * (n - 1) + max(-d, 0.0)) / n
+    return 100.0 if al == 0 else 100.0 - 100.0 / (1.0 + ag / al)
+
+
+def _wilder_atr(bars: list[dict], n: int) -> float:
+    trs = []
+    for i in range(1, len(bars)):
+        h, l, pc = bars[i]["h"], bars[i]["l"], bars[i - 1]["c"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if not trs:
+        return float("nan")
+    atr = sum(trs[:n]) / min(n, len(trs))
+    for tr in trs[n:]:
+        atr = (atr * (n - 1) + tr) / n
+    return atr
+
+
+def _klines_structure_read(symbol: str | None = None) -> dict:
+    """EMA/RSI/ATR/posición desde velas 5m de Binance. MISMO schema de salida
+    que el parser de tv_live.mjs para que structure_block() no cambie."""
+    sym = (symbol or _target_symbol() or "").upper()
+    if not sym:
+        return {"ok": False, "error": "sin símbolo objetivo (atas_target.json ilegible)"}
     try:
-        p = subprocess.run(["node", str(TV_SCRIPT)], capture_output=True,
-                           text=True, timeout=120, cwd=str(TV_SCRIPT.parent))
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "tv_live.mjs tardó más de 120s"}
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:60]}"}
-    # tv_live.mjs emits WHITESPACE-PADDED labels ("close        1.4967"), not
-    # "key: value" -- an earlier parser split on ":" and silently matched nothing.
-    # Split on whitespace runs instead, and take the first token as the numeric.
-    kv = {}
-    for line in p.stdout.splitlines():
-        s = line.strip()
-        if not s or s in ("CONNECTED", "DONE"):
-            continue
-        if s.startswith("SYMBOL:"):
-            rest = s[len("SYMBOL:"):].strip()
-            kv["symbol"] = rest.split("|")[0].strip()
-            if "TF:" in rest:
-                kv["tf"] = rest.split("TF:")[1].strip()
-            continue
-        if s.startswith("BARS:"):
-            kv["bars"] = s[len("BARS:"):].strip()
-            continue
-        if s.startswith("position in range"):
-            kv["position_in_range"] = s.split("(")[0].replace(
-                "position in range:", "").strip()
-            continue
-        # "EMA9 vs 21   BULLISH stack" is the STACK line, not an EMA value. It
-        # must be matched BEFORE the generic key/value rule, or ema9 gets the
-        # literal string "vs".
-        if s.startswith("EMA9 vs 21"):
-            kv["stack"] = s[len("EMA9 vs 21"):].strip()
-            continue
-        parts = s.split()
-        if len(parts) >= 2 and parts[0] in (
-                "close", "EMA9", "EMA21", "EMA50", "EMA200", "RSI14",
-                "RSI6", "ATR14"):
-            key = parts[0].lower()
-            # "RSI14        62.96   RSI6 29.41" packs BOTH on one line.
-            kv[key] = parts[1]
-            kv[key + "_rest"] = " ".join(parts[2:])
-            if key == "rsi14":
-                rest = kv[key + "_rest"]
-                if "RSI6" in rest:
-                    kv["rsi6"] = rest.split("RSI6", 1)[1].strip()
-            continue
-    if not kv.get("close"):
-        return {"ok": False, "error": "tv_live.mjs sin salida parseable",
-                "raw": p.stdout[-300:]}
-    kv["ok"] = True
-    kv["note"] = ("estructura solamente: TradingView free no tiene L2, su "
-                  "order-flow es proxy OHLC")
-    return kv
+        req = urllib.request.Request(
+            f"{FAPI}/fapi/v1/klines?symbol={sym}&interval=5m&limit=300",
+            headers={"User-Agent": "live-reader/2.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = json.loads(r.read().decode())
+    except Exception as e:                          # noqa: BLE001
+        return {"ok": False, "error": f"klines no disponibles: {type(e).__name__}"}
+    if not isinstance(raw, list) or len(raw) < 60:
+        return {"ok": False, "error": f"klines insuficientes ({len(raw) if isinstance(raw, list) else 0})"}
+    bars = [{"h": float(k[2]), "l": float(k[3]), "c": float(k[4]), "v": float(k[5])}
+            for k in raw]
+    closes = [b["c"] for b in bars]
+    close = closes[-1]
+    ema9, ema21 = _ema(closes, 9), _ema(closes, 21)
+    ema50 = _ema(closes[-250:], 50)
+    ema200 = _ema(closes[-400:], 200) if len(closes) >= 200 else float("nan")
+    if ema9 > ema21 > ema50:
+        stack = "BULLISH stack"
+    elif ema9 < ema21 < ema50:
+        stack = "BEARISH stack"
+    else:
+        stack = "MIXED"
+    hi = max(b["h"] for b in bars)
+    lo = min(b["l"] for b in bars)
+    pos = (close - lo) / (hi - lo) * 100.0 if hi > lo else 50.0
+    vols = [b["v"] for b in bars]
+    vol_ratio = vols[-1] / (sum(vols[-21:-1]) / 20.0) if len(vols) > 21 else float("nan")
+    return {
+        "ok": True,
+        "symbol": sym,
+        "tf": "5m",
+        "close": close,
+        "ema9": round(ema9, 8), "ema21": round(ema21, 8),
+        "ema50": round(ema50, 8),
+        "ema200": (round(ema200, 8) if ema200 == ema200 else None),
+        "stack": stack,
+        "rsi14": round(_wilder_rsi(closes, 14), 2),
+        "rsi6": round(_wilder_rsi(closes, 6), 2),
+        "atr14": round(_wilder_atr(bars, 14), 8),
+        "position_in_range": f"{pos:.1f}%",
+        "volume_ratio": round(vol_ratio, 3) if vol_ratio == vol_ratio else None,
+        "source": "klines_binance",
+        "note": ("estructura solamente (CONTEXTO, NO señal): mismas métricas que "
+                 "daba tv_live.mjs, computadas de velas Binance para cualquier par"),
+    }
 
 
-def src_tradingview(max_age_s: float = TV_CACHE_S, force: bool = False) -> dict:
-    """Estructura del chart, CACHEADA. Ver TV_CACHE_S arriba."""
+def src_tradingview(max_age_s: float = TV_CACHE_S, force: bool = False,
+                    symbol: str | None = None) -> dict:
+    """Estructura del símbolo objetivo, CACHEADA (60s en memoria).
+
+    Mantiene el nombre histórico para no romper a los callers; la fuente ya no
+    es TradingView sino klines de Binance (ver _klines_structure_read)."""
     now = time.time()
-    cached = None
-    try:
-        if _TV_CACHE.exists():
-            cached = json.loads(_TV_CACHE.read_text(encoding="utf-8"))
-    except Exception:                               # noqa: BLE001
-        cached = None
-    if not force and isinstance(cached, dict) and \
-            (now - float(cached.get("read_ts") or 0)) < max_age_s:
+    sym = (symbol or _target_symbol() or "").upper()
+    if not sym:
+        # una fuente ausente SE DECLARA — no se fetch-ea un simbolo vacio
+        return {"ok": False, "read_ts": now,
+                "error": "sin símbolo objetivo (atas_target.json ilegible)"}
+    cached = _KL_CACHE.get(sym)
+    if not force and isinstance(cached, dict) and             (now - float(cached.get("read_ts") or 0)) < max_age_s:
         return cached
-    fresh = _tradingview_read()
+    fresh = _klines_structure_read(sym)
     fresh["read_ts"] = now
-    try:
-        tmp = _TV_CACHE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(fresh, indent=1), encoding="utf-8")
-        tmp.replace(_TV_CACHE)
-    except Exception:                               # noqa: BLE001
-        pass
-    if not fresh.get("ok") and isinstance(cached, dict) and cached.get("ok"):
-        # Un fallo puntual de node/CDP no puede borrar la ultima lectura buena:
-        # se devuelve marcada, y quien la lea sabe que es vieja.
-        out = dict(cached)
-        out["stale_error"] = fresh.get("error")
-        return out
+    if fresh.get("ok"):
+        _KL_CACHE[sym] = fresh
     return fresh
 
 
@@ -208,7 +233,7 @@ def structure_block(max_age_s: float = TV_CACHE_S) -> dict:
         return {"ok": False, "error": tv.get("error"), "validated": False}
     return {
         "ok": True,
-        "source": "tradingview",
+        "source": "klines_binance",
         "symbol": tv.get("symbol"),
         "tf": tv.get("tf"),
         "close": tv.get("close"),

@@ -36,12 +36,13 @@ import live_reader as L                   # noqa: E402
 
 
 def _fake_tv(**over):
-    base = {"ok": True, "source": "tradingview", "symbol": "BINANCE:JUPUSDT.P",
-            "tf": "240", "close": "0.3100", "ema9": "0.3200", "ema21": "0.3100",
-            "ema50": "0.3000", "ema200": "0.2900",
-            "stack": "BULLISH stack (+3.2%)", "rsi14": "61.0", "rsi6": "66.0",
-            "atr14": "0.0100", "position_in_range": "78.0%",
-            "volume_ratio": "1.20", "read_ts": 1_700_000_000.0}
+    """Lectura de estructura en el formato NUEVO (klines_binance)."""
+    base = {"ok": True, "source": "klines_binance", "symbol": "1000PEPEUSDT",
+            "tf": "5m", "close": 0.31, "ema9": 0.32, "ema21": 0.31,
+            "ema50": 0.30, "ema200": 0.29,
+            "stack": "BULLISH stack", "rsi14": 61.0, "rsi6": 66.0,
+            "atr14": 0.01, "position_in_range": "78.0%",
+            "volume_ratio": 1.20, "read_ts": 1_700_000_000.0}
     base.update(over)
     return base
 
@@ -75,41 +76,37 @@ def test_a_dead_chart_does_not_break_the_block(monkeypatch):
         "parezca 'sin señal'")
 
 
-def test_the_structure_cache_keeps_the_last_good_read_on_a_transient_failure(tmp_path, monkeypatch):
-    """Un hipo de node/CDP no puede borrar la ultima lectura buena."""
-    monkeypatch.setattr(L, "_TV_CACHE", tmp_path / "tv.json")
+def test_a_transient_failure_is_declared_not_imputed(monkeypatch):
+    """2026-11-14 (klines): un fallo de lectura SE DECLARA — la regla del
+    modulo es que una fuente ausente nunca se imputa. La vieja politica de
+    servir la ultima lectura buena era parte del contrato CDP/node; con un
+    fetch de klines el reintento llega en el siguiente ciclo."""
+    monkeypatch.setattr(L, "_KL_CACHE", {})
+    monkeypatch.setattr(L, "_klines_structure_read",
+                        lambda symbol=None: {"ok": False, "error": "klines no disponibles: TimeoutError"})
+    out = L.src_tradingview(force=True)
+    assert out.get("ok") is False and "klines" in (out.get("error") or "")
+
+
+def test_a_dead_target_symbol_is_declared(monkeypatch):
+    monkeypatch.setattr(L, "_KL_CACHE", {})
+    monkeypatch.setattr(L, "_target_symbol", lambda: None)
+    out = L.src_tradingview(force=True)
+    assert out.get("ok") is False and "objetivo" in (out.get("error") or "")
+
+
+def test_the_cache_serves_within_the_window_without_refetching(monkeypatch):
+    monkeypatch.setattr(L, "_KL_CACHE", {})
     calls = {"n": 0}
 
-    def flaky(**k):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return _fake_tv()
-        return {"ok": False, "error": "timeout"}
-
-    monkeypatch.setattr(L, "_tradingview_read", flaky)
-    first = L.src_tradingview(force=True)
-    assert first["ok"] is True
-
-    second = L.src_tradingview(force=True)
-    assert second.get("ok") is True, (
-        "un fallo puntual borro la ultima lectura buena: el veredicto se queda "
-        "sin estructura por un hipo")
-    assert second.get("stale_error") == "timeout", (
-        "la lectura reciclada no se marca: pareceria fresca")
-
-
-def test_the_cache_serves_within_the_window_without_calling_node(tmp_path, monkeypatch):
-    monkeypatch.setattr(L, "_TV_CACHE", tmp_path / "tv.json")
-    calls = {"n": 0}
-
-    def counted(**k):
+    def counted(symbol=None):
         calls["n"] += 1
         return _fake_tv()
 
-    monkeypatch.setattr(L, "_tradingview_read", counted)
+    monkeypatch.setattr(L, "_klines_structure_read", counted)
     L.src_tradingview(force=True)
-    L.src_tradingview(max_age_s=240.0)
-    L.src_tradingview(max_age_s=240.0)
+    L.src_tradingview()
+    L.src_tradingview()
     assert calls["n"] == 1, (
-        f"se lanzo node {calls['n']} veces: el cache no sirve y el ritmo de 30s "
-        f"del reader queda a merced de un subproceso de hasta 120s")
+        f"se refetcheo klines {calls['n']} veces dentro de la ventana: el cache "
+        f"en memoria no sirve y el ritmo de 30s del reader paga el fetch")

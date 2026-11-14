@@ -31,8 +31,10 @@ from urllib.parse import quote
 from urllib.request import urlopen, Request as URLRequest
 
 import uvicorn
+from pathlib import Path as _Path
 import decision_engine as _de
 import _shared_read
+import synthetic_flow as _sf
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
@@ -127,6 +129,9 @@ ticker_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 # ---------------------------------------------------------------------------
 dom_state: dict = {}
 dom_lock = asyncio.Lock()
+# Motor sintetico (2026-11-14): flujo tipo-ATAS para TODOS los pares desde el
+# stream @trade — ATAS solo certifica el chart activo; esto uniforma el panel.
+_syn_flows: dict[str, _sf.SyntheticFlow] = {}
 
 RECENT_TRADES_MAX = 30
 TRADE_SUMMARY_WINDOW = 10
@@ -212,6 +217,8 @@ async def _dom_feeds():
             _taker_cvd_state.setdefault(sym.upper(), _taker_cvd_new_state())
         except Exception:
             pass
+        # motor sintetico por simbolo
+        _syn_flows[sym.upper()] = _sf.SyntheticFlow(sym.upper())
     async def _run_symbol_feed(sym: str):
         # P1: Sequence validation state
         last_update_id = None
@@ -403,6 +410,8 @@ async def _dom_feeds():
                                 qty = float(data.get("q", 0))
                                 is_buyer_maker = data.get("m", False)
                                 side = "sell" if is_buyer_maker else "buy"
+                                price_raw = data.get("p")
+                                trade_ms = int(data.get("T") or 0)
                                 usd = price * qty
                                 now = time.time()
                                 trade = {"p": price, "q": qty, "usd": round(usd, 2), "s": side, "t": now}
@@ -440,6 +449,15 @@ async def _dom_feeds():
                                     delta_qty = qty if side == "buy" else -qty
                                     delta_usd = usd if side == "buy" else -usd
                                     _taker_cvd_update(sym, delta_qty, delta_usd)
+                                except Exception:
+                                    pass
+                                # motor sintetico: mismo stream, acumulador por simbolo
+                                try:
+                                    _fl = _syn_flows.get(sym.upper())
+                                    if _fl is not None:
+                                        _fl.on_trade(price, qty, side,
+                                                     trade_ms or int(now * 1000),
+                                                     price_raw)
                                 except Exception:
                                     pass
                             except Exception:
@@ -1713,6 +1731,104 @@ def _attach_dom_context(data: dict) -> dict:
     except Exception as e:  # noqa: BLE001 - enrichment must never break the feed
         log.debug("dom context attach skipped: %s", str(e)[:80])
     return data
+
+
+def _read_exporter_for_symbol(sym: str) -> dict | None:
+    """Payload del exporter REAL para un simbolo concreto (archivo fresco cuyo
+    payload.ticker == sym). None si no hay archivo vivo para ese simbolo.
+
+    Misma frescura que _read_live_data (mtime y timestamp <= 300s), pero
+    resolviendo POR SIMBOLO en vez de newest-wins."""
+    limit = _LIVE_STALE_LIMIT_SECONDS
+    now = time.time()
+    dirs = [_LIVEEXPORTER_OUTPUT_DIR, _BRIDGE_DIR]
+    seen = set()
+    candidates = []
+    for d in dirs:
+        try:
+            for fp in _Path(d).glob("_live_indicators_*.json"):
+                if fp in seen:
+                    continue
+                seen.add(fp)
+                try:
+                    if now - fp.stat().st_mtime > limit:
+                        continue
+                    raw = _shared_read.read_text(str(fp))  # _shared_read exige str (CreateFileW)
+                    payload = _json.loads(raw) if raw else None
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                ts = payload.get("timestamp")
+                if not isinstance(ts, (int, float)) or (now * 1000 - ts) > limit * 1000:
+                    continue
+                if str(payload.get("ticker", "")).upper() != sym:
+                    continue
+                candidates.append((fp.stat().st_mtime, payload))
+        except Exception:
+            continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+@app.get("/indicators/{symbol}")
+async def indicators_for_symbol(symbol: str):
+    """Indicadores de flujo POR SIMBOLO (2026-11-14).
+
+    Prioridad: payload REAL del exporter ATAS si hay archivo fresco de este
+    simbolo (source=atas_exporter); si no, motor sintetico desde el stream
+    @trade de Binance (source=synthetic_binance — mismo schema, footprint es
+    delta por nivel, no bid/ask). Los 12 pares del scanner quedan cubiertos."""
+    sym = symbol.upper().strip()
+    try:
+        loop = asyncio.get_running_loop()
+        payload = await loop.run_in_executor(None, _read_exporter_for_symbol, sym)
+        if payload:
+            payload.setdefault("source", "atas_exporter")
+            return payload
+    except Exception as e:  # noqa: BLE001
+        log.warning("exporter read for %s failed: %s", sym, e)
+    fl = _syn_flows.get(sym)
+    if fl is None:
+        raise HTTPException(status_code=404,
+                            detail=f"{sym}: sin exporter y sin stream sintetico")
+    dom = dom_state.get(sym.lower()) or {}
+    return fl.snapshot(dom={k: dom.get(k) for k in
+                            ("imbalance_pct", "imbalance_pct_ema",
+                             "best_bid", "best_ask", "spread",
+                             "bid_wall_price", "ask_wall_price",
+                             "bid_wall_persistent", "ask_wall_persistent")})
+
+
+@app.get("/indicators_all")
+async def indicators_all():
+    """Los 12 pares en una llamada: exporter real si lo hay, sintetico si no.
+    {symbol: {source, payload}} — para el barrido de analisis del panel."""
+    out = {}
+    syms = sorted({s.upper() for s in dom_state} | {s.upper() for s in _syn_flows})
+    for sym in syms:
+        payload = None
+        try:
+            loop = asyncio.get_running_loop()
+            payload = await loop.run_in_executor(None, _read_exporter_for_symbol, sym)
+        except Exception:  # noqa: BLE001
+            payload = None
+        if payload:
+            payload.setdefault("source", "atas_exporter")
+            out[sym] = {"source": "atas_exporter", "payload": payload}
+            continue
+        fl = _syn_flows.get(sym)
+        if fl is None:
+            out[sym] = {"source": "none", "payload": None}
+            continue
+        dom = dom_state.get(sym.lower()) or {}
+        out[sym] = {"source": "synthetic_binance",
+                    "payload": fl.snapshot(dom={k: dom.get(k) for k in
+                                                ("imbalance_pct", "imbalance_pct_ema",
+                                                 "best_bid", "best_ask", "spread")})}
+    return out
 
 
 @app.get("/indicators")
