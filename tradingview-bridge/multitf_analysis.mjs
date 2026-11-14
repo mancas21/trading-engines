@@ -1,7 +1,7 @@
 import CDP from 'chrome-remote-interface';
 import https from 'https';
-const TG_TOKEN = '8890755562:AAHdMKjIhXETxJ-tgoyxxwrNoxcZzCBh3o4';
-const TG_CHAT = '6369690844';
+const TG_TOKEN = process.env.TG_TOKEN || '';  // audit 1.1: was hard-coded, revoked; set in environment
+const TG_CHAT = process.env.TG_CHAT || '';
 
 function tgSend(text) {
   return new Promise((ok, fail) => {
