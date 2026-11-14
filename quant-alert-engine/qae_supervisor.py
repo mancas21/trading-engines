@@ -61,6 +61,16 @@ LOG = os.path.join(LOGDIR, "qae_supervisor.log")
 CHILD_LOG = os.path.join(LOGDIR, "qae_stdout.log")
 CHILD_ERR = os.path.join(LOGDIR, "qae_stderr.log")
 STOP_FILE = os.path.join(HERE, "data", "supervisor.stop")
+
+# 2026-11-14: la ventana se cierra SOLA sin que el usuario la cierre (hoy, con
+# ATAS abierto; y 50 de las 64 salidas históricas fueron exit 0). El diseño
+# "clean exit = cerrado a propósito" deja el engine muerto silenciosamente.
+# Con QAE_RESTART_ON_CLEAN=1 una salida limpia RELANZA, pero solo si la sesión
+# duró algo real (QAE_MIN_CLEAN_RUN_S, 60s default): una salida limpia
+# inmediata sigue parando el supervisor. Parar DE VERDAD: stop-qae.ps1 (mata
+# primero el supervisor) o tocar data/supervisor.stop.
+RESTART_ON_CLEAN = os.environ.get("QAE_RESTART_ON_CLEAN", "0") == "1"
+MIN_CLEAN_RUN_S = float(os.environ.get("QAE_MIN_CLEAN_RUN_S", "60"))
 # The supervisor's own single-instance marker. See _acquire_supervisor_lock.
 SUPERVISOR_LOCK = os.path.join(HERE, "data", "supervisor.lock")
 
@@ -249,8 +259,14 @@ def _main() -> int:
                 "the app. (This is expected if you launched a second copy.)")
             return 0
 
-        # -- clean exit: the user closed the window. THIS is the fix. --
+        # -- clean exit --------------------------------------------------
         if code == 0:
+            if RESTART_ON_CLEAN and ran >= MIN_CLEAN_RUN_S:
+                log(f"UI closed cleanly (exit code 0) after {ran:.0f}s — "
+                    f"QAE_RESTART_ON_CLEAN=1: relaunching. Para parar de "
+                    f"verdad: stop-qae.ps1 o data/supervisor.stop")
+                time.sleep(RESTART_DELAY_S)
+                continue
             log("UI closed cleanly (exit code 0) — supervisor stopping, "
                 "nothing will be relaunched")
             return 0

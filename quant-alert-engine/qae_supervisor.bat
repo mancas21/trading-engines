@@ -18,5 +18,9 @@ REM Same interpreter the supervisor has always used for the UI. Set QAE_PYTHON
 REM to switch it (e.g. to venv\Scripts\python.exe).
 if not defined QAE_PYTHON set "QAE_PYTHON=C:\Users\Lenovo\AppData\Local\Programs\Python\Python312\python.exe"
 
+REM 2026-11-14: la UI se cierra sola a veces (exit 0 sin usuario); con esto el
+REM supervisor la relanza si la sesion duro >=60s. Parar de verdad: stop-qae.ps1.
+set "QAE_RESTART_ON_CLEAN=1"
+
 "%QAE_PYTHON%" "%~dp0qae_supervisor.py"
 exit /b %ERRORLEVEL%

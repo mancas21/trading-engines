@@ -170,7 +170,34 @@ else:
     check("supervisor eventually exited 0", rc5 == 0, f"rc={rc5}")
 
 
-    print("\n=== 6. Source-level invariants ===")
+    print("\n=== 6. Salida limpia con QAE_RESTART_ON_CLEAN=1 relanza ===")
+    # 2026-11-14: la UI se cierra sola a veces (exit 0 sin usuario). Con el
+    # flag, una salida limpia que duro >= QAE_MIN_CLEAN_RUN_S RELANZA; la
+    # parada real es stop-qae.ps1 / supervisor.stop. El hijo: sale 0 la primera
+    # vez, exit 3 la segunda (ALREADY_RUNNING_EXIT para al supervisor limpio).
+    rc6, out6, dur6, tmp6 = run_supervisor_with_fake_child(
+        """
+        import os, sys
+        if os.path.exists("ran_once"):
+            sys.exit(3)
+        open("ran_once", "w").write("1")
+        sys.exit(0)
+        """,
+        env_extra={"QAE_RESTART_ON_CLEAN": "1", "QAE_MIN_CLEAN_RUN_S": "0"})
+    check("clean exit RELANZO con el flag", "relaunching" in out6, out6[-300:])
+    check("se lanzo dos veces (0 -> relanza -> 3 -> stop)",
+          out6.count("Starting ") == 2, f"spawns={out6.count('Starting ')}")
+    check("supervisor termino 0 tras el exit 3", rc6 == 0, f"rc={rc6}")
+
+    print("\n=== 6b. Salida limpia INSTANTANEA sigue parando (anti-loop) ===")
+    rc6b, out6b, _, _ = run_supervisor_with_fake_child(
+        "import sys\nsys.exit(0)\n",
+        env_extra={"QAE_RESTART_ON_CLEAN": "1"})
+    check("salida limpia instantanea NO relanza", out6b.count("Starting ") == 1,
+          f"spawns={out6b.count('Starting ')}")
+    check("supervisor paro", rc6b == 0, f"rc={rc6b}")
+
+    print("\n=== 7. Source-level invariants ===")
     ui_src = open(UI).read()
     eng_src = open(ENGINE).read()
     check("UI no longer calls a blocking modal MessageBoxW",
