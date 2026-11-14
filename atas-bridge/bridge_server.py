@@ -276,10 +276,14 @@ async def _dom_feeds():
                                 data = _json.loads(raw)
                                 
                                 # P1: Sequence validation — detect gaps in depth updates
+                                # audit 4.3 VERIFICADO en vivo 2026-11-14 (btcusdt@depth20@100ms):
+                                # el stream parcial SI trae U/u/pu y pu == u del evento
+                                # anterior en cada mensaje consecutivo — la logica diff de
+                                # abajo es valida tal cual en este stream.
                                 U = data.get("U")  # first update ID in event
                                 u = data.get("u")  # final update ID in event
                                 pu = data.get("pu")  # final update ID in previous event
-                                
+
                                 if last_update_id is not None:
                                     # Check for gap: previous event's final ID should match our last
                                     if pu is not None and pu != last_update_id:
@@ -308,9 +312,19 @@ async def _dom_feeds():
                                 bid_wall_vol = float(bid_wall[1])
                                 ask_wall_price = float(ask_wall[0])
                                 ask_wall_vol = float(ask_wall[1])
+                                # total_*_vol sigue en BASE qty: sus consumidores
+                                # (orderflow_engine cumulative_*, live_read
+                                # bid_depth_usd = vol * precio) asumen base.
                                 total_bid = sum(float(b[1]) for b in bids[:15])
                                 total_ask = sum(float(a[1]) for a in asks[:15])
-                                imb = ((total_bid - total_ask) / (total_bid + total_ask)) * 100 if (total_bid + total_ask) > 0 else 0
+                                # audit 4.2: el DESBALORCE se pondera por nocional
+                                # quote (precio*qty): un nivel lejano y barato
+                                # pesaba igual que uno cercano. Con precios muy
+                                # distintos entre simbolos, el estandar es valorar
+                                # el book en quote.
+                                _qb = sum(float(b[0]) * float(b[1]) for b in bids[:15])
+                                _qa = sum(float(a[0]) * float(a[1]) for a in asks[:15])
+                                imb = ((_qb - _qa) / (_qb + _qa)) * 100 if (_qb + _qa) > 0 else 0
 
                                 # P6: DOM persistence filter — require wall to persist across reads
                                 dp = dom_persist[sym]
@@ -991,6 +1005,12 @@ def _cvd_process_live(data: dict) -> None:
 
             # Clean close: the closed bar's final delta = last observed live
             # delta (LiveExporter delta is the bar's true delta-so-far).
+            # audit 4.4: los trades entre la ultima escritura del exporter y el
+            # rollover quedan atribuidos a la barra nueva. Efecto acotado a un
+            # intervalo de escritura del exporter (el guard de imposibles de
+            # abajo rechaza el caso patologico). El fix de raiz es que el
+            # exporter envie el delta FINAL de la barra cerrada; aqui no hay
+            # como recuperarlo.
             closed_delta = prev_live_delta
             closed_vol = prev_bar_volume
             ok = True
@@ -1521,9 +1541,19 @@ async def context_symbol(symbol: str):
 # ---------------------------------------------------------------------------
 # Auth guard for POST/PUT endpoints (Part 2)
 async def _require_auth(request: Request):
-    """Check X-Bridge-Token header against BRIDGE_TOKEN. Skip if token not configured."""
+    """Check X-Bridge-Token header against BRIDGE_TOKEN.
+
+    audit 4.1: sin token, antes se permitia TODO. Ahora sin token solo se
+    permite loopback: un HOST=0.0.0.0 sin token deja la API cerrada (fail-closed)
+    en vez de abierta a toda la red."""
     if not BRIDGE_TOKEN:
-        return  # no token configured, allow all
+        _host = (HOST or "").strip().strip("[]").lower()
+        if _host not in ("127.0.0.1", "localhost", "::1"):
+            raise HTTPException(
+                status_code=503,
+                detail="BRIDGE_TOKEN no configurado y HOST no es loopback: "
+                       "API deshabilitada (audit 4.1)")
+        return
     token = request.headers.get("X-Bridge-Token", "")
     if token != BRIDGE_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid or missing X-Bridge-Token")
