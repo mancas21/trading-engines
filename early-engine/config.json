@@ -1,0 +1,20 @@
+{
+  "mode": "shadow",
+  "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+  "ws_base": "wss://fstream.binance.com/ws",
+  "bridge_url": "",
+  "event_log": "logs/early_events.jsonl",
+  "control_every_s": 60,
+  "detectors": {
+    "band_bps": 10.0,
+    "level_band_bps": 8.0,
+    "flow_window_s": 15.0,
+    "flow_z_min": 2.0,
+    "imb_min": 0.25,
+    "ask_depletion_ratio": 0.6,
+    "absorb_max_drop_bps": 4.0,
+    "rally_move_atr": 1.0,
+    "rally_window_s": 30.0,
+    "rally_max_extension_atr": 1.5
+  }
+}
