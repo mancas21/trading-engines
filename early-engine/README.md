@@ -19,8 +19,8 @@ This package adds those detectors. It runs on its own Binance USDT-M streams.
 | Event | Reads | Fires |
 |---|---|---|
 | `BREAKOUT_PRESSURE` | price within band of resistance, taker buy z-score, bid-heavy book, depleted asks | before the level breaks |
-| `BOUNCE_ABSORPTION` | price at support, taker sell z-score, price not falling, bid-heavy book | while sellers are being absorbed |
-| `FVG_RETEST` | unmitigated 1m bullish FVG, price trades back into the gap, bid-heavy book | intrabar, on re-entry |
+| `BOUNCE_ABSORPTION` | price at support, taker sell z-score, price not falling; book regime TAGGED (shadow fires both bid/ask-heavy — during absorption the visible book is naturally ask-heavy) | while sellers are being absorbed |
+| `FVG_RETEST` | unmitigated 1m bullish FVG, price trades back into the gap; book regime TAGGED (a dip into the gap is an ask-pressure moment) | intrabar, on re-entry |
 | `RALLY_IGNITION` | 30 s move ≥ 1 ATR, buy z-score, book, **not extended** beyond 1.5 ATR | first leg only |
 
 Every event logs its feature values. The shadow log is the audit trail.
@@ -33,6 +33,16 @@ Every event logs its feature values. The shadow log is the audit trail.
   precision. The study script measures that trade-off; intuition does not.
 - **FVG formation is not early.** A 1m FVG is known when its third candle
   closes. Only the *retest* is intrabar.
+- **The bid-heavy book gate is a HYPOTHESIS, not an axiom (2026-11-14).** The
+  first calibration pass fired 0 events and the review caught why that would
+  happen by construction: `BOUNCE_ABSORPTION` and `FVG_RETEST` required a
+  bid-heavy book, but absorption and gap-retests naturally occur with an
+  ask-heavy visible book (the aggressor side fills the near-touch book).
+  Shadow now fires BOTH regimes, tags `book_regime` in the features, and
+  `study.py` splits bid/ask-heavy against control separately. Live mode keeps
+  the strict bid-heavy gate until the study shows which regime carries the
+  excess. Nothing here is validated by this change — the sample space just
+  got complete.
 - **Order-book signals are noisy on thin markets.** Depth changes that look
   like a wall are often spoofing or market-maker quoting. Imbalance is a
   weak feature alone; the detectors require several conditions for that reason.

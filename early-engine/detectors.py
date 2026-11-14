@@ -30,6 +30,14 @@ class Config:
     imb_min: float = 0.25           # book imbalance in the direction of the move
     ask_depletion_ratio: float = 0.6  # ask depth now / baseline, below this = thin
     absorb_max_drop_bps: float = 4.0  # price may not fall more than this while absorbing
+    # Calibration modes (audit discussion 2026-11-14): during absorption the
+    # visible book is NATURALLY ask-heavy (sellers are the aggressors), so
+    # requiring a bid-heavy book filters out the setup's namesake. Shadow mode
+    # fires BOTH regimes (tagged book_regime) so the study can split them;
+    # live mode forces these False (strict bid-heavy) until the study shows
+    # which regime carries the excess over control.
+    absorb_book_any: bool = True
+    fvg_book_any: bool = True
     rally_move_atr: float = 1.0     # move over window, in ATRs, to call ignition
     rally_window_s: float = 30.0
     rally_max_extension_atr: float = 1.5  # beyond this, the move is no longer early
@@ -103,7 +111,9 @@ def breakout_pressure(v: MarketView, c: Config) -> Optional[Event]:
                 features={"dist_bps": dist, "buy_z": v.flow["buy_z"],
                           "imbalance": v.book.imbalance,
                           "ask_depth": v.book.ask_depth,
-                          "ask_baseline": v.book_baseline_ask},
+                          "ask_baseline": v.book_baseline_ask,
+                          "book_regime": "bid_heavy" if v.book.imbalance >= c.imb_min
+                                         else "ask_heavy"},
             )
     return None
 
@@ -111,9 +121,13 @@ def breakout_pressure(v: MarketView, c: Config) -> Optional[Event]:
 def bounce_absorption(v: MarketView, c: Config) -> Optional[Event]:
     """Price is at support, sellers are hitting it, but it is not falling.
 
-    Heavy aggressive selling that fails to move price down, with bid depth
-    holding, is absorption. It precedes the bounce; the bar-close engine sees
-    the bounce only after the bar has printed.
+    Heavy aggressive selling that fails to move price down is absorption. It
+    precedes the bounce; the bar-close engine sees the bounce only after the
+    bar has printed. The BOOK regime at the moment of absorption is an open
+    question, not an axiom: sellers being the aggressors makes the visible
+    book ask-heavy exactly when absorption happens, so shadow logs BOTH
+    regimes (book_regime in features) and the study splits them. Live mode
+    keeps the strict bid-heavy gate until the study says which regime pays.
     """
     if v.book is None:
         return None
@@ -124,16 +138,19 @@ def bounce_absorption(v: MarketView, c: Config) -> Optional[Event]:
         if not (0 <= dist <= c.level_band_bps):
             continue
         drop = v.price_change_bps_window.get(int(c.flow_window_s), 0.0)
+        bid_heavy = v.book.imbalance >= c.imb_min
+        if not (bid_heavy or c.absorb_book_any):
+            continue
         if (v.flow.get("sell_z", 0.0) >= c.flow_z_min
-                and drop >= -c.absorb_max_drop_bps
-                and v.book.imbalance >= c.imb_min):
+                and drop >= -c.absorb_max_drop_bps):
             return Event(
                 name="BOUNCE_ABSORPTION", side="long", symbol=v.symbol, ts=v.ts,
                 price=v.price, level=lvl.price,
                 invalidation=lvl.price * (1 - c.level_band_bps / 1e4),
                 features={"dist_bps": dist, "sell_z": v.flow["sell_z"],
                           "window_change_bps": drop,
-                          "imbalance": v.book.imbalance},
+                          "imbalance": v.book.imbalance,
+                          "book_regime": "bid_heavy" if bid_heavy else "ask_heavy"},
             )
     return None
 
@@ -143,7 +160,10 @@ def fvg_retest(v: MarketView, c: Config) -> Optional[Event]:
 
     The FVG itself is known at the close of its third candle. The retest is
     the intrabar event: the moment price trades into the gap with buyers
-    defending it, which is earlier than any close-based confirmation.
+    defending it, which is earlier than any close-based confirmation. A dip
+    INTO the gap is an ask-pressure moment by definition, so the book regime
+    is logged (book_regime) and both regimes fire in shadow; live stays
+    strict until the study splits them.
     """
     if v.book is None:
         return None
@@ -152,14 +172,18 @@ def fvg_retest(v: MarketView, c: Config) -> Optional[Event]:
             continue
         if not (lvl.bottom <= v.price <= lvl.top * (1 + c.level_band_bps / 1e4)):
             continue
-        if v.book.imbalance >= c.imb_min and v.flow.get("buy_z", 0.0) >= 0:
+        bid_heavy = v.book.imbalance >= c.imb_min
+        if not (bid_heavy or c.fvg_book_any):
+            continue
+        if v.flow.get("buy_z", 0.0) >= 0:
             return Event(
                 name="FVG_RETEST", side="long", symbol=v.symbol, ts=v.ts,
                 price=v.price, level=lvl.top,
                 invalidation=lvl.bottom,
                 features={"zone_top": lvl.top, "zone_bottom": lvl.bottom,
                           "imbalance": v.book.imbalance,
-                          "buy_z": v.flow.get("buy_z", 0.0)},
+                          "buy_z": v.flow.get("buy_z", 0.0),
+                          "book_regime": "bid_heavy" if bid_heavy else "ask_heavy"},
             )
     return None
 
@@ -183,7 +207,9 @@ def rally_ignition(v: MarketView, c: Config) -> Optional[Event]:
             invalidation=v.price - c.rally_move_atr * v.atr_1m,
             features={"move_atr": v.move_atr_window,
                       "extension_atr": v.extension_atr,
-                      "buy_z": v.flow["buy_z"], "imbalance": v.book.imbalance},
+                      "buy_z": v.flow["buy_z"], "imbalance": v.book.imbalance,
+                      "book_regime": "bid_heavy" if v.book.imbalance >= c.imb_min
+                                     else "ask_heavy"},
         )
     return None
 

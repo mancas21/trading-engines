@@ -206,3 +206,45 @@ def test_runtime_path_fires_logs_and_settles(tmp_path):
     assert "event" in kinds
     assert any(r["kind"] == "fwd" and r["horizon_s"] == 30 and r["ret_bps"] > 0
                for r in rows), rows
+
+# ---------------------------------------------------- regímenes de libro
+
+def test_bounce_absorption_fires_ask_heavy_book():
+    """El caso que motivó la calibración: vendedores agresivos que NO mueven
+    el precio con el libro 5:1 ask-heavy (exactamente el VAL de PEPE). Con
+    absorb_book_any=True (shadow) DEBE disparar y etiquetar ask_heavy."""
+    v = view(price=100.0,
+             levels=[D.Level(price=99.995, kind="support")],
+             flow={"buy_z": 0.0, "sell_z": 3.0},
+             book=BookMetrics(mid=100.0, best_bid=99.99, best_ask=100.01,
+                              bid_depth=2, ask_depth=10, imbalance=-0.67),
+             price_change_bps_window={15: -1.0})
+    cfg = D.Config(absorb_book_any=True)
+    e = D.bounce_absorption(v, cfg)
+    assert e is not None and e.name == "BOUNCE_ABSORPTION"
+    assert e.features["book_regime"] == "ask_heavy"
+    assert e.features["imbalance"] == -0.67
+
+
+def test_bounce_absorption_silent_ask_heavy_in_live_mode():
+    """Live mantiene el gate estricto hasta que el estudio lo cambie."""
+    v = view(price=100.0,
+             levels=[D.Level(price=99.995, kind="support")],
+             flow={"buy_z": 0.0, "sell_z": 3.0},
+             book=BookMetrics(mid=100.0, best_bid=99.99, best_ask=100.01,
+                              bid_depth=2, ask_depth=10, imbalance=-0.67),
+             price_change_bps_window={15: -1.0})
+    assert D.bounce_absorption(v, D.Config(absorb_book_any=False)) is None
+
+
+def test_fvg_retest_fires_ask_heavy_book():
+    """Un dip DENTRO del gap es un momento de presión vendedora por definición."""
+    v = view(price=100.2,
+             levels=[D.Level(price=0, kind="fvg_bull", bottom=100.0, top=100.4)],
+             flow={"buy_z": 0.5, "sell_z": 0.0},
+             book=BookMetrics(mid=100.0, best_bid=99.99, best_ask=100.01,
+                              bid_depth=2, ask_depth=10, imbalance=-0.67))
+    e = D.fvg_retest(v, D.Config(fvg_book_any=True))
+    assert e is not None and e.name == "FVG_RETEST"
+    assert e.features["book_regime"] == "ask_heavy"
+    assert D.fvg_retest(v, D.Config(fvg_book_any=False)) is None

@@ -205,6 +205,7 @@ class Output:
         self._write(row)
         self.pending.append({"kind": "event", "key": ev.key(), "side": ev.side,
                              "symbol": ev.symbol, "t0": now, "p0": ev.price,
+                             "regime": (ev.features or {}).get("book_regime", "n/a"),
                              "due": {h: False for h in HORIZONS_S}})
 
     def record_control(self, symbol: str, price: float, now: float) -> None:
@@ -223,6 +224,7 @@ class Output:
                 if not row["due"][h] and now - row["t0"] >= h:
                     row["due"][h] = True
                     self._write({"kind": "fwd", "row": row["kind"], "key": row["key"],
+                                 "regime": row.get("regime", "n/a"),
                                  "symbol": symbol, "horizon_s": h,
                                  "ret_bps": D._bps(price, row["p0"]) *
                                             (1 if row["side"] == "long" else -1)})
@@ -341,6 +343,19 @@ async def detect_loop(states: dict[str, SymbolState], cfg: D.Config, out: Output
 async def main_async(cfg_path: str) -> None:
     raw = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
     dcfg = D.Config(**raw.get("detectors", {}))
+    mode = raw.get("mode", "shadow")
+    if mode == "live":
+        # Calibración 2026-11-14: en sombra los detectores disparan en AMBOS
+        # regímenes de libro (tagged book_regime) para que el estudio los
+        # separe. En live el gate estricto bid-heavy vuelve a mandar HASTA que
+        # el estudio muestre qué régimen paga el exceso sobre control.
+        dcfg.absorb_book_any = False
+        dcfg.fvg_book_any = False
+        log.info("modo live: gate de libro estricto (bid-heavy) en "
+                 "BOUNCE_ABSORPTION y FVG_RETEST")
+    else:
+        log.info("modo shadow: disparo en ambos regímenes de libro "
+                 "(calibración; el estudio separa bid/ask-heavy)")
     symbols = [s.upper() for s in raw.get("symbols", ["BTCUSDT"])]
     ws_base = raw.get("ws_base", FAPI_WS)
     out = Output(raw)

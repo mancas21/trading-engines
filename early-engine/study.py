@@ -36,16 +36,21 @@ def _welch(a: list[float], b: list[float]) -> float:
 
 
 def main(path: str) -> None:
-    fwd = defaultdict(list)  # (name, horizon) -> returns
+    # 2026-11-14: los eventos se separan por REGIMEN DE LIBRO (bid_heavy /
+    # ask_heavy / n/a) — el gate bid-heavy era una hipótesis, no un axioma, y
+    # la absorción ocurre con el libro ask-heavy justo cuando los vendedores
+    # son los agresores. Cada régimen se compara contra control por su cuenta.
+    fwd = defaultdict(list)  # (name|regime, horizon) -> returns
     ctrl = defaultdict(list)
     events_seen = defaultdict(int)
     with open(path, encoding="utf-8") as f:
         rows = [json.loads(line) for line in f if line.strip()]
-    key_name = {}
+    key_label = {}
     for r in rows:
         if r.get("kind") == "event":
-            key_name[r["key"]] = r["name"]
-            events_seen[r["name"]] += 1
+            regime = (r.get("features") or {}).get("book_regime", "n/a")
+            key_label[r["key"]] = f"{r['name']}|{regime}"
+            events_seen[key_label[r["key"]]] += 1
     for r in rows:
         if r.get("kind") != "fwd":
             continue
@@ -53,10 +58,13 @@ def main(path: str) -> None:
         if r["row"] == "control":
             ctrl[("CONTROL", h)].append(r["ret_bps"])
         else:
-            name = key_name.get(r["key"], "?")
-            fwd[(name, h)].append(r["ret_bps"])
+            label = r.get("regime") and key_label.get(r["key"])
+            if label is None:
+                # filas antiguas sin regime en fwd: resolver por el key
+                label = key_label.get(r["key"], "?")
+            fwd[(label, h)].append(r["ret_bps"])
 
-    print(f"{'event':<20}{'h(s)':>6}{'n_ev':>7}{'n_ctl':>7}"
+    print(f"{'event|regime':<38}{'h(s)':>6}{'n_ev':>7}{'n_ctl':>7}"
           f"{'ev_bps':>9}{'ctl_bps':>9}{'excess':>9}{'t':>7}{'hit_ev':>8}{'hit_ctl':>9}")
     for (name, h) in sorted(fwd):
         e = fwd[(name, h)]
@@ -67,10 +75,13 @@ def main(path: str) -> None:
         t = _welch(e, c)
         he = sum(1 for x in e if x > 0) / len(e)
         hc = sum(1 for x in c if x > 0) / len(c)
-        print(f"{name:<20}{h:>6}{len(e):>7}{len(c):>7}"
+        print(f"{name:<38}{h:>6}{len(e):>7}{len(c):>7}"
               f"{me:>9.2f}{mc:>9.2f}{me - mc:>9.2f}{t:>7.2f}{he:>8.2%}{hc:>9.2%}")
     if not any(fwd.values()):
         print("no matched event/control horizons yet — let shadow mode run longer")
+    if events_seen:
+        print()
+        print("regímenes vistos:", dict(sorted(events_seen.items())))
 
 
 if __name__ == "__main__":
