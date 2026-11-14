@@ -19,10 +19,11 @@ beats what happens at a random moment. Every 60 s a control row is logged with
 no condition attached. The study compares event forward returns to control
 forward returns. Without that comparison, a high hit rate proves nothing.
 
-Shadow mode is the default. Set `"mode": "live"` in config only after the
-shadow study shows lead time and forward return above the control baseline.
-Post-to-bridge is still honored in shadow mode so the buffer can be watched,
-but nothing here places orders.
+Shadow mode is the default and posts NOTHING anywhere. Set `"mode": "live"`
+in config only after the shadow study shows lead time and forward return
+above the control baseline on several independent days — only then do events
+reach the bridge /quant-alert endpoint (signal_type=EARLY). Nothing here ever
+places orders.
 
 Requires: websockets, httpx. Run:  python early_engine.py --config config.json
 """
@@ -34,15 +35,22 @@ import json
 import logging
 import os
 import statistics
+import sys
 import time
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 
-import httpx
+# Lanzable desde cualquier cwd (supervisor, tarea programada): los modulos
+# hermanos (detectors, book) viven junto a este fichero.
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
 
-import detectors as D
-from book import LocalBook
+import httpx  # noqa: E402
+
+import detectors as D  # noqa: E402
+from book import LocalBook  # noqa: E402
 
 log = logging.getLogger("early_engine")
 
@@ -272,7 +280,11 @@ async def depth_loop(http, st: SymbolState, ws_base: str) -> None:
 
 async def trade_loop(st: SymbolState, ws_base: str) -> None:
     import websockets
-    stream = f"{ws_base}/{st.symbol.lower()}@aggTrade"
+    # Verificado en vivo 2026-11-14: en fstream el stream @aggTrade no
+    # entrega mensajes (timeout, probado en ambos casos) y @trade SI, con los
+    # mismos campos que usa el estado (T/p/q/m). m=True = comprador es maker,
+    # o sea que el agresor vendio.
+    stream = f"{ws_base}/{st.symbol.lower()}@trade"
     while True:
         try:
             async with websockets.connect(stream, ping_interval=60) as ws:

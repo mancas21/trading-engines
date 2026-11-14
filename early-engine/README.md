@@ -39,10 +39,16 @@ Every event logs its feature values. The shadow log is the audit trail.
 - **Lead time is measured, not asserted.** The control sampler logs
   unconditional forward returns every minute. An event is only useful if its
   forward return beats the control at the same horizon.
-- **Not tested against live feeds.** The book, detectors, and runtime path are
-  tested offline (13 unit tests, one synthetic end-to-end run). The WebSocket
-  and REST wiring has not been exercised against Binance from the environment
-  it was written in.
+- **Live feeds verified 2026-11-14 (Windows, CPython 3.12).** Book sync on
+  BTC/ETH/SOL held `gaps=0` across a live run; klines/ATR refresh clean; the
+  control sampler wrote and settled forward returns. One wiring bug was found
+  and fixed in the process: on `fstream.binance.com` the `@aggTrade` stream
+  does NOT deliver (timeout, both casings) while `@trade` does, with the same
+  fields (`T/p/q/m`) the flow state consumes — `trade_loop` now uses `@trade`.
+  The bridge post path (`live` mode) was verified against the real bridge:
+  a test event landed in the quant buffer as `signal_type=EARLY`. The
+  WebSocket reconnect/resync paths are exercised by the book unit tests and
+  the live run, not by every failure mode.
 
 ## Modes
 
@@ -61,7 +67,13 @@ pip install httpx websockets
 cd early-engine
 python early_engine.py --config config.json      # shadow mode
 python study.py logs/early_events.jsonl          # after a few hours or days
-python -m pytest tests/ -q                       # offline unit tests
+python -m pytest tests/ -q                       # offline tests (book, detectors, runtime e2e)
+```
+
+Dentro del repo hay un lanzador con la convencion del resto de motores:
+
+```bat
+early-engine\start_early_engine.bat
 ```
 
 Set `BRIDGE_TOKEN` in the environment if the bridge enforces auth.

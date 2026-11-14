@@ -149,3 +149,60 @@ def test_zscore_is_zero_on_thin_or_flat_baseline():
     assert D.zscore(5.0, [1.0] * 50) == 0.0         # zero variance
     assert D.zscore(9.0, list(range(10))) > 0       # above the mean
     assert D.zscore(3.0, list(range(10))) < 0       # below the mean
+
+
+# ---------------------------------------------------------------- runtime e2e
+
+def test_runtime_path_fires_logs_and_settles(tmp_path):
+    """End-to-end sintetico del camino del runtime (el WS/REST no se toca):
+    SymbolState con libro valido + rafaga de compras -> view -> detector ->
+    Output.record_event -> settle escribe el forward return."""
+    import json
+
+    import early_engine as EE
+
+    cfg = D.Config()
+    st = EE.SymbolState("BTCUSDT", cfg)
+
+    # libro valido: snapshot + evento puente
+    # bid/ask DENTRO de la banda de 10 bps del mid para que el imbalance signifique
+    st.book.load_snapshot({"lastUpdateId": 10,
+                           "bids": [["99.99", "50"]], "asks": [["100.01", "1"]]})
+    assert st.book.apply({"U": 10, "u": 11, "pu": 9, "b": [], "a": []}) is True
+    assert st.book.valid
+
+    # baseline de flow: 12 muestras de 5 s con volumen moderado y VARIABLE.
+    # Durante la fase baseline el libro tiene asks GORDAS: flow_z muestrea el
+    # ask_depth en cada llamada, asi que el baseline de depletion sale de ahi.
+    t0 = 1_000_000.0
+    st.book.asks = {100.01: 50.0}
+    for k in range(12):
+        for _ in range(5 + (k % 3)):
+            st.on_trade(t0 + k * 5, 100.0, 1.0, False)
+        st.flow_z(t0 + k * 5 + 0.1)
+    # rafaga agresiva compradora en la ventana actual
+    for _ in range(200):
+        st.on_trade(t0 + 65.0, 100.0, 1.0, False)
+
+    # evento: asks AGOTADAS frente al baseline gordo (1 << 0.6*50)
+    st.book.asks = {100.01: 1.0}
+    st.levels = [D.Level(price=100.05, kind="resistance")]
+
+    v = st.view(t0 + 66.0)
+    assert v is not None and v.book is not None
+    evs = D.run_all(v, cfg)
+    names = [e.name for e in evs]
+    assert "BREAKOUT_PRESSURE" in names, names
+
+    # Output real contra fichero temporal
+    out = EE.Output({"event_log": str(tmp_path / "ev.jsonl"), "mode": "shadow"})
+    ev = next(e for e in evs if e.name == "BREAKOUT_PRESSURE")
+    out.record_event(ev, t0)
+    # sin bridge_url en modo shadow: nada se publica
+    out.settle("BTCUSDT", ev.price * 1.001, t0 + 31.0)
+
+    rows = [json.loads(l) for l in (tmp_path / "ev.jsonl").read_text(encoding="utf-8").splitlines()]
+    kinds = [r["kind"] for r in rows]
+    assert "event" in kinds
+    assert any(r["kind"] == "fwd" and r["horizon_s"] == 30 and r["ret_bps"] > 0
+               for r in rows), rows
