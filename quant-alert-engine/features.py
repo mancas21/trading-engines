@@ -141,19 +141,22 @@ def _efficiency_ratio(c: np.ndarray, start: int, i: int, length: int) -> float:
 
 
 def _value_location(c: np.ndarray, v: np.ndarray, start: int, i: int,
-                    bins: int = 50) -> Tuple[float, float]:
-    """Rolling volume profile over [start..i]: (c - POC)/c*100 and location.
+                    bins: int = 50) -> Tuple[float, float, float, float]:
+    """Rolling volume profile over [start..i]: (c - POC)/c*100, posicion vs el
+    area de valor REAL (val/vah por expansion desde el POC) y los bordes.
 
-    Mirrors `StrategyBacktester._value_location` so the backtester, the live
-    logger and the model all use one value-area concept.
+    audit 3.13: el consumidor reconstruia la banda como POC +- width/2 (simetrica),
+    lo que NO es un value area: el POC rara vez queda centrado. La expansion
+    70%-volumen ya se calcula aqui abajo; se devuelven los bordes reales y la
+    posicion se decide contra ellos, igual que StrategyBacktester._value_location.
     """
     cw = c[start:i + 1]
     vw = v[start:i + 1]
     if len(cw) < 20 or cw.max() <= cw.min():
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
     hist, edges = np.histogram(cw, bins=bins, weights=vw)
     if hist.sum() <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
     poc_idx = int(np.argmax(hist))
     poc = float((edges[poc_idx] + edges[poc_idx + 1]) / 2)
     total = hist.sum()
@@ -173,8 +176,9 @@ def _value_location(c: np.ndarray, v: np.ndarray, start: int, i: int,
     val = float(edges[lo])
     vah = float(edges[hi + 1])
     cur = float(c[i])
-    width = ((vah - val) / poc * 100.0) if poc > 0 else 0.0
-    return (cur - poc) / cur * 100.0 if cur > 0 else 0.0, width
+    dist = (cur - poc) / cur * 100.0 if cur > 0 else 0.0
+    va_pos = 1.0 if cur > vah else (-1.0 if cur < val else 0.0)
+    return dist, va_pos, val, vah
 
 
 # ---------------------------------------------------------------------------
@@ -245,13 +249,20 @@ class FeatureExtractor:
         bb_u, bb_m, bb_l = self.ind.bollinger_bands(co, cfg["bb_len"], cfg["bb_mult"])
         atr = self.ind.atr(ho, lo, co, cfg["atr_len"])
         ema_reg = self.ind.ema(co, cfg["regime_len"])
-        ema200 = self.ind.ema(co, min(200, max(60, w // 2)))
+        # audit 3.13: el periodo era dinamico (60..200) con la etiqueta
+        # "ema200". Periodo real 200; con ventana corta el EMA no existe y el
+        # feature vale 0 (honesto) en vez de un EMA-60 disfrazado.
+        ema200 = self.ind.ema(co, 200)
         vol_avg = self.ind.sma(vo, cfg["vol_avg_len"])
 
-        # signed bar volume (tick-rule proxy) -> CVD + OBV, same math as engine
-        signed = np.where(np.diff(co, prepend=co[0]) >= 0, vo, -vo)
+        # signed bar volume (tick-rule proxy) -> CVD; OBV clasico aparte.
+        # audit 3.13: antes cvd y obv eran LA MISMA expresion. El engine vivo
+        # calcula OBV con np.sign (barra plana aporta 0); se replica aqui para
+        # que backtest y vivo compartan definicion.
+        _chg = np.diff(co, prepend=co[0])
+        signed = np.where(_chg >= 0, vo, -vo)
         cvd = np.cumsum(signed)
-        obv = np.cumsum(signed)
+        obv = np.cumsum(np.sign(_chg) * vo)
 
         j = w - 1  # last index inside the window
 
@@ -271,28 +282,25 @@ class FeatureExtractor:
         win_vol_sum = float(vo.sum()) or 1.0
 
         # delta of the signal bar, as % of its own volume
+        # audit 3.13: era binario +-100 (solo signo, sin magnitud). Proxy de
+        # magnitud: posicion del close DENTRO del rango de la barra (0..1) —
+        # cierre en el maximo = +100, en el minimo = -100, medio = 0.
         delta_pct_vol = 0.0
         if vol_v > 0:
-            up = co[j] >= co[j - 1] if j >= 1 else True
-            delta_pct_vol = (100.0 if up else -100.0)
+            bar_range = float(ho[j]) - float(lo[j])
+            if j >= 1 and bar_range > 0:
+                loc = (float(co[j]) - float(lo[j])) / bar_range
+                delta_pct_vol = (2.0 * loc - 1.0) * 100.0
+            elif j >= 1:
+                up = co[j] >= co[j - 1]
+                delta_pct_vol = (100.0 if up else -100.0)
 
         cvd_slope5 = at(cvd, j) - at(cvd, max(0, j - 5))
         obv_slope5 = at(obv, j) - at(obv, max(0, j - 5))
-        va_dist_poc, va_width = _value_location(co, vo, 0, j)
-
-        # value-area location vs VAL/VAH
-        if va_width > 0:
-            # reconstruct band from POC +/- half of the computed width
-            poc = price - (va_dist_poc / 100.0) * price
-            half = (va_width / 100.0) * poc / 2.0
-            if price > poc + half:
-                va_pos = 1.0
-            elif price < poc - half:
-                va_pos = -1.0
-            else:
-                va_pos = 0.0
-        else:
-            va_pos = 0.0
+        # audit 3.13: va_pos se decide DENTRO de _value_location contra los
+        # bordes reales VAL/VAH (antes se reconstruia una banda simetrica
+        # alrededor del POC, que no es como se define un value area).
+        va_dist_poc, va_pos, _va_low, _va_high = _value_location(co, vo, 0, j)
 
         # trend regime, identical to SignalAnalyzer._trend_regime
         regime = 0.0

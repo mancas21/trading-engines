@@ -168,7 +168,8 @@ class GeneralConfig(BaseModel):
     time_gating_enabled: bool = Field(True, description="Mute signals during historically negative expectancy hours (local time = UTC + utc_offset)")
     time_gating_lookback_days: int = Field(14, ge=1, le=90, description="Trailing window for time gating")
     time_gating_min_n: int = Field(20, ge=5, le=500, description="Min sample size per hour before muting")
-    time_gating_utc_offset: int = Field(-5, ge=-12, le=14, description="Hour offset added to UTC when bucketing/checking muted hours (e.g. -5 for Colombia)")
+    time_gating_utc_offset: int = Field(-5, ge=-12, le=14, description="Hour offset added to UTC when bucketing/checking muted hours (e.g. -5 for Colombia). Ignored when time_gating_tz is set.")
+    time_gating_tz: str = Field("", description="Optional IANA timezone (e.g. America/Bogota) for exact local-hour bucketing incl. DST; empty = legacy utc_offset")
     time_gating_protected_hours_local: List[int] = Field(default_factory=lambda: [8, 9, 10, 11, 12, 13, 14, 15], description="Local hours NEVER muted regardless of expectancy (e.g. New York session 08-15 in UTC-5)")
     # Recency blackout (v2.5): time-based throttle independent of condition filters.
     blackout_enabled: bool = Field(True, description="Enforce a minimum gap between consecutive alerts per symbol")
@@ -210,7 +211,7 @@ class Level2Config(BaseModel):
     require_dom: bool = Field(True, description="Include DOM imbalance in validation score")
     dom_imbalance_min: float = Field(5.0, ge=0.0, le=50.0, description="Min |imbalance %| to count as strong DOM confirmation")
     require_cvd: bool = Field(True, description="Include CVD trend in validation score")
-    require_quant: bool = Field(True, description="Include quant multi-TF consensus in validation score")
+    require_quant: bool = Field(False, description="Include quant multi-TF consensus in validation score")
     quant_min_timeframes: int = Field(1, ge=1, le=4, description="Min distinct timeframes with agreement for quant consensus")
     fail_open: bool = Field(True, description="If the bridge is unreachable, allow the alert instead of blocking")
     cache_ttl_seconds: float = Field(4.0, ge=1.0, le=60.0, description="Cache bridge reads per symbol to avoid hammering")

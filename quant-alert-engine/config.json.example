@@ -100,14 +100,14 @@
     "timeout_seconds": 2.0
   },
   "level2": {
-    "enabled": true,
+    "enabled": false,
     "base_url": "http://127.0.0.1:8000",
     "timeout_seconds": 1.5,
     "min_score": 2.0,
     "require_dom": true,
     "dom_imbalance_min": 5.0,
     "require_cvd": true,
-    "require_quant": true,
+    "require_quant": false,
     "quant_min_timeframes": 1,
     "fail_open": true,
     "cache_ttl_seconds": 4.0

@@ -456,6 +456,11 @@ class CostModel:
         return price * self.funding_rate_pct * intervals * qty
 
 
+# audit 3.5: instancia unica del modelo de coste para leer expectancy NETA del
+# track record vivo (mismo modelo que el backtester: 10 bps roundtrip).
+_LIVE_COSTS = CostModel()
+
+
 def _regime_label(r):
     return {1: "up", -1: "down", 0: "neutral"}.get(r, "neutral")
 
@@ -482,8 +487,24 @@ def compute_metrics(trades, bars_per_year):
     std_ret = (sum((r - avg_ret) ** 2 for r in rets) / max(n - 1, 1)) ** 0.5
     downside = [r for r in rets if r < 0]
     downside_std = (sum(r ** 2 for r in downside) / max(len(downside), 1)) ** 0.5 if downside else 1e-12
-    sharpe = (avg_ret / std_ret * (bars_per_year ** 0.5)) if std_ret > 0 else 0.0
-    sortino = (avg_ret / downside_std * (bars_per_year ** 0.5)) if downside_std > 0 else 0.0
+    # audit 3.3: los retornos son POR TRADE. Annualizar con bars_per_year
+    # inflaba el Sharpe (5.90 donde el correcto era 0.83). Se annualiza por la
+    # FRECUENCIA de trades: sqrt(trades por año), estimada del horizonte
+    # calendario que cubren los trades. Sin horizonte utilizable, el factor es
+    # 1 (Sharpe por-trade sin annualizar) y el JSON lo dice.
+    span_start = None
+    span_end = None
+    for t in trades:
+        e0, e1 = t.get("entry_idx"), t.get("exit_idx")
+        if isinstance(e0, (int, float)) and isinstance(e1, (int, float)):
+            span_start = e0 if span_start is None else min(span_start, e0)
+            span_end = e1 if span_end is None else max(span_end, e1)
+    span_bars = (int(span_end) - int(span_start) + 1) if span_start is not None else 0
+    years = span_bars / bars_per_year if (bars_per_year > 0 and span_bars > 1) else 0.0
+    trades_per_year = (n / years) if years > 0 else 0.0
+    ann_factor = math.sqrt(trades_per_year) if trades_per_year > 0 else 1.0
+    sharpe = (avg_ret / std_ret) * ann_factor if std_ret > 0 else 0.0
+    sortino = (avg_ret / downside_std) * ann_factor if downside_std > 0 else 0.0
     # equity curve + max drawdown (with time-to-recover)
     eq = 1.0
     eq_curve = [1.0]
@@ -512,9 +533,11 @@ def compute_metrics(trades, bars_per_year):
     # annualized return
     n_trades = n
     total_ret = eq_curve[-1] - 1.0
-    # bars_per_year estimate: assume ~350 trading days * 24h / bar_duration_h
-    # Use bars_per_year as supplied.
-    annual_ret = (1 + total_ret) ** (bars_per_year / n_trades) - 1 if n_trades else 0.0
+    # audit 3.3: CAGR desde el horizonte calendario (años que cubren los
+    # trades), NO desde el numero de trades: el exponente bars/n_trades
+    # componia el retorno por-trade como si cada trade fuera una barra y
+    # producía retornos "anuales" de 1.19 millones por ciento.
+    annual_ret = (1 + total_ret) ** (1.0 / years) - 1 if years > 0 else 0.0
     calmar = (annual_ret / max_dd_pct * 100) if max_dd_pct > 0 else float("inf")
     # regime stats
     regime_stats = {}
@@ -527,6 +550,7 @@ def compute_metrics(trades, bars_per_year):
             pf = sum(x for x in rr if x > 0) / (abs(sum(x for x in rr if x <= 0)) or 1e-12)
             regime_stats[label] = {"count": len(rt), "win_rate": wr, "profit_factor": pf}
     # overlapping-trade effective sample size
+    # audit 3.4: sin clamp, rho negativo daba effective_n > n. Clamp a [1, n].
     eff_n = n
     if n >= 11 and std_ret > 0:
         rho = 0.0
@@ -537,7 +561,7 @@ def compute_metrics(trades, bars_per_year):
             rk = c / (std_ret ** 2)
             if abs(rk) < 0.05: break
             rho += rk
-        eff_n = n / (1 + 2 * rho)
+        eff_n = max(1.0, min(float(n), n / (1 + 2 * rho)))
     # multiple-testing correction: count distinct strategy hypotheses tested (Fix H2)
     unique_signals = set(t.get("name", "") for t in trades if t.get("name"))
     n_variants = max(1, len(unique_signals))
@@ -557,7 +581,13 @@ def compute_metrics(trades, bars_per_year):
         "annual_return": annual_ret,
         "regime_stats": regime_stats,
         "effective_n": eff_n,
-        "multiple_testing_note": f"{n_variants} distinct signal strategies tested; Bonferroni-adjusted effective sample = {eff_n:.0f} (raw {n})",
+        "trades_per_year": trades_per_year,
+        # audit 3.4: la nota decia "Bonferroni-adjusted" pero NADIE dividia el
+        # umbral entre el numero de tests. Se describe lo que hay, sin el rótulo.
+        "multiple_testing_note": (
+            f"{n_variants} distinct signal strategies tested; effective sample "
+            f"size {eff_n:.0f} of {n} trades (lag-autocorrelation corrected, "
+            f"clamped to [1, n]). No multiple-testing correction applied here."),
     }
 
 
@@ -628,8 +658,17 @@ class AlertManager:
                     self._conn.execute(
                         "ALTER TABLE signal_outcomes ADD COLUMN direction INTEGER DEFAULT 0")
                     logger.info("Migrated signal_outcomes: added direction column")
+                # audit 3.7: `emitted` distingue las senales que superaron los
+                # gates de las que se generaron y quedaron en sombra. Sin esa
+                # columna las estadisticas de outcome solo describen lo que el
+                # propio gate dejaba pasar: el gate no puede evaluarse contra
+                # lo que bloquea.
+                if "emitted" not in _cols:
+                    self._conn.execute(
+                        "ALTER TABLE signal_outcomes ADD COLUMN emitted INTEGER DEFAULT 0")
+                    logger.info("Migrated signal_outcomes: added emitted column")
             except Exception as e:
-                logger.debug("signal_outcomes direction migration skipped: %s", e)
+                logger.debug("signal_outcomes migration skipped: %s", e)
             self._conn.commit()
         self._prune()
 
@@ -731,6 +770,20 @@ class AlertManager:
                 self._conn.commit()
         except Exception as e:
             logger.warning(f"tag_signal failed: {e}")
+
+    def mark_emitted(self, signal_name: str, symbol: str, timeframe: str, bar_key: str):
+        """Marcar como EMITIDA la senal sombra (audit 3.7). tag_signal se llama
+        al entrar en _emit para TODA senal generada; solo la que supera todos los
+        gates pasa a emitted=1."""
+        signal_id = f"{symbol}_{signal_name}_{timeframe}_{bar_key}"
+        try:
+            with self._db_lock:
+                self._conn.execute(
+                    'UPDATE signal_outcomes SET emitted = 1 WHERE signal_id = ?',
+                    (signal_id,))
+                self._conn.commit()
+        except Exception as e:
+            logger.warning(f"mark_emitted failed: {e}")
 
     def get_unresolved(self, symbol: str, timeframe: str, limit: int = 100):
         try:
@@ -980,7 +1033,7 @@ class SignalAnalyzer:
         self._consolidation = bool(self.config.get('general.tf_consolidation_enabled', True))
         # Macro regime & outcome gating (v2.3) + time gating (v2.4)
         # Recency blackout (v2.5): per-symbol min-gap throttle independent of conditions.
-        self._blackout_enabled = bool(self.config.get('general.blackout_enabled', False))
+        self._blackout_enabled = bool(self.config.get('general.blackout_enabled', True))  # audit 3.14: igual que config_schema
         self._blackout_seconds = int(self.config.get('general.blackout_seconds', 300) or 300)
         self._signal_cooldown_seconds = int(self.config.get('general.signal_cooldown_seconds', 600) or 600)
         # key -> last emit wall-clock ts
@@ -995,7 +1048,14 @@ class SignalAnalyzer:
         self._l2_require_dom = bool(self.config.get('level2.require_dom', True))
         self._l2_dom_min = float(self.config.get('level2.dom_imbalance_min', 5.0) or 5.0)
         self._l2_require_cvd = bool(self.config.get('level2.require_cvd', True))
-        self._l2_require_quant = bool(self.config.get('level2.require_quant', True))
+        # audit 3.8: el componente "quant" era el engine leyendo SUS PROPIAS
+        # alertas de vuelta desde el bridge (todo quant_buffer lleva source
+        # "quant_engine") — autoconfirmacion circular, no evidencia
+        # independiente. Se elimina del score: DOM y CVD vienen del market data.
+        if self.config.get('level2.require_quant') is not None:
+            logger.warning("level2.require_quant esta deprecado (audit 3.8: "
+                           "autoconfirmacion circular) y se ignora.")
+        self._l2_require_quant = False
         self._l2_quant_min_tf = int(self.config.get('level2.quant_min_timeframes', 1) or 1)
         self._l2_fail_open = bool(self.config.get('level2.fail_open', True))
         self._l2_cache_ttl = float(self.config.get('level2.cache_ttl_seconds', 4.0) or 4.0)
@@ -1118,6 +1178,19 @@ class SignalAnalyzer:
         self._time_lookback_days = int(self.config.get('general.time_gating_lookback_days', 14) or 14)
         self._time_min_n = int(self.config.get('general.time_gating_min_n', 20) or 20)
         self._time_utc_offset = int(self.config.get('general.time_gating_utc_offset', 0) or 0)
+        # audit 3.7: tz IANA opcional (p.ej. "America/Bogota") para bucketing
+        # por hora local real. Colombia es UTC-5 fijo, asi que el offset legacy
+        # no esta mal AQUI — pero un offset fijo se rompe en zonas con horario
+        # de verano. Si se define time_gating_tz, manda sobre utc_offset.
+        self._time_tz = None
+        _tzname = str(self.config.get('general.time_gating_tz', '') or '').strip()
+        if _tzname:
+            try:
+                from zoneinfo import ZoneInfo  # noqa: PLC0415
+                self._time_tz = ZoneInfo(_tzname)
+            except Exception as _te:
+                logger.warning("time_gating_tz %r invalida (%s); se usa utc_offset=%d",
+                               _tzname, _te, self._time_utc_offset)
         self._time_protected = set(
             int(h) for h in (self.config.get('general.time_gating_protected_hours_local', []) or []) if 0 <= int(h) <= 23
         )
@@ -1465,7 +1538,10 @@ class SignalAnalyzer:
         except Exception:
             is_forming = False
 
-        if is_forming and len(df) > 51:
+        # audit 3.12: el guard era condicional (len(df) > 51): con <=51 barras la
+        # vela en curso ENTRABA en la evaluacion y la senal repintaba. El check
+        # `len(df_sig) < 50` de abajo ya protege la ventana minima.
+        if is_forming:
             df_sig = df.iloc[:-1].copy()
             live_price = float(df['close'].iloc[-1]) if not pd.isna(df['close'].iloc[-1]) else None
             # live_bar_key is forming candle's open time — not used for dedup
@@ -1515,7 +1591,8 @@ class SignalAnalyzer:
         vol_avg = None
         if self.config.get('volume.enabled'):
             vol_avg = self.ind.sma(v, self.config.get('volume.avg_len', 20))[-1]
-        bull_conf, bear_conf = self._confluence(c, rsi_arr, ml, sl, k, d, mid, v, vol_avg)
+        bull_conf, bear_conf = self._confluence(c, rsi_arr, ml, sl, k, d, mid, v, vol_avg,
+                                                atr_arr=atr_arr)
         regime = self._trend_regime(c, atr_arr)
         conf = (bull_conf, bear_conf, regime, self._conf_req, self._regime_enabled)
 
@@ -1775,29 +1852,49 @@ class SignalAnalyzer:
         try:
             cutoff = now - self._outcome_lookback_days * 86400
             with self.alert_mgr._db_lock:
-                rows = self.alert_mgr._conn.execute(
-                    f"""SELECT signal_name, AVG({_DIRECTED_RETURN_SQL}) as exp,
-                               COUNT(*) as n,
-                               SQRT(MAX(0.0, AVG({_DIRECTED_RETURN_SQL}*{_DIRECTED_RETURN_SQL})
-                                        - AVG({_DIRECTED_RETURN_SQL})*AVG({_DIRECTED_RETURN_SQL}))) as sd
-                       FROM signal_outcomes
-                       WHERE resolved = 1 AND fired_ts >= ? AND direction != 0
-                       GROUP BY signal_name""",
+                cur = self.alert_mgr._conn.execute(
+                    f"""SELECT signal_name, symbol, {_DIRECTED_RETURN_SQL}, fired_ts
+                        FROM signal_outcomes
+                        WHERE resolved = 1 AND fired_ts >= ? AND direction != 0
+                        ORDER BY signal_name, fired_ts""",
                     (cutoff,)).fetchall()
-                sym_rows = self.alert_mgr._conn.execute(
-                    f"""SELECT signal_name, symbol, AVG({_DIRECTED_RETURN_SQL}) as exp,
-                               COUNT(*) as n,
-                               SQRT(MAX(0.0, AVG({_DIRECTED_RETURN_SQL}*{_DIRECTED_RETURN_SQL})
-                                        - AVG({_DIRECTED_RETURN_SQL})*AVG({_DIRECTED_RETURN_SQL}))) as sd
-                       FROM signal_outcomes
-                       WHERE resolved = 1 AND fired_ts >= ? AND direction != 0
-                       GROUP BY signal_name, symbol""",
-                    (cutoff,)).fetchall()
-            def _t(exp_v, n_v, sd_v):
-                """One-sided t-stat for mean < 0; None when not computable."""
-                if exp_v is None or n_v is None or sd_v is None or int(n_v) < 2 or float(sd_v) <= 0:
+
+            # audit 3.7: se incluyen TAMBIEN las filas emitted=0 (senales en
+            # sombra que los gates bloquearon). Medir solo lo emitido hacia el
+            # gate contra si mismo — el gate no puede evaluarse contra lo que
+            # bloquea. La columna emitted queda para analisis posterior.
+            # audit 3.5: la expectancy se lee NETA: el coste roundtrip del
+            # modelo propio se resta en lectura, de modo que las filas
+            # historicas (guardadas en bruto) y las nuevas son comparables.
+            _rt_cost = _LIVE_COSTS.roundtrip_cost_pct()
+            pooled: Dict[str, List[float]] = {}
+            percell: Dict[Tuple[str, str], List[float]] = {}
+            for sname, sym, ret, _ts in cur:
+                if ret is None:
+                    continue
+                r = float(ret) - _rt_cost
+                pooled.setdefault(str(sname), []).append(r)
+                percell.setdefault((str(sname), str(sym)), []).append(r)
+
+            def _stats(rets: List[float]):
+                """(mean, n, t) con sd MUESTRAL (ddof=1, no poblacional) y t
+                corregido por solape lag-1 con clamp [1, n] (audit 3.6)."""
+                n_v = len(rets)
+                if n_v < 2:
                     return None
-                return float(exp_v) / float(sd_v) * math.sqrt(int(n_v))
+                mu_v = sum(rets) / n_v
+                var_v = sum((x - mu_v) ** 2 for x in rets) / (n_v - 1)
+                sd_v = var_v ** 0.5
+                rho = 0.0
+                if n_v >= 11 and sd_v > 0:
+                    a = [x - mu_v for x in rets[:-1]]
+                    b = [x - mu_v for x in rets[1:]]
+                    cov = sum(x * y for x, y in zip(a, b)) / len(a)
+                    rho = max(-0.49, min(0.49, cov / (sd_v ** 2)))
+                eff_n = max(1.0, min(float(n_v), n_v / (1 + 2 * rho)))
+                if sd_v <= 0 or eff_n < 2:
+                    return (mu_v, n_v, None)
+                return (mu_v, n_v, mu_v / sd_v * math.sqrt(eff_n))
 
             cache: Dict[str, Tuple[float, int]] = {}
             muted: set = set()
@@ -1805,20 +1902,24 @@ class SignalAnalyzer:
             # negative AND that mean is significantly below zero. Without the
             # t-test, 7 signals with t between -0.22 and -0.95 were muted on
             # sampling noise, which starved them of the data needed to recover.
-            for sname, exp, n, sd in rows:
-                if exp is None or n is None:
+            # audit 3.7: con el tag en sombra, una celula muted SIGUE recibiendo
+            # filas (se etiquetan antes de los gates), asi que el mute ya no
+            # congela el registro — solo deja de alertar.
+            for sname, rets in pooled.items():
+                st = _stats(rets)
+                if st is None:
                     continue
-                key = str(sname)
-                cache[key] = (float(exp), int(n))
-                t = _t(exp, n, sd)
-                if float(exp) < 0 and int(n) >= self._outcome_min_n and t is not None and t < -_DIRECTED_MIN_T:
-                    muted.add(key)                # pooled: applies to every symbol
-            for sname, sym, exp, n, sd in sym_rows:
-                if exp is None or n is None:
+                mu_v, n_v, t = st
+                cache[sname] = (mu_v, n_v)
+                if mu_v < 0 and n_v >= self._outcome_min_n and t is not None and t < -_DIRECTED_MIN_T:
+                    muted.add(sname)              # pooled: applies to every symbol
+            for cell, rets in percell.items():
+                st = _stats(rets)
+                if st is None:
                     continue
-                t = _t(exp, n, sd)
-                if float(exp) < 0 and int(n) >= self._outcome_min_n and t is not None and t < -_DIRECTED_MIN_T:
-                    muted.add((str(sname), str(sym)))   # per-symbol override
+                mu_v, n_v, t = st
+                if mu_v < 0 and n_v >= self._outcome_min_n and t is not None and t < -_DIRECTED_MIN_T:
+                    muted.add(cell)               # per-symbol override
             with self._state_lock:
                 self._outcome_cache = cache
                 self._outcome_muted = muted
@@ -1851,15 +1952,35 @@ class SignalAnalyzer:
         try:
             cutoff = now - self._time_lookback_days * 86400
             off = self._time_utc_offset
-            with self.alert_mgr._db_lock:
-                cur = self.alert_mgr._conn.execute(
-                    f"""SELECT CAST((((strftime('%H', datetime(fired_ts, 'unixepoch')) + ?) % 24) + 24) % 24 AS INTEGER) as hr,
-                              AVG({D}) as exp, COUNT(*) as n,
-                              SQRT(MAX(0.0, AVG({D}*{D}) - AVG({D})*AVG({D}))) as sd
-                       FROM signal_outcomes
-                       WHERE resolved=1 AND fired_ts >= ? AND direction != 0 GROUP BY hr""",
-                    (off, cutoff))
-                rows = cur.fetchall()
+            tz = self._time_tz  # None = legacy offset fijo; zoneinfo = DST correcto
+            if tz is not None:
+                # audit 3.7: bucketing por hora LOCAL real (zoneinfo). Un offset
+                # fijo etiqueta mal la hora durante el cambio de horario.
+                with self.alert_mgr._db_lock:
+                    cur = self.alert_mgr._conn.execute(
+                        f"""SELECT fired_ts, {_DIRECTED_RETURN_SQL}
+                            FROM signal_outcomes
+                            WHERE resolved=1 AND fired_ts >= ? AND direction != 0""",
+                        (cutoff,)).fetchall()
+                buckets: Dict[int, List[float]] = {}
+                for fts, ret in cur:
+                    if ret is None:
+                        continue
+                    hr = datetime.fromtimestamp(float(fts), tz).hour
+                    buckets.setdefault(hr, []).append(float(ret))
+                rows = [(hr, sum(v) / len(v), len(v),
+                         (sum((x - sum(v) / len(v)) ** 2 for x in v) / (len(v) - 1)) ** 0.5
+                         if len(v) > 1 else 0.0)
+                        for hr, v in sorted(buckets.items())]
+            else:
+                with self.alert_mgr._db_lock:
+                    rows = self.alert_mgr._conn.execute(
+                        f"""SELECT CAST((((strftime('%H', datetime(fired_ts, 'unixepoch')) + ?) % 24) + 24) % 24 AS INTEGER) as hr,
+                                  AVG({D}) as exp, COUNT(*) as n,
+                                  SQRT(MAX(0.0, AVG({D}*{D}) - AVG({D})*AVG({D}))) as sd
+                           FROM signal_outcomes
+                           WHERE resolved=1 AND fired_ts >= ? AND direction != 0 GROUP BY hr""",
+                        (off, cutoff)).fetchall()
             cache: Dict[int, Tuple[float, int]] = {}
             muted: set = set()
             for hr, exp, n, sd in rows:
@@ -1886,7 +2007,10 @@ class SignalAnalyzer:
         if not self._time_enabled:
             return False
         self._refresh_time_cache()
-        hr = (time.gmtime().tm_hour + self._time_utc_offset) % 24
+        if self._time_tz is not None:
+            hr = datetime.now(self._time_tz).hour
+        else:
+            hr = (time.gmtime().tm_hour + self._time_utc_offset) % 24
         with self._state_lock:
             return hr in self._time_muted_hours
 
@@ -2055,30 +2179,14 @@ class SignalAnalyzer:
         return 1.0 if delta < 0 else -1.0
 
     def _l2_quant_score(self, base: str, direction: str) -> Optional[float]:
-        """+1 multi-TF consensus agrees, -1 disagrees, 0.0 neutral (balanced).
-        None when the bridge has no quant alerts buffered (missing, not neutral)."""
-        d = self._l2_fetch("/quant/" + base, cache_key=("quant", base))
-        if not d or not isinstance(d.get("alerts"), list):
-            return None
-        if not d["alerts"]:
-            return None
-        bull = bear = 0
-        tfs: Dict[str, int] = {}
-        for a in d["alerts"]:
-            color = (a.get("color") or "").lower()
-            tf = str(a.get("timeframe") or "?")
-            if color == "green":
-                bull += 1
-                tfs[tf] = tfs.get(tf, 0) + 1
-            elif color == "red":
-                bear += 1
-        distinct_tf = len(tfs)
-        if bull == bear:
-            return 0.0
-        agrees = (bull > bear) == (direction == "bull")
-        if distinct_tf >= self._l2_quant_min_tf:
-            return 1.0 if agrees else -1.0
-        return 0.5 if agrees else -0.5
+        """DEPRECATED (audit 3.8): devuelve None siempre.
+
+        Leia /quant/{base} del bridge, cuyo buffer SOLO contiene alertas
+        reenviadas por este engine (source="quant_engine"): una alerta podia
+        ser "confirmada" por una alerta anterior de si misma. El componente
+        quant ya no participa en la validacion L2; DOM y CVD son los unicos
+        inputs, y ambos vienen del market data."""
+        return None
 
     def _l2_validate(self, symbol: str, direction: str) -> Tuple[bool, float, str]:
         """Run Level-2 validation. Returns (pass, score, detail).
@@ -2138,10 +2246,11 @@ class SignalAnalyzer:
                 return True, 0.0, "l2-error(fail-open)"
             return False, 0.0, "l2-error"
 
-    def _confluence(self, c, rsi_arr, ml, sl, k, d, mid, v, vol_avg) -> Tuple[int, int]:
+    def _confluence(self, c, rsi_arr, ml, sl, k, d, mid, v, vol_avg,
+                    atr_arr=None) -> Tuple[int, int]:
         """Count directional agreement across 6 independent factors:
         RSI vs 50, MACD line vs signal, %K vs %D, close vs BB mid,
-        volume vs 20-bar average, close vs trend EMA.
+        volume confirming bar direction, close vs trend EMA.
         Returns (bull_count, bear_count)."""
         bull = bear = 0
         try:
@@ -2158,9 +2267,17 @@ class SignalAnalyzer:
                 if c[-1] > mid[-1]: bull += 1
                 else: bear += 1
             if vol_avg is not None and not np.isnan(vol_avg) and not np.isnan(v[-1]):
-                if v[-1] > vol_avg: bull += 1
-                else: bear += 1
-            tr = self._trend_regime(c)
+                # audit 3.10: el volumen no es direccional por si solo — el
+                # factor original sumaba a los bulls cualquier volumen por
+                # encima de la media y a los bears cualquier barra tranquila.
+                # Voto solo cuando el volumen alto confirma el close de la barra.
+                if v[-1] > vol_avg and len(c) > 1:
+                    if c[-1] > c[-2]: bull += 1
+                    elif c[-1] < c[-2]: bear += 1
+            # audit 3.11: misma definicion de regimen que el gate principal —
+            # con banda ATR — para que una misma barra no cuente "up" aqui y
+            # "flat" en el filtro de regimen.
+            tr = self._trend_regime(c, atr_arr)
             if tr > 0: bull += 1
             elif tr < 0: bear += 1
         except Exception:
@@ -2195,6 +2312,18 @@ class SignalAnalyzer:
         """Central emit gate: disabled list + regime filter + confluence + multi-TF consolidation + macro + outcome gating.
         Returns True if the alert was actually emitted."""
         bull_conf, bear_conf, regime, conf_req, reg_enabled = conf
+        # audit 3.7: TODA senal generada se registra en sombra con emitted=0,
+        # ANTES de los gates. Solo la que pasa todos los gates se marca
+        # emitted=1 al final. Asi las estadisticas de outcome describen el
+        # flujo completo y los gates pueden evaluarse contra lo que bloquean.
+        _dir_sign = get_signal_direction(name, direction)
+        try:
+            self.alert_mgr.tag_signal(name, sym, p, tf, bk, stype,
+                                      self._forward_bars_for(tf),
+                                      features=(market_data or {}).get("features"),
+                                      direction=_dir_sign)
+        except Exception as _te:
+            logger.debug("shadow tag failed: %s", _te)
         if direction == "bull":
             if reg_enabled and regime < 0:
                 return False
@@ -2273,7 +2402,6 @@ class SignalAnalyzer:
         # attached to market_data (so it lands in the log, Telegram and the
         # signal_features row) and only blocks emission when ml.gate_signals is
         # true. Fail-open by default — a scoring error must not blackhole alerts.
-        _dir_sign = get_signal_direction(name, direction)
         if self._ml_filter is not None:
             _p = None
             try:
@@ -2301,6 +2429,9 @@ class SignalAnalyzer:
                     return False
         self.alert_mgr.emit_alert(name, sym, p, stype, color, bk, tf,
                                   market_data=market_data, direction=_dir_sign)
+        # audit 3.7: emit_alert ya inserta (INSERT OR IGNORE no-op); aqui se
+        # marca esta fila como EMITIDA.
+        self.alert_mgr.mark_emitted(name, sym, tf, bk)
         try:
             t0 = datetime.fromisoformat(bk).timestamp() if bk else 0.0
         except (ValueError, TypeError):
@@ -2418,7 +2549,7 @@ class SignalAnalyzer:
             return None
 
     def _vol_state_persisted(self, sym: str, tf: str, state: str, bar_key: str) -> bool:
-        """True when `state` has held for N consecutive CLOSED BARS.
+        """True EXACTLY when `state` reaches N consecutive CLOSED BARS (once per episode).
 
         Fix VOL-1: without this a ratio sitting on the threshold re-enters and exits the
         state between bars and every re-entry is a fresh alert. Volume regime is a slow
@@ -2430,37 +2561,57 @@ class SignalAnalyzer:
         without the market changing at all. The bar_key is the closed bar's open time, so
         the same bar key repeating means "no new information" and must not advance the
         count.
+
+        audit 3.9: el antiguo diseño NUNCA emitia — el llamador solo invocaba este
+        helper en la barra de TRANSICION (hold=1 < need) y nunca en las barras
+        siguientes, asi que hold no podia llegar a need. Ahora el llamador invoca
+        en cada barra no-normal y este helper devuelve True una unica vez, cuando
+        la racha alcanza `need`.
         """
         need = int(self.config.get('volume.state_persistence_bars', 2))
         if need <= 1:
             return True
         key = f"{sym}_{tf}_vol_hold"
-        prev_key, hold = self._vol_pending.get(key, (None, 0))
-        if bar_key == prev_key:
-            return hold >= need            # same bar seen again: no progress, no reset
-        hold = hold + 1 if state == self._vol_pending.get(f"{sym}_{tf}_vol_state") else 1
-        self._vol_pending[key] = (bar_key, hold)
-        self._vol_pending[f"{sym}_{tf}_vol_state"] = state
-        return hold >= need
+        entry = dict(self._vol_pending.get(key) or {})
+        if entry.get("state") != state:
+            entry = {"state": state, "bk": bar_key, "hold": 1, "fired": False}
+        elif entry.get("bk") != bar_key:
+            entry["bk"] = bar_key
+            entry["hold"] = int(entry.get("hold", 0)) + 1
+        fire = False
+        if int(entry.get("hold", 0)) >= need and not entry.get("fired"):
+            entry["fired"] = True
+            fire = True
+        self._vol_pending[key] = entry
+        return fire
 
     def _obv_break_persisted(self, sym: str, tf: str, side: str, bar_key: str) -> bool:
-        """True when the OBV break has held for N consecutive CLOSED BARS.
+        """True EXACTLY when an OBV break has held N consecutive CLOSED BARS.
 
         Fix VOL-2. Counted in bars via bar_key, for the same reason as the volume state:
         the engine polls every 5s and re-evaluates one closed bar ~60 times on 5m, so a
         poll counter would fire instantly and mean nothing.
+
+        audit 3.9: el llamador solo invocaba este helper en la BARRA DEL CRUCE
+        (hold=1 < need para siempre). Ahora se invoca en cada barra con lado y
+        esto dispara una unica vez cuando la racha llega a `need`.
         """
         need = int(self.config.get('volume.obv_break_bars', 2))
         if need <= 1:
             return True
         key = f"{sym}_{tf}_obv_hold"
-        prev_key, hold = self._vol_pending.get(key, (None, 0))
-        if bar_key == prev_key:
-            return hold >= need
-        hold = hold + 1 if side == self._vol_pending.get(f"{sym}_{tf}_obv_side") else 1
-        self._vol_pending[key] = (bar_key, hold)
-        self._vol_pending[f"{sym}_{tf}_obv_side"] = side
-        return hold >= need
+        entry = dict(self._vol_pending.get(key) or {})
+        if entry.get("side") != side:
+            entry = {"side": side, "bk": bar_key, "hold": 1, "fired": False}
+        elif entry.get("bk") != bar_key:
+            entry["bk"] = bar_key
+            entry["hold"] = int(entry.get("hold", 0)) + 1
+        fire = False
+        if int(entry.get("hold", 0)) >= need and not entry.get("fired"):
+            entry["fired"] = True
+            fire = True
+        self._vol_pending[key] = entry
+        return fire
 
     def _check_volume(self, sym, p, c, v, bk, tf, vol_avg, conf,
                        market_data: Optional[Dict[str, Any]] = None):
@@ -2492,10 +2643,13 @@ class SignalAnalyzer:
             ratio = cur_vol / base
             ratio_txt = f" vs own 30d median ({ratio:.2f}x)"
         else:
-            d_hi = self.config.get('volume.dryup_exit_mult', 0.8) * vol_avg
-            e_hi = self.config.get('volume.climax_mult', 3.5) * vol_avg
-            e_mid = self.config.get('volume.spike_mult', 2.0) * vol_avg
-            e_lo = self.config.get('volume.dryup_mult', 0.5) * vol_avg
+            # audit 3.9: los umbrales de fallback eran VOLUMENES (mult * vol_avg)
+            # comparados contra `ratio`, que es adimensional: un volumen
+            # constante da ratio=1 y 1 < 0.5*vol_avg disparaba "dryup" falso.
+            # Los multiplicadores son RATIOS aqui, igual que en la rama con base.
+            e_hi = self.config.get('volume.climax_mult', 3.5)
+            e_mid = self.config.get('volume.spike_mult', 2.0)
+            e_lo = self.config.get('volume.dryup_mult', 0.5)
             ratio = cur_vol / vol_avg if vol_avg else 0.0
 
         # Transition logic for volume (state persisted in SQLite, survives restarts)
@@ -2504,8 +2658,9 @@ class SignalAnalyzer:
         elif ratio > e_mid: cur_state = "spike"
         elif ratio < e_lo: cur_state = "dryup"
 
-        prev_state = self._STATE_CODE_TO_NAME.get(self.alert_mgr.get_state_val(state_key), "normal")
-        if cur_state != "normal" and cur_state != prev_state:
+        # audit 3.9: se evalua en CADA barra no-normal (no solo en la transicion):
+        # la persistencia necesita barras consecutivas para llegar a `need`.
+        if cur_state != "normal":
             if self._vol_state_persisted(sym, tf, cur_state, bk):
                 self._emit(f"Volume {cur_state.capitalize()}", sym, p, "VOL", "red", bk, tf,
                            conf, market_data=market_data)
@@ -2536,8 +2691,10 @@ class SignalAnalyzer:
             margin = self.config.get('volume.obv_break_sigma', 0.75) * sd
             d_now, d_prev = resid[-1], resid[-2]
             side = "bull" if d_now > margin else ("bear" if d_now < -margin else "flat")
-            prev_side = "bull" if d_prev > margin else ("bear" if d_prev < -margin else "flat")
-            if side != "flat" and side != prev_side:
+            # audit 3.9: la persistencia se evalua en cada barra con lado — el
+            # cruce debe AGUANTAR `obv_break_bars` barras cerradas, no ocurrir
+            # en la misma barra en la que se exige la racha.
+            if side != "flat":
                 if self._obv_break_persisted(sym, tf, side, bk):
                     self._emit("OBV Bullish Break" if side == "bull" else "OBV Bearish Break",
                                sym, p, "VOL", "green" if side == "bull" else "red", bk, tf,
@@ -2689,11 +2846,15 @@ class Backtester:
         # Capture every signal the real checks emit during replay
         captured = []
         orig_emit = self.analyzer.alert_mgr.emit_alert
+        # audit 3.1: la firma cerrada no aceptaba market_data/direction y el
+        # primer emitido reventaba con TypeError. **kw los captura; direction
+        # se guarda para calcular el retorno del lado correcto.
         self.analyzer.alert_mgr.emit_alert = (
-            lambda name, sym, price, signal_type="", color="info", bar_key="", timeframe="":
+            lambda name, sym, price, signal_type="", color="info", bar_key="", timeframe="", **kw:
             captured.append({"name": name, "sym": sym, "price": price,
                              "signal_type": signal_type, "bar_key": bar_key,
-                             "timeframe": timeframe}))
+                             "timeframe": timeframe,
+                             "direction": kw.get("direction")}))
 
         try:
             for i in range(100, len(df)):
@@ -2735,13 +2896,18 @@ class Backtester:
             regime = regimes[i] if i < len(regimes) else 0
             dryup = (phase == "OOS" and sig["name"] == "Volume Dryup")
             cost_pct = self.costs.roundtrip_cost_pct(dryup=dryup)
-            dir_sign = get_signal_direction(sig["name"])
+            dir_sign = sig.get("direction")
+            if dir_sign not in (-1, 1):
+                dir_sign = get_signal_direction(sig["name"])
             for h in horizons:
                 if i + h < n:
                     raw_ret = float(closes[i + h]) / float(sig["price"]) - 1.0
                     # Fix C1: Short signals profit when price falls
                     gross_ret = -raw_ret if dir_sign == -1 else raw_ret
-                    fwd_cost = self.costs.funding_cost(float(sig["price"]), h)
+                    # audit 3.2: funding sobre el horizonte REAL de la vela
+                    fwd_cost = self.costs.funding_cost(
+                        float(sig["price"]), h,
+                        bar_seconds=TF_SECONDS.get(timeframe, 300))
                     net_ret = gross_ret - cost_pct - fwd_cost
                     record(sig["name"], h, net_ret, phase, regime)
                     all_trades.append({
@@ -2825,11 +2991,13 @@ class WalkForward:
         # Capture signals with correct expanding history (delegate Backtester replay)
         captured = []
         orig_emit = bt.analyzer.alert_mgr.emit_alert
+        # audit 3.1: misma firma rota que en Backtester.run
         bt.analyzer.alert_mgr.emit_alert = (
-            lambda name, sym, price, signal_type="", color="info", bar_key="", timeframe="":
+            lambda name, sym, price, signal_type="", color="info", bar_key="", timeframe="", **kw:
             captured.append({"name": name, "sym": sym, "price": price,
                              "signal_type": signal_type, "bar_key": bar_key,
-                             "timeframe": timeframe}))
+                             "timeframe": timeframe,
+                             "direction": kw.get("direction")}))
         try:
             for i in range(100, len(df)):
                 bt.analyzer._evaluate(symbol, timeframe, df.iloc[:i + 1])
@@ -2862,13 +3030,18 @@ class WalkForward:
                 if i is None: continue
                 regime = regimes[i] if i < len(regimes) else 0
                 cost_pct = bt.costs.roundtrip_cost_pct(dryup=(sig["name"] == "Volume Dryup"))
-                dir_sign = get_signal_direction(sig["name"])
+                dir_sign = sig.get("direction")
+                if dir_sign not in (-1, 1):
+                    dir_sign = get_signal_direction(sig["name"])
                 for h in horizons:
                     if i + h < n:
                         raw_ret = float(closes[i + h]) / float(sig["price"]) - 1.0
                         # Fix C1: Short signals profit when price falls
                         gross_ret = -raw_ret if dir_sign == -1 else raw_ret
-                        fwd_cost = bt.costs.funding_cost(float(sig["price"]), h)
+                        # audit 3.2: funding sobre el horizonte REAL de la vela
+                        fwd_cost = bt.costs.funding_cost(
+                            float(sig["price"]), h,
+                            bar_seconds=TF_SECONDS.get(timeframe, 300))
                         fold_trades.append({
                             "name": sig["name"], "ret": gross_ret - cost_pct - fwd_cost,
                             "gross_ret": gross_ret, "entry_idx": i, "exit_idx": i + h,
@@ -2978,8 +3151,10 @@ class QuantAlertEngine:
         or socket blip. HTTP errors back off too (a 429 without backoff invites
         a Telegram ban). Returns True only on a confirmed 200.
         """
-        token = self.config.get('telegram.token', '')
-        chat_id = self.config.get('telegram.chat_id', '')
+        # audit 1.1: credentials must come from the environment, never from the
+        # committed config (repo is public). Env wins so rotation needs no code change.
+        token = os.environ.get('TG_TOKEN') or self.config.get('telegram.token', '')
+        chat_id = os.environ.get('TG_CHAT') or self.config.get('telegram.chat_id', '')
         if not token or not chat_id:
             logger.debug("Telegram disabled: missing token or chat_id")
             return False

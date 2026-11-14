@@ -45,6 +45,7 @@ Config (env vars):
 """
 from __future__ import annotations
 
+import io
 import os
 import signal
 import subprocess
@@ -86,10 +87,18 @@ def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if os.name == "nt":
+        # audit 7.1: la salida se comparaba con substring — el PID 12 "vivia"
+        # si habia un 1234 en el listado. CSV y comparacion exacta del campo.
         try:
-            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                                  capture_output=True, text=True, timeout=10)
-            return str(pid) in out.stdout
+            # CSV: "imagen","PID",... — el PID es el campo 1 (audit 7.1:
+            # antes se comparaba la linea completa por substring).
+            import csv as _csv
+            for row in _csv.reader(io.StringIO(out.stdout)):
+                if len(row) >= 2 and row[1].strip() == str(pid):
+                    return True
+            return False
         except Exception:
             return False
     try:
