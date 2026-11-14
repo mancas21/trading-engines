@@ -50,7 +50,10 @@ if str(HERE) not in sys.path:
 import httpx  # noqa: E402
 
 import detectors as D  # noqa: E402
+import smc as SM  # noqa: E402
 from book import LocalBook  # noqa: E402
+
+TF_SECONDS_SMC = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "1h": 3600}
 
 log = logging.getLogger("early_engine")
 
@@ -232,6 +235,22 @@ class Output:
                 keep.append(row)
         self.pending = keep
 
+    def notify_telegram(self, text: str) -> None:
+        """Aviso directo a Telegram (hechos de estructura). Credenciales por
+        entorno (TG_TOKEN/TG_CHAT, audit 1.1); silencioso si faltan."""
+        token = os.environ.get("TG_TOKEN", "").strip()
+        chat = os.environ.get("TG_CHAT", "").strip()
+        if not token or not chat:
+            log.debug("telegram off: TG_TOKEN/TG_CHAT ausentes")
+            return
+        try:
+            import httpx as _hx
+            _hx.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat, "text": text}, timeout=5.0)
+        except Exception as e:  # noqa: BLE001 — un aviso no tumba el engine
+            log.warning("telegram notify failed: %s", e)
+
     async def post_bridge(self, ev: D.Event) -> None:
         if not self.bridge_url:
             return
@@ -339,6 +358,74 @@ async def detect_loop(states: dict[str, SymbolState], cfg: D.Config, out: Output
         await asyncio.sleep(0.5)
 
 
+# ---------------------------------------------------------------- SMC structure
+async def structure_loop(http, syms: list[str], out: Output,
+                         scfg: dict) -> None:
+    """SMC CHOCH/BOS por (simbolo, timeframe) sobre velas CERRADAS.
+
+    Son hechos de estructura: se notifican a Telegram sin protocolo de
+    validacion (no afirman edge). Tambien entran al log de sombra para que el
+    estudio mida su forward return como a cualquier evento."""
+    tfs = [t for t in scfg.get("timeframes", ["15m"]) if t in TF_SECONDS_SMC]
+    strength = int(scfg.get("strength", 2))
+    notify = bool(scfg.get("notify", True))
+    limit = int(scfg.get("klines_limit", 300))
+    trackers: dict[tuple, SM.StructureTracker] = {}
+    last_bars: dict[tuple, float] = {}
+    init_done: set[tuple] = set()
+    while True:
+        for sym in syms:
+            for tf in tfs:
+                key = (sym, tf)
+                # primera pasada = replay de historial: los eventos de contexto
+                # van al log de sombra pero NO a Telegram (serian viejos)
+                can_notify = key in init_done
+                try:
+                    r = await http.get(f"{FAPI_REST}/fapi/v1/klines",
+                                       params={"symbol": sym, "interval": tf,
+                                               "limit": limit})
+                    r.raise_for_status()
+                    rows = r.json()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("%s %s klines: %s", sym, tf, e)
+                    continue
+                now_ms = time.time() * 1000
+                closed = [k for k in rows if int(k[6]) < now_ms]
+                if not closed:
+                    continue
+                tr = trackers.get(key)
+                if tr is None:
+                    tr = trackers[key] = SM.StructureTracker(sym, tf, strength)
+                for k in closed:
+                    ts = float(k[0])
+                    if last_bars.get(key, 0.0) >= ts:
+                        continue                       # ya procesada
+                    bar = {"ts": ts, "open": float(k[1]), "high": float(k[2]),
+                           "low": float(k[3]), "close": float(k[4])}
+                    ev = tr.update(bar)
+                    last_bars[key] = ts
+                    if ev is None:
+                        continue
+                    # el side va en direccion del evento: bull = larga, bear = corta
+                    d_ev = D.Event(
+                        name=ev.name, side="long" if ev.side == "bull" else "short",
+                        symbol=sym, ts=time.time(), price=ev.price, level=ev.level,
+                        invalidation=ev.level,
+                        features={"tf": tf, "kind": ev.kind, "ev_side": ev.side,
+                                  "trend_before": ev.trend_before, "family": "structure"})
+                    out.record_event(d_ev, time.time())
+                    log.info("SMC %s %s %s %s rompio %.6g cierre %.6g%s",
+                             sym, tf, ev.kind, ev.side, ev.level, ev.price,
+                             "" if can_notify else " (replay, sin notify)")
+                    if notify and can_notify:
+                        arrow = "+" if ev.side == "bull" else "-"
+                        out.notify_telegram(
+                            f"{arrow} {sym} {tf} {ev.name} {ev.side.upper()} | "
+                            f"cierre {ev.price:g} rompio {ev.level:g} | early-engine")
+                init_done.add(key)
+        await asyncio.sleep(30)
+
+
 # ---------------------------------------------------------------- main
 async def main_async(cfg_path: str) -> None:
     raw = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
@@ -364,7 +451,13 @@ async def main_async(cfg_path: str) -> None:
         tasks = [asyncio.create_task(levels_loop(http, states, dcfg)),
                  asyncio.create_task(detect_loop(states, dcfg, out,
                                                  raw.get("control_every_s", 60.0),
-                                                 raw.get("mode", "shadow") == "shadow"))]
+                                                 raw.get("mode", "shadow") == "shadow")),
+                 asyncio.create_task(structure_loop(
+                     http,
+                     list(dict.fromkeys(
+                         symbols + [x.upper() for x in
+                                    raw.get("structure_symbols", [])])),
+                     out, raw.get("structure", {})))]
         for st in states.values():
             tasks.append(asyncio.create_task(depth_loop(http, st, ws_base)))
             tasks.append(asyncio.create_task(trade_loop(st, ws_base)))

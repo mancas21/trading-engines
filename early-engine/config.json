@@ -1,6 +1,10 @@
 {
   "mode": "shadow",
-  "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT"
+  ],
   "ws_base": "wss://fstream.binance.com/ws",
   "bridge_url": "",
   "event_log": "logs/early_events.jsonl",
@@ -16,5 +20,24 @@
     "rally_move_atr": 1.0,
     "rally_window_s": 30.0,
     "rally_max_extension_atr": 1.5
-  }
+  },
+  "structure": {
+    "timeframes": [
+      "1m",
+      "5m",
+      "15m"
+    ],
+    "strength": 2,
+    "notify": true,
+    "klines_limit": 300
+  },
+  "structure_symbols": [
+    "XRPUSDT",
+    "1000PEPEUSDT",
+    "ARBUSDT",
+    "HYPEUSDT",
+    "SUIUSDT",
+    "JUPUSDT",
+    "DOGEUSDT"
+  ]
 }

@@ -95,6 +95,23 @@ mean event return, mean control return, the **excess** (event − control),
 a Welch t-stat, and the hit rate of each. Read the excess and the t-stat
 together. A positive excess on one day with n < 50 is noise.
 
+## SMC structure alerts (CHOCH / BOS) — live since 2026-11-14
+
+`smc.py` tracks swing structure per (symbol, timeframe) on CLOSED bars with
+pivot strength 2 and no lookahead (a swing is confirmed only `strength` bars
+after its extreme). Events:
+
+- `SMC_BOS` — close breaks the last swing IN the trend direction (continuation)
+- `SMC_CHOCH` — close breaks the last swing AGAINST the trend (reversal signal)
+
+These are FACTS, not predictions, so they notify Telegram immediately
+(`TG_TOKEN`/`TG_CHAT` env) on every configured timeframe, for the L2 symbols
+PLUS the light `structure_symbols` list (klines-only, no WebSocket). The first
+pass replays history into the shadow log WITHOUT notifying (no old-event spam).
+They also land in the shadow log, so the study measures their forward returns
+like any event. QAE (the indicator engine) stays DISCONNECTED by user decision
+— this module replaces it as the alerting layer.
+
 ## Files
 
 - `book.py` — local L2 book with the documented Binance resync procedure. A
