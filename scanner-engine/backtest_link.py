@@ -27,6 +27,10 @@ Se aplican los del propio repo (AGENTS.md "Validation criteria"):
     solo gana "perdiendo menos que un mercado que se hunde" no es alpha.
     Desde 2026-10-25 esto se APLICA (antes solo se reportaba: un candidato con
     excess -279pp pasaba el gate).
+  - audit 5.6: el gate es PF-based y el PF no controla azar por si solo; se
+    exige ademas `exp_R > 0` (expectancia neta por trade, ya presente en el
+    artefacto). El t/bootstrap sobre retornos por trade requiere que el
+    backtest-system los emita: pendiente en ESE repo, no aqui.
 
 Los artefactos con `slice_from`/`slice_to` son cortes diagnosticos de 8-9 meses,
 no resultados validados: se cuentan en `slice_artifacts` y NUNCA son candidatos
@@ -132,6 +136,19 @@ def _passes(row: dict) -> tuple[bool, str]:
     # excess_% = -279 was admitted as a candidate.
     if excess <= 0:
         return False, f"excess {excess:+.1f}pp <= 0 vs buy & hold"
+    # audit 5.6: el PF no tiene distribucion de muestreo usada aqui y el gate
+    # no controlaba azar. El artefacto ya trae `exp_R` (expectancia neta por
+    # trade en R): exigirla positiva es una condicion real por-trade, no un
+    # agregado inflable por concentracion. Un t-test de verdad necesita los
+    # retornos por trade del backtest-system (flag pendiente alli).
+    exp_r = row.get("exp_R")
+    if exp_r is not None:
+        try:
+            exp_r = float(exp_r)
+        except (TypeError, ValueError):
+            return False, "exp_R ilegible"
+        if exp_r <= 0:
+            return False, f"exp_R {exp_r:+.3f} <= 0 (expectancia neta por trade)"
     return True, "ok"
 
 
@@ -226,6 +243,9 @@ def scan() -> dict:
                 "conc_top5_share_pct": row.get("conc_top5_share_pct"),
                 "conc_passes_decile": row.get("conc_passes_decile"),
                 "funding_drag_pp": row.get("funding_drag_pp"),
+                # audit 5.6: la significancia exacta (t/bootstrap) vive en el
+                # backtest-system; aqui solo se copia la expectancia por trade.
+                "exp_R": row.get("exp_R"),
             }
             # DEDUPE: la misma estrategia puede tener varios artefactos
             # (el backtest-system se ha re-ejecutado con datos frescos). Se

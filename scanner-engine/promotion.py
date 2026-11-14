@@ -70,7 +70,7 @@ def has_directional_claim(spec: dict) -> bool:
 
 def promote_if_earned(audit_row: dict, spec: dict,
                       min_n: int = DEFAULT_MIN_N,
-                      min_t: float = DEFAULT_MIN_T) -> tuple[bool, str]:
+                      min_t: float | None = None) -> tuple[bool, str]:
     """Decide whether `spec` may be promoted, given its measured `audit_row`.
 
     Returns (promote, reason). `audit_row` is one entry from
@@ -94,6 +94,13 @@ def promote_if_earned(audit_row: dict, spec: dict,
         return False, ("no directional claim (direction_hint is null) — this "
                        "rule is observation-only by design")
 
+    # audit 5.3: el default era el 1.65 SIN corregir; una llamada directa sin
+    # threshold habria promocionado con la barra suelta. Promotion es el acto
+    # irreversible: sin el min_t del auditor (derivado por Bonferroni sobre la
+    # familia que si se gradua), se NIEGA.
+    if min_t is None:
+        return False, ("min_t ausente: pasa el umbral derivado del auditor "
+                       "(expectancy.audit()['min_t'], Bonferroni sobre la familia)")
     thresh = abs(float(min_t))
     n = audit_row.get("n", 0)
     n_eff = audit_row.get("n_eff", n)
@@ -120,7 +127,7 @@ def promote_if_earned(audit_row: dict, spec: dict,
 
 def apply_promotion(rules_path: pathlib.Path, rule_id: str,
                     audit_row: dict, min_n: int = DEFAULT_MIN_N,
-                    min_t: float = DEFAULT_MIN_T) -> tuple[bool, str]:
+                    min_t: float | None = None) -> tuple[bool, str]:
     """Measure-then-write. Never writes unless promote_if_earned agrees."""
     with open(rules_path, encoding="utf-8") as fh:
         rules = json.load(fh)
@@ -231,7 +238,7 @@ def promotion_report(db: sqlite3.Connection, rules: dict,
             continue
         ok, reason = promote_if_earned(row, spec,
                                        audit.get("min_n", DEFAULT_MIN_N),
-                                       audit.get("min_t", DEFAULT_MIN_T))
+                                       audit.get("min_t"))
         out.append({
             "rule": rid,
             "name": spec.get("name"),
