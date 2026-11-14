@@ -57,6 +57,9 @@ LEVERAGE_DEFAULT = 5
 LEVERAGE_MAX = 20
 MARGIN_PCT_DEFAULT = 25.0
 PROD_TAKER_BPS = 5.0
+# audit 2.4: un stop a <5 bps del mark genera un qty enorme (dist~0) y un stop
+# que salta con el ruido. Es un suelo de sensatez, no una estrategia.
+MIN_STOP_DIST_BPS = 5.0
 
 
 def load_signal(path: str | None, args) -> dict:
@@ -223,6 +226,10 @@ def run(a: argparse.Namespace) -> int:
 
     # ── tamano ────────────────────────────────────────────────────────
     dist = abs(mark - sig["stop"])
+    if dist / mark * 1e4 < MIN_STOP_DIST_BPS:
+        print(f"\nBLOQUEADO: stop a {dist/mark*1e4:.1f} bps del mark "
+              f"(< {MIN_STOP_DIST_BPS:g} bps): riesgo sin sentido y qty disparada")
+        return 4
     risk_usd = equity * a.risk_pct / 100.0
     qty_risk = risk_usd / dist
     qty_notional = c.max_notional / mark
@@ -319,7 +326,10 @@ def run(a: argparse.Namespace) -> int:
 
     # ── proteccion ────────────────────────────────────────────────────
     close_side = "SELL" if side == "LONG" else "BUY"
-    stop_px = c.round_price(sym, sig["stop"])
+    # audit 2.4: el stop se redondea ALEJANDOLO del mercado — un tick nunca
+    # acerca el disparo ni puede dejar el trigger al otro lado del mark.
+    stop_px = c.round_price(sym, sig["stop"],
+                            direction="down" if side == "LONG" else "up")
     try:
         sresp = c.protective_order(kind="STOP_MARKET", symbol=sym, side=close_side,
                                    stop_price=stop_px, close_position=True)

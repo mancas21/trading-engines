@@ -37,9 +37,10 @@ sys.path.insert(0, str(HERE))
 import flatten  # noqa: E402
 import live_signal  # noqa: E402
 import proclock  # noqa: E402
+import risk_guard  # noqa: E402
 import router  # noqa: E402
 import state_store  # noqa: E402
-from binance_testnet import BinanceError, TestnetClient  # noqa: E402
+from binance_testnet import BinanceError, SafetyError, TestnetClient  # noqa: E402
 
 LOG = HERE / "logs" / "auto_router.jsonl"
 LOCK = "auto_router"
@@ -74,7 +75,9 @@ def decision(*, sig: dict, pos_amt: float, max_lag: int) -> dict:
     age = sig.get("bars_held")
     base = {"want": want, "have": have, "age": age}
 
-    if not sig.get("trusted", True):
+    # audit 2.2: el default era True — una senal sin el campo se consideraba
+    # fiable. Al reves: sin prueba de fiabilidad, no se opera.
+    if not sig.get("trusted", False):
         return {**base, "action": "skip", "why": "ventana corta: estado no fiable"}
     if want == 0:
         return ({**base, "action": "close", "why": "senal plana"}
@@ -129,6 +132,19 @@ def run_cycle(execute: bool, max_lag: int, leverage: int,
     positions = {p["symbol"]: float(p["positionAmt"])
                  for p in c.positions() if float(p.get("positionAmt", 0)) != 0}
 
+    # audit 2.2: guardia de cartera. El kill switch bloquea el riesgo NUEVO
+    # (abrir/revertir); cerrar sigue permitido porque reduce riesgo.
+    if execute:
+        try:
+            equity = float(c.account().get("totalWalletBalance") or 0)
+            g = risk_guard.daily_check(equity)
+            if g["tripped"]:
+                log({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                     "action": "kill_tripped", **g})
+        except Exception as e:  # noqa: BLE001 — sin equity no se vigila la perdida diaria
+            log({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                 "action": "daily_guard_error", "error": f"{type(e).__name__}: {e}"})
+
     rows = []
     rc = 0
     for sym, cand in sorted(cands.items()):
@@ -147,10 +163,6 @@ def run_cycle(execute: bool, max_lag: int, leverage: int,
         pos_amt = positions.get(sym, 0.0)
         d = decision(sig=sig, pos_amt=pos_amt, max_lag=max_lag)
         risk, why_risk = risk_for(cand)
-        mark = c.mark_price(sym) if d["action"] in ("open", "reverse") else None
-        if mark:
-            marks[sym] = mark
-
         row = {"symbol": sym, "strategy": cand["id"], "pf": cand["pf"],
                "run_id": cand["run_id"], "conc_passes": cand.get("conc_passes"),
                "risk_pct": risk, **d, "last_close": sig.get("last_close"),
@@ -181,6 +193,30 @@ def run_cycle(execute: bool, max_lag: int, leverage: int,
                 continue
 
         # open (o la pata nueva de un reverse)
+        # audit 2.3: en un reverse el mark se lee DESPUES de aplanar: el precio
+        # leido antes del cierre puede estar obsoleto y se dimensionaria el
+        # nuevo tramo contra un precio que ya no existe.
+        try:
+            risk_guard.require_can_open()
+            exp = risk_guard.exposure_check(c)
+            if not exp["ok"]:
+                raise risk_guard.RiskBlocked(exp["why"])
+        except risk_guard.RiskBlocked as e:
+            row["action"] = "skip"
+            row["why"] = f"guardia de riesgo: {e}"
+            print(f"{sym}: NO ABRO: {e}")
+            continue
+        except Exception as e:  # noqa: BLE001
+            # Sin lectura de cuenta no se pueden verificar los topes: en execute
+            # se bloquea (fail-closed); en dry-run el plan sigue, no se envia nada.
+            if execute:
+                row["action"] = "skip"
+                row["why"] = f"guardia de riesgo no verificable: {type(e).__name__}: {e}"
+                print(f"{sym}: NO ABRO: {row['why']}")
+                continue
+        mark = c.mark_price(sym)
+        if mark:
+            marks[sym] = mark
         if mark is None:
             continue
         stop, why_stop = entry_stop(sig, mark, d["action"])
@@ -214,9 +250,15 @@ def run_cycle(execute: bool, max_lag: int, leverage: int,
             rc = max(rc, 1)
             log(row)
             continue
-        state_store.patch(sym, strategy=cand["id"], candidate_id=cand["id"],
-                          run_id=cand["run_id"], conc_passes=cand.get("conc_passes"),
-                          auto=True)
+        try:
+            state_store.patch(sym, strategy=cand["id"], candidate_id=cand["id"],
+                              run_id=cand["run_id"], conc_passes=cand.get("conc_passes"),
+                              auto=True)
+        except state_store.StateCorrupt as e:
+            # audit 2.7: estado corrupto no se pisa con uno vacio; se para y se avisa.
+            risk_guard.trip(f"estado corrupto: {e}")
+            print(f"CRITICO: estado corrupto ({e}); KILL_SWITCH activado.")
+            rc = max(rc, 1)
 
     for row in rows:
         log(row)

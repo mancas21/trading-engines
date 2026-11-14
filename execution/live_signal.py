@@ -25,16 +25,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ENGINE_DIR = Path(r"C:\Users\Lenovo\Documents\backtest-system\code")
+# audit 1.4: la ruta era un literal de maquina; ahora se puede sobreescribir
+# con la variable de entorno ENGINE_DIR sin tocar el codigo.
+ENGINE_DIR = Path(os.environ.get(
+    "ENGINE_DIR", r"C:\Users\Lenovo\Documents\backtest-system\code"))
 BASE = "https://fapi.binance.com"
 WARMUP_BARS = 300          # S10 necesita 168+96; S02 148. 300 deja margen.
 MAX_BARS = 3000            # ~125 dias de 1h
+
+if not (ENGINE_DIR / "cbpack_funding_engine.py").is_file():
+    raise ImportError(
+        f"cbpack_funding_engine no esta en {ENGINE_DIR} — apunta ENGINE_DIR al "
+        "directorio de codigo del backtest-system (audit 2.5: engine externo "
+        "no auditable desde este repo)")
 
 if str(ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(ENGINE_DIR))

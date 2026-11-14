@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -232,10 +232,21 @@ class TestnetClient:
         q = (Decimal(str(qty)) / step).to_integral_value(rounding=ROUND_DOWN) * step
         return float(q)
 
-    def round_price(self, symbol: str, price: float) -> float:
+    def round_price(self, symbol: str, price: float,
+                    direction: str = "down") -> float:
+        """Redondeo al tick.
+
+        audit 2.4: el ROUND_DOWN incondicional movia el stop de un corto HACIA
+        el mercado (disparo inmediato posible) y el de un largo alejandolo.
+        `direction` permite redondear "up"/"down"/"nearest"; los stops
+        protectores se redondean ALEJANDOLOS del mercado (risk distance >= la
+        pretendida y sin cruce instantaneo del mark).
+        """
         r = self.rules(symbol)
         tick = Decimal(str(r["tick"]))
-        p = (Decimal(str(price)) / tick).to_integral_value(rounding=ROUND_DOWN) * tick
+        rounding = {"down": ROUND_DOWN, "up": ROUND_UP,
+                    "nearest": ROUND_HALF_EVEN}[direction]
+        p = (Decimal(str(price)) / tick).to_integral_value(rounding=rounding) * tick
         return float(p)
 
     def check_order(self, symbol: str, side: str, qty: float,

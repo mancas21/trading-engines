@@ -44,6 +44,7 @@ sys.path.insert(0, str(HERE))
 
 from binance_testnet import BinanceError, SafetyError, TestnetClient
 import proclock
+import risk_guard
 
 LOG = HERE / "logs" / "neutral_bot.jsonl"
 STATE = HERE / "state" / "grid_state.json"
@@ -62,6 +63,10 @@ GRID_SPACING_PCT = 0.005    # 0.5% entre niveles
 NOTIONAL_PER_SIDE_USDT = 100  # USDT por nivel y por lado
 MAX_ORDER_NOTIONAL_USD = 650
 POLL_SECONDS = 20           # cada cuanto se revisa si se llenaron niveles
+# audit 2.8: sin tope de inventario, una tendencia acumula exposicion de un
+# lado sin limite. El net_exposure era display-only; ahora corta la compra.
+MAX_INVENTORY_USD_PER_SYMBOL = 400
+MAX_INVENTORY_USD_TOTAL = 1500
 
 # ---------------------------------------------------------------------------
 # Utilidades
@@ -140,42 +145,72 @@ class NeutralGridBot:
     def levels_for(self, symbol: str) -> dict:
         return self.state.setdefault(symbol, {})
 
+    def _executed_qty(self, symbol: str, order_id: int) -> float:
+        """Qty realmente llenada de una orden (para no perder llenos parciales)."""
+        try:
+            return float(self.client.query_order(symbol, order_id=order_id)
+                         .get("executedQty", 0) or 0)
+        except (BinanceError, SafetyError):
+            return 0.0
+
+    def _place_tp(self, symbol: str, key: str, rec: dict, lv: dict) -> None:
+        """Coloca el take-profit del nivel llenado. Si falla, el inventario
+        queda marcado needs_tp y se reintenta el proximo ciclo — audit 2.8:
+        antes el nivel se perdia y la posicion quedaba huerfana."""
+        side = rec["side"]
+        price = float(rec["price"])
+        qty = float(rec["qty"])
+        level = int(rec.get("level", 0))
+        tp_price = self.client.round_price(
+            symbol, price * (1 + self.grid_spacing) if side == "BUY"
+            else price * (1 - self.grid_spacing))
+        tp_side = "SELL" if side == "BUY" else "BUY"
+        log({"symbol": symbol, "action": "fill", "level": level, "filled_side": side,
+             "fill_price": price, "qty": qty, "tp_side": tp_side, "tp_price": tp_price})
+        r = self.place_limit(symbol, tp_side, tp_price, qty)
+        if r is not None and r.get("orderId"):
+            lv[key] = {"level": level, "side": tp_side, "order_id": r.get("orderId"),
+                       "price": tp_price, "qty": qty}
+        else:
+            rec["needs_tp"] = True
+            rec["qty"] = qty
+            log({"symbol": symbol, "action": "tp_failed_retry_later",
+                 "level": key, "qty_open": qty})
+
     def check_fills(self, symbol: str) -> None:
-        """Revisa si algun nivel pendiente se llenoio; si si, coloca la orden
+        """Revisa si algun nivel pendiente se lleno; si si, coloca la orden
         contraria (take-profit) y libera el nivel."""
         lv = self.levels_for(symbol)
         for key in list(lv.keys()):
             rec = lv[key]
+            if rec.get("needs_tp"):
+                # inventario abierto de un TP que fallo: reintentar, no perderlo
+                self._place_tp(symbol, key, rec, lv)
+                continue
             if not rec.get("order_id"):
+                lv.pop(key, None)
                 continue
             status = self.order_status(symbol, rec["order_id"])
             if status not in ("FILLED",):
                 if status in ("CANCELED", "REJECTED", "EXPIRED"):
-                    log({"symbol": symbol, "action": "level_lost",
-                         "level": key, "status": status})
-                    lv.pop(key, None)
+                    # audit 2.8: CANCELED tras un lleno parcial deja qty viva;
+                    # se reconcilia en vez de tirar el registro.
+                    executed = self._executed_qty(symbol, rec["order_id"])
+                    if executed > 0:
+                        log({"symbol": symbol, "action": "level_lost_partial",
+                             "level": key, "status": status, "executed_qty": executed})
+                        rec["qty"] = executed
+                        self._place_tp(symbol, key, rec, lv)
+                    else:
+                        log({"symbol": symbol, "action": "level_lost",
+                             "level": key, "status": status})
+                        lv.pop(key, None)
                 continue
-
-            # Llenado: colocar la orden contraria un nivel mas lejos del mark
-            side = rec["side"]
-            price = float(rec["price"])
-            qty = float(rec["qty"])
-            level = int(rec["level"])
-            tp_price = self.client.round_price(
-                symbol, price * (1 + self.grid_spacing) if side == "BUY"
-                else price * (1 - self.grid_spacing))
-            tp_side = "SELL" if side == "BUY" else "BUY"
-            log({"symbol": symbol, "action": "fill", "level": level, "filled_side": side,
-                 "fill_price": price, "qty": qty, "tp_side": tp_side, "tp_price": tp_price})
-            r = self.place_limit(symbol, tp_side, tp_price, qty)
-            if r is not None:
-                lv[key] = {"level": level, "side": tp_side, "order_id": r.get("orderId"),
-                           "price": tp_price, "qty": qty}
-            else:
-                lv.pop(key, None)
+            self._place_tp(symbol, key, rec, lv)
         save_state(self.state)
 
-    def ensure_grid(self, symbol: str) -> None:
+    def ensure_grid(self, symbol: str, pos_amt: float = 0.0,
+                    total_inventory_usd: float = 0.0) -> None:
         """Coloca los niveles que falten alrededor del mark actual."""
         try:
             mark = float(self.client.mark_price(symbol))
@@ -191,12 +226,24 @@ class NeutralGridBot:
                  "why": f"qty {qty} no cumple min_notional {rules.get('min_notional')}"})
             return
 
+        # audit 2.8: topes de inventario. Comprar con el inventario lleno
+        # amplia la exposicion de un lado; vender la reduce y se permite.
+        inv_sym = abs(pos_amt) * mark
+        buy_blocked = (inv_sym >= MAX_INVENTORY_USD_PER_SYMBOL
+                       or total_inventory_usd >= MAX_INVENTORY_USD_TOTAL)
+        if buy_blocked and (pos_amt != 0 or total_inventory_usd > 0):
+            log({"symbol": symbol, "action": "inventory_cap",
+                 "inventory_sym_usd": round(inv_sym, 2),
+                 "inventory_total_usd": round(total_inventory_usd, 2)})
+
         placed = 0
         for i in range(1, self.grid_levels + 1):
             for side, sign in (("BUY", -1), ("SELL", +1)):
                 key = f"{side}{i}"
                 if key in lv:
-                    continue  # ya hay una orden viva en este nivel
+                    continue  # ya hay una orden viva (o inventario pendiente) en este nivel
+                if side == "BUY" and buy_blocked:
+                    continue
                 px = self.client.round_price(symbol, mark * (1 + sign * self.grid_spacing * i))
                 r = self.place_limit(symbol, side, px, qty)
                 if r is not None:
@@ -212,12 +259,31 @@ class NeutralGridBot:
 
     # ---- ciclo ------------------------------------------------------------
     def run_cycle(self) -> None:
+        positions = {}
+        try:
+            positions = {p["symbol"]: float(p.get("positionAmt", 0))
+                         for p in self.client.positions()
+                         if float(p.get("positionAmt", 0)) != 0}
+        except (BinanceError, SafetyError):
+            pass
+        marks = {}
+        for sym in positions:
+            try:
+                marks[sym] = self.client.mark_price(sym)
+            except (BinanceError, SafetyError):
+                marks[sym] = 0.0
+        total_inventory = sum(abs(a) * marks.get(s, 0.0)
+                              for s, a in positions.items())
         for symbol in self.symbols:
             if symbol not in self.allow_symbols:
                 log({"symbol": symbol, "action": "skip", "why": "fuera de ALLOW_SYMBOLS"})
                 continue
             self.check_fills(symbol)
-            self.ensure_grid(symbol)
+            if risk_guard.kill_active():
+                # kill switch: no hay riesgo nuevo; los TP existentes se siguen gestionando
+                log({"symbol": symbol, "action": "skip", "why": "KILL_SWITCH activo"})
+                continue
+            self.ensure_grid(symbol, positions.get(symbol, 0.0), total_inventory)
 
     def net_exposure(self) -> dict:
         """Exposicion neta por simbolo (debe tender a 0 = neutral)."""

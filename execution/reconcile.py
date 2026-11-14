@@ -266,7 +266,14 @@ def process(c: TestnetClient, sym: str, rec: dict, execute: bool) -> int:
 
 
 def run_cycle(execute: bool, close_orphans: bool, only: str | None) -> int:
-    state = state_store.load()
+    try:
+        state = state_store.load()
+    except state_store.StateCorrupt as e:
+        # audit 2.7: sin estado fiable NO se reconcilia nada — reconciliar contra
+        # un estado vacio trataria posiciones vivas como huerfanas.
+        print(f"CRITICO: estado corrupto, reconciliacion abortada: {e}")
+        print("Inspecciona execution/state/positions.json a mano antes de seguir.")
+        return 6
     c = TestnetClient(dry_run=not execute)
     c.sync_time()
     rc = 0

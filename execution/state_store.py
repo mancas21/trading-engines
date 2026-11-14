@@ -11,6 +11,11 @@ actuar.
                    "tp_algo_id": 456, "candidate_id": "S10",
                    "run_id": "...", "strategy": "S10", "opened_utc": "...",
                    "risk_usdt": 1.84, "status": "open" } }
+
+audit 2.7: un estado corrupto NO se lee como "sin posiciones". JSONDecodeError
+levanta StateCorrupt — el llamador debe parar y avisar, no seguir como si el
+estado estuviera vacio. save() hace fsync del fichero antes del rename para que
+un corte de luz no deje un fichero truncado que dispare exactamente eso.
 """
 from __future__ import annotations
 
@@ -24,17 +29,33 @@ STATE_DIR = HERE / "state"
 STATE_FILE = STATE_DIR / "positions.json"
 
 
+class StateCorrupt(RuntimeError):
+    """positions.json existe pero no se puede parsear."""
+
+
 def load() -> dict:
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        raw = STATE_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return {}
+    except OSError as e:
+        raise StateCorrupt(f"no se pudo leer {STATE_FILE}: {e}") from None
+    try:
+        d = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise StateCorrupt(f"{STATE_FILE}: {e}") from None
+    if not isinstance(d, dict):
+        raise StateCorrupt(f"{STATE_FILE}: el contenido no es un objeto JSON")
+    return d
 
 
 def save(data: dict) -> None:
     STATE_DIR.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=2, ensure_ascii=False))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, STATE_FILE)
 
 
