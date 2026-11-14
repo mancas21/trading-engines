@@ -123,7 +123,7 @@
   },
   "telegram": {
     "enabled": true,
-    "token": "8844332826:AAHdZrs4RhOCFLGjDOD3QI53kVbtA6KMz4A",
+    "token": "REDACTED-audit-1.1-revoke-and-rotate",
     "chat_id": "6369690844",
     "filter_symbol": null,
     "filter_timeframe": null
