@@ -400,8 +400,12 @@ def read_live():
         # veredicto, son las ENTRADAS — para poder evaluar cualquier rediseno
         # offline sobre el historico real en vez de volver a muestrear a mano.
         # Ver el bloque de dom_vac_eval en verdict.py.
-        "dom_vac_raw": json.dumps({k: _gate.get(k) for k in
-                                   ("raw", "counts", "venues", "buy", "sell")}),
+        # ee2cd17 dejo aqui una referencia a `_gate` (eliminado con las reglas
+        # 6/7) y el recorder reventaba en NameError en CADA ciclo — crash-loop
+        # 22 fallos hasta el abandono. El gate está RETIRADO: se registra el
+        # marcador, veraz como el resto de columnas RETIRED.
+        "dom_vac_raw": json.dumps(
+            {"state": "RETIRED", "reason": "reglas 6/7 eliminadas (ee2cd17)"}),
         "fill_price": None,
         "forward_return": None,
         "resolved": 0,
