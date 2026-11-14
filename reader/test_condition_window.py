@@ -99,15 +99,31 @@ def test_only_the_observer_writes_state():
 
 
 def test_the_window_value_lives_in_rules_json_and_the_code_reads_it():
-    """Contrato JSON <-> codigo, como el resto de umbrales del sistema."""
+    """Contrato JSON <-> codigo, como el resto de umbrales del sistema.
+
+    2026-11-14 (audit 6.3): las reglas 6 y 7 fueron ELIMINADAS (ee2cd17).
+    El contrato anterior exigia que 6/7 declararan condition_window_s y
+    reventaba con StopIteration. Ahora pincha su AUSENCIA para que nadie las
+    reanime sin pasar por aqui, y verifica el valor de ventana contra las
+    reglas que SI la declaran."""
     raw = json.loads((ROOT / "atas-bridge" / "rules.json").read_text(encoding="utf-8"))
-    for rid in (6, 7):
-        spec = next(r for r in raw["rules"] if r["id"] == rid)
-        assert "condition_window_s" in spec["conditions"], (
-            f"la regla {rid} no declara condition_window_s")
-    assert V.COND_WINDOW_S == 60.0, (
-        f"el codigo lee {V.COND_WINDOW_S} y rules.json declara 60: el contrato "
-        f"divergio en silencio")
+    ids = {r.get("id") for r in raw["rules"]}
+    assert 6 not in ids and 7 not in ids, (
+        "las reglas 6/7 fueron eliminadas (ee2cd17): no se reaniman sin un "
+        "protocolo nuevo pre-registrado")
+    for r in raw["rules"]:
+        cw = (r.get("conditions") or {}).get("condition_window_s")
+        if cw is not None:
+            assert float(cw) == V.COND_WINDOW_S, (
+                f"la regla {r.get('id')} declara condition_window_s={cw} y el "
+                f"codigo lee {V.COND_WINDOW_S}: el contrato divergio en silencio")
+    # Con 6/7 fuera, NINGUNA regla declara ventana: el codigo debe caer a 0.0
+    # (conjuncion estricta en el mismo tick, el comportamiento historico).
+    assert not any((r.get("conditions") or {}).get("condition_window_s")
+                   for r in raw["rules"]), (
+        "hay reglas con condition_window_s: actualiza este contrato")
+    assert V.COND_WINDOW_S == 0.0, (
+        f"el codigo lee {V.COND_WINDOW_S}; sin reglas con ventana debe ser 0.0")
 
 
 def test_the_window_cannot_pull_a_met_from_outside_the_plazo():

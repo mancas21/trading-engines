@@ -76,25 +76,32 @@ def _fake_runner(monkeypatch, recorder_rc, recorder_out, resolve_rc=0,
                  notify_rc=0):
     """Sustituye subprocess: devuelve los rc programados y registra llamadas."""
     calls = []
+    scripts = []
 
-    # El notificador se llama con --once Y --digest (c139605): --once conserva el
-    # aviso inmediato por cambio de sesgo, --digest anade el resumen ejecutivo de
-    # 15 min aunque el sesgo no cambie. El stub exige LAS DOS, para que quitar
-    # --digest (o volver a no enviar nada) ponga esto rojo otra vez.
-    NOTIFY_ARGS = (["--once", "--digest"], ["--once", "--digest", "--dry-run"])
+    # 2026-11-14 (audit 6.3): contrato VIGENTE del ciclo (b883ab9 retiro el
+    # --digest de 15 min por decision del usuario y anadio phase_brief y
+    # watch_early):
+    #   * verdict_notify.py  -> --once [--dry-run]  (aviso por CAMBIO DE SESGO)
+    #   * phase_brief.py     -> --once [--dry-run]  (brief de fases cada ciclo;
+    #     el propio script se auto-limita con el marcador phase_state.json)
+    #   * watch_early.py     -> --once [--dry-run]  (stub: capa RETIRADA 2026-11-13)
+    # Si el supervisor vuelve a llamar --digest, esto se pone rojo: esa
+    # retirada fue una decision, no un accidente.
+    ONCE_OK = {"--once", "--dry-run"}
 
     def run(script, args, timeout):
         calls.append(list(args))
+        scripts.append(pathlib.Path(script).name)
         if args == ["record"]:
             return recorder_rc, recorder_out
         if args == ["resolve"]:
             return resolve_rc, "  resolved 3/4"
-        if args in NOTIFY_ARGS:
+        if set(args) <= ONCE_OK and args and args[0] == "--once":
             return notify_rc, "  notified"
-        raise AssertionError(f"llamada inesperada: {args}")
+        raise AssertionError(f"llamada inesperada: {args} ({script})")
 
     monkeypatch.setattr(RS, "run_child", run)
-    return calls
+    return calls, scripts
 
 
 SKIP_OUT = "  SKIP: ATAS no disponible: RemoteDisconnected"
@@ -103,7 +110,7 @@ REC_OUT = "  recorded JUPUSDT bar#1021 bias=NEUTRAL r6=False r7=False"
 
 def test_skip_is_not_a_crash_but_resolve_still_runs(monkeypatch):
     """Un ciclo con ATAS caido tiene que ser sano Y seguir resolviendo."""
-    calls = _fake_runner(monkeypatch, RS.RECORDER_SKIP, SKIP_OUT)
+    calls, scripts = _fake_runner(monkeypatch, RS.RECORDER_SKIP, SKIP_OUT)
     ok, tail = RS.cycle()
 
     assert ok is True, "un SKIP esta haciendo parecer que el proceso fallo"
@@ -112,8 +119,10 @@ def test_skip_is_not_a_crash_but_resolve_still_runs(monkeypatch):
     assert ["resolve"] in calls, (
         "resolve quedo gateado tras el SKIP: las filas pendientes de antes "
         "dejan de resolverse durante toda la caida")
-    # ... pero notify no, porque no hay veredicto nuevo
-    assert not any(a and a[0] == "--once" for a in calls), (
+    # ... pero notify no, porque no hay veredicto nuevo (phase_brief y el stub
+    # watch_early SI corren cada ciclo, fuera de la puerta `recorded`)
+    assert not any(s == "verdict_notify.py" and a and a[0] == "--once"
+                   for s, a in zip(scripts, calls)), (
         "notify corrio sin fila nueva: re-notificaria el mismo veredicto")
 
     st = json.loads(RS.STATUS.read_text(encoding="utf-8"))
@@ -145,13 +154,19 @@ def test_a_run_of_skips_becomes_visible_without_killing_the_service(monkeypatch)
 
 
 def test_recorded_cycle_runs_notify(monkeypatch):
-    calls = _fake_runner(monkeypatch, RS.RECORDER_RECORDED, REC_OUT)
+    calls, scripts = _fake_runner(monkeypatch, RS.RECORDER_RECORDED, REC_OUT)
     ok, _ = RS.cycle()
     assert ok is True
     assert ["resolve"] in calls
-    assert ["--once", "--digest"] in calls, (
-        "el notificador perdio --digest: el resumen ejecutivo de 15 min dejaria "
-        "de enviarse y nada lo avisaria (es justo el defecto que arreglo c139605)")
+    # b883ab9: el digest de 15 min se RETIRA (decision del usuario) y el
+    # notificador vuelve a --once puro (aviso por cambio de sesgo); el resumen
+    # lo da phase_brief.py. Si --digest reaparece aqui, esa decision se revercio
+    # sin registro: rediscutirla, no reactivarla calladamente.
+    assert not any("--digest" in a for a in calls), (
+        "el supervisor vuelve a llamar --digest: fue RETIRADO en b883ab9 "
+        "sustituido por phase_brief.py")
+    assert "verdict_notify.py" in scripts and "phase_brief.py" in scripts, (
+        "falta el notificador de sesgo o el brief de fases en el ciclo")
 
 
 def test_recorder_crash_is_a_crash(monkeypatch):

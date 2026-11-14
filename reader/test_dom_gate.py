@@ -61,34 +61,20 @@ def spec6_of(raw):
 
 
 def test_contract_json_matches_code():
+    """Contrato tras el RETIRO (2026-11-13): las reglas 6/7 NO existen en
+    rules.json y el gate está retirado en el código — bias nunca direccional
+    por construcción. Si alguien reintroduce las reglas 6/7 en el JSON sin el
+    protocolo de medición pre-registrado superado, este test lo detiene."""
     raw = json.loads((ROOT / "atas-bridge" / "rules.json").read_text(encoding="utf-8"))
     assert raw.get("namespace") == "atas"
-    for rid in (6, 7):
-        spec = next(r for r in raw["rules"] if r["id"] == rid)
-        assert spec["conditions"]["dom_source"] == V.DOM_SOURCE, (
-            "rules.json declara una fuente y el codigo implementa otra — "
-            "exactamente el fallo de contrato que este test existe para detener")
-        # Cada regla con LOS SUYOS: el motor ahora lee R6 para el lado sell y
-        # R7 para el lado buy, asi que ambos juegos tienen que seguir iguales
-        # a lo que declara CADA regla (no a lo que declara la otra).
-        assert spec["conditions"]["dom_vac_thr"] == V.RULE6["vac_thr"]
-        assert spec["conditions"]["dom_vac_venues_min"] == V.RULE6["vac_venues"]
-        assert spec["conditions"]["dom_vac_polls_min"] == V.RULE6["vac_polls"]
-    spec7 = next(r for r in raw["rules"] if r["id"] == 7)
-    assert spec7["conditions"]["dom_vac_thr"] == V.RULE7["vac_thr"]
-    assert spec7["conditions"]["dom_vac_venues_min"] == V.RULE7["vac_venues"]
-    assert spec7["conditions"]["dom_vac_polls_min"] == V.RULE7["vac_polls"]
-
-    # 2026-10-15 — el umbral z declarado debe ser el que el codigo usa. Sin esta
-    # linea, bastaria con que rules.json dijera z=1.0 y el codigo comparara otro
-    # numero para que el contrato se romiera en silencio, que es el fallo que este
-    # test entero existe para impedir.
-    for spec, R in ((spec6_of(raw), V.RULE6), (spec7, V.RULE7)):
-        assert spec["conditions"]["dom_vac_z_min"] == R["vac_z"], (
-            "rules.json declara dom_vac_z_min=%r y el codigo usa %r"
-            % (spec["conditions"].get("dom_vac_z_min"), R["vac_z"]))
-
-
+    ids = {r["id"] for r in raw["rules"]}
+    assert 6 not in ids and 7 not in ids, (
+        "las reglas 6/7 fueron ELIMINADAS el 2026-11-13 (PLAN §11); si "
+        "reaparecen en el JSON sin el protocolo §5 superado, este contrato "
+        "se rompe")
+    # el bias de la puerta retirada no puede ser direccional jamás
+    assert V.RULE7.get("enforcement") in ("unavailable", "retired", None)
+    assert V.RULE6.get("enforcement") in ("unavailable", "retired", None)
 def test_the_suite_never_writes_the_live_gate_state():
     """Ninguna ruta de test puede coincidir con el gate del reader vivo."""
     assert pathlib.Path(V._DOM_GATE_STATE) != _PRODUCTION_STATE, (

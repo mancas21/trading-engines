@@ -58,10 +58,12 @@ def test_cada_regla_de_rules_json_aparece_una_vez():
 
 def test_las_anclas_vivas_siguen_declaradas():
     cov = _cov()
+    # 2026-11-14 (audit 6.3): 6 y 7 fueron ELIMINADAS (ee2cd17). El antiguo
+    # contrato exigia que siguieran declaradas — eso era verdad antes de la
+    # retirada y provoca KeyError. Ahora se pincha que ya NO estan.
     for rid in (6, 7):
-        assert cov[rid]["implemented"] is True, f"la regla {rid} dejo de declararse"
-        assert "rules.json" in cov[rid]["how"], (
-            f"la regla {rid} ya no cita de donde salen sus umbrales")
+        assert rid not in cov, (
+            f"la regla {rid} vuelve a declararse tras su eliminacion (ee2cd17)")
     assert cov[8]["implemented"] is True
     assert "_audit_record_loss" in cov[8]["how"]
 
