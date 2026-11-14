@@ -162,6 +162,27 @@ def compose(rows: list[dict]) -> str:
     elif live:
         con_lado = [f"{r['name']} {r['dir']}/{r['score']}" for r in live if r["dir"] != "neutral"]
         L.append("Scanner con lado: " + (", ".join(con_lado) if con_lado else "ninguno"))
+    # Estadística de episodio (2026-11-14): los pares débiles con caída fuerte
+    # llevan una línea de piso estadístico — distribución condicional de su
+    # propio histórico (scripts/episode_stats.py), NO predicción.
+    try:
+        if str(HERE.parent / "scripts") not in __import__("sys").path:
+            __import__("sys").path.insert(0, str(HERE.parent / "scripts"))
+        import episode_stats as _es
+        debiles = sorted([r for r in rows if r["chg"] <= -6.0],
+                         key=lambda r: r["chg"])[:2]
+        for r in debiles:
+            sym = PAIRS.get(r["name"])
+            if not sym:
+                continue
+            fx = _es.episode_floor_stats(sym)
+            if fx and fx.get("n"):
+                L.append(f"EPISODIO {r['name']}: dd-7d {fx['dd_now']:.0f}% "
+                         f"(n={fx['n']}) → piso 10d mediano {fx['extra_med']:+.0f}% "
+                         f"→ {fx['lvl_med']:g} | p25 {fx['lvl_p25']:g} | "
+                         f"recup. 30d {fx['recov_pct']:.0%}")
+    except Exception:
+        pass
     # Banderas de vigilancia temprana activas (<24h) — una línea, si hay.
     try:
         wst = json.loads((HERE / "watch_state.json").read_text(encoding="utf-8"))
