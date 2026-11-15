@@ -228,6 +228,7 @@ class Output:
                     row["due"][h] = True
                     self._write({"kind": "fwd", "row": row["kind"], "key": row["key"],
                                  "regime": row.get("regime", "n/a"),
+                                 "ts": now,
                                  "symbol": symbol, "horizon_s": h,
                                  "ret_bps": D._bps(price, row["p0"]) *
                                             (1 if row["side"] == "long" else -1)})
