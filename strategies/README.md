@@ -32,6 +32,33 @@ Registradas en `vrun.py` como `--strategy capfloor` y `--strategy smcrot`
 capfloor invertida, variaciones de decay del smcrot) es una hipótesis NUEVA
 que pasa de nuevo por este loop: pre-registrar → run → verify → gates.
 
+## ewexh — la tercera (EW 15m/1D mecanizada) — 2026-11-15 — ARCHIVADA
+
+`ew_exhaustion_rotation_v1.py` (`96aed6736762e30d`): impulso de 5 ondas
+completado con las reglas duras de Elliott (W4 no solapa W1, W3 no el más
+corto, longitudes en rango) → reversión por agotamiento cross-sectional con
+invalidación estructural por pierna.
+
+| Ventana | Retorno | PF | Sharpe | DD |
+|---|---|---|---|---|
+| FULL | +76.2% | 1.02 | +0.68 | −70.4% |
+| IS | +259.4% | 1.04 | +1.06 | −55.3% |
+| **OOS** | **−44.5%** | **0.96** | **−1.07** | −53.0% |
+
+Mismo patrón que smcrot: IS positivo → OOS negativo. La estructura de 5 ondas
+mejoró el comportamiento vs el factor crudo (capfloor), pero **no convirtió la
+reversión en edge out-of-sample**. Coherente con el historial del repo:
+mean-reversion 0/N — ahora 3 confirmaciones más.
+
+## Conclusión de familia (2026-11-15)
+
+Las tres lógicas de la sesión (funding-extremo, estructura SMC, agotamiento
+EW) **fallan out-of-sample** como factores cross-sectionales mecánicos con
+11 bps. Lo que queda vivo de la sesión: las herramientas descriptivas
+(episodios, SMC como contexto/alertador de hechos, gauge de capitulación) —
+con la etiqueta de confianza reducida. La siguiente hipótesis de esta familia
+solo entra con un mecanismo NUEVO pre-registrado, no con re-parametrización.
+
 ## Hipótesis
 
 - **capfloor**: posicionamiento extremo revierte relativo — long shorts
