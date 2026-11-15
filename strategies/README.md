@@ -20,6 +20,18 @@ G1-G11, IS/OOS 70/30 y block bootstrap se aplican en tu lado.
 que las estrategias nunca debieron ver para tuneo. El veredicto lo da tu
 harness con IS/OOS — si OOS no sostiene, se archiva.
 
+## VEREDICTO FORMAL DEL HARNESS (2026-11-15, run_id verificados bit-for-bit)
+
+| Estrategia | run_id | FULL | IS | OOS | Veredicto |
+|---|---|---|---|---|---|
+| capfloor | `9f9082d68b284a2f` | −95.1% / PF 0.85 | −88.3% (PF 0.87) | −52.9% (PF 1.15, Sharpe −2.24) | **ARCHIVADA** — muerta en ambas ventanas; confirma §5.7 en datos formales |
+| smcrot | `21804cd69bf72555` | +2889% / PF 1.00 | **+12,054%** (Sharpe 1.42) | **−78.7%** (Sharpe −0.82) | **ARCHIVADA** — la firma clásica de overfit: IS explota, OOS colapsa, PF full = 1.00 (sin edge), DD −87.6% |
+
+Registradas en `vrun.py` como `--strategy capfloor` y `--strategy smcrot`
+(adaptador `code/strat151_ports.py`). Cualquier iteración futura (v2 de
+capfloor invertida, variaciones de decay del smcrot) es una hipótesis NUEVA
+que pasa de nuevo por este loop: pre-registrar → run → verify → gates.
+
 ## Hipótesis
 
 - **capfloor**: posicionamiento extremo revierte relativo — long shorts
