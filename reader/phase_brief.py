@@ -57,6 +57,11 @@ PAIRS = {
     "XAU": "XAUUSDT", "XRP": "XRPUSDT", "JUP": "JUPUSDT", "NVDA": "NVDAUSDT",
     "SPCX": "SPCXUSDT", "SUI": "SUIUSDT", "ARB": "ARBUSDT",
 }
+# 2026-11-15 (bug reportado por el usuario): PEPE nunca salia en el brief —
+# el scanner añadio 1000PEPE el 2026-11-12 y esta lista hardcoded no se
+# enteró. Fix de raiz: sweep() deriva los pares del PROPIO /rank del scanner
+# (PAIRS queda solo como fallback si el rank no responde); añadir un par al
+# scanner basta, el brief lo sigue sin tocar codigo.
 
 
 def _get(url: str, timeout: float = 8.0, retries: int = 1):
@@ -85,13 +90,18 @@ def save_state(st: dict) -> None:
 
 
 def sweep() -> list[dict]:
-    """Una fila por par: metricas de estructura 24h + veredicto scanner."""
+    """Una fila por par: metricas de estructura 24h + veredicto scanner.
+
+    Los pares salen del PROPIO /rank del scanner (fuente de verdad del
+    registro) — añadir un par al scanner basta para que aparezca aqui.
+    PAIRS (hardcoded) es solo el fallback si el rank no responde."""
     rank = {}
     r = _get(f"{SCANNER}/rank")
     for row in (r or {}).get("rank", []):
         rank[row["pair"].split("/")[0]] = row
+    pairs = {name: name + "USDT" for name in rank} or PAIRS
     rows = []
-    for name, sym in PAIRS.items():
+    for name, sym in pairs.items():
         t = _get(f"{FAPI}/fapi/v1/ticker/24hr?symbol={sym}", retries=2)
         time.sleep(0.4)
         k = _get(f"{FAPI}/fapi/v1/klines?symbol={sym}&interval=1h&limit=24", retries=2)
@@ -172,7 +182,7 @@ def compose(rows: list[dict]) -> str:
         debiles = sorted([r for r in rows if r["chg"] <= -6.0],
                          key=lambda r: r["chg"])[:2]
         for r in debiles:
-            sym = PAIRS.get(r["name"])
+            sym = r.get("sym")
             if not sym:
                 continue
             fx = _es.episode_floor_stats(sym)
@@ -183,17 +193,8 @@ def compose(rows: list[dict]) -> str:
                          f"recup. 30d {fx['recov_pct']:.0%}")
     except Exception:
         pass
-    # Banderas de vigilancia temprana activas (<24h) — una línea, si hay.
-    try:
-        wst = json.loads((HERE / "watch_state.json").read_text(encoding="utf-8"))
-        act = wst.get("active", [])
-        if act:
-            items = "; ".join(f"{a['side']} {a['pair']} @ {a['price']:g} "
-                              f"(funding {a['funding']*100:.3f}%)"
-                              for a in act[-3:])
-            L.append("Vigilancia temprana: " + items)
-    except Exception:
-        pass
+    # (2026-11-15) La "vigilancia temprana" se RETIRO (9670195): su bloque y
+    # sus banderas viejas no deben aparecer en el brief.
     L.append("(estructura 24h en barras 1h; clasificacion mecanica, "
              "no sesgo de Reglas 6/7)")
     return "\n".join(L)
