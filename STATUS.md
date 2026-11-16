@@ -5,6 +5,67 @@ SQLite corpus (`quant-alert-engine/data/alerts.db`) unless stated otherwise.
 
 ---
 
+## 2026-11-16 — Auditoria del bot neutral (grid): 3 bugs reales y 1 pie de bomba
+
+El bot neutral (grid delta-neutral sobre Binance USDT-M testnet) estaba vivo
+pero descincronizado en tres frentes. La auditoria se dejo como script
+repetible, execution/audit_sync.py (solo lectura): exchange vs
+state/grid_state.json vs state/positions.json.
+
+**1. El tope de inventario bloqueaba la COBERTURA, no la Apertura.**
+El codigo hacia if side == "BUY" and blocked: continue. En una posicion en
+CORTO, comprar es tapar y vender es anadir: la condicion bloqueaba
+justamente la cobertura y dejaba libre la apertura. El grid se volvio
+direccional: 6 de los 9 simbolos en corto y un inventario bruto de 13.569
+USD con un tope total de 1.200 USD (11x). Se separa el lado que AUMENTA la
+exposicion (se bloquea y se cancelan sus slots vivos, que si no el tope
+solo impedia colocar y no absorber) del lado que la REDUCE (nunca se
+bloquea). Al reiniciar, el bot devolvio a la cobertura SUI (fill BUY1 a
+0,7207: el corto paso de 1.508,3 a 1.369,7) y coloco 4 niveles BUY de
+cobertura en BTC, ETH, HYPE, SOL, SUI y XRP. Los dos largos (PEPE, ARB)
+conservan sus SELL, que en un largo es el lado que reduce.
+
+**2. Una posicion viva sin slots y sin aviso: HYPE.** El ancla de HYPE
+(66,946) estaba 2,2% por debajo del mark (68,412): sus niveles de venta
+caian al lado equivocado del mark (se omitian por la regla de 5 bps) y los
+de compra estaban bloqueados por el bug del punto 1. Quedaba un corto de
+3.539 USD con CERO slots: no se podia ampliar, tapar ni re-anclar (el
+re-anclaje solo ocurre en plano). Solo lo frenaba el stop del −4% del
+nocional (−141 USD; estaba en −34). Ahora el bot lo registra
+explicitamente (unmanaged_position con la deriva del ancla) y, con el
+punto 1, vuelve a tener niveles.
+
+**3. El reconciliador era un pie de bomba: cierres del libro entero.**
+econcile.py es del auto_router, RETIRADO el 12-nov; su estado es
+state/positions.json y su idea de huerfana es "posicion sin estado". El
+grid no usa positions.json (usa state/grid_state.json), asi que las
+8 posiciones del grid eran huerfanas para el reconciliador: con
+--execute --close-orphans las cerraba A MERCADO. Con ALLOW_ORDERS=1 en
+el entorno, era un comando deTecera de cerrar el libro entero. Ahora
+grid_manages() deja intactos los simbolos del grid.
+
+**4. Estado muerto y codigo sin commitear.** positions.json describia un
+XRP SHORT de 248,9 @ 1,2395 abierto el 5-nov por el auto_router, con un
+stop_algo_id que ya no existia (la posicion real es un corto del grid de
+1.765,2 @ 0,966). Backup en
+state/positions.json.retirado-router-2026-11-16.bak y fichero a {}.
+Tambien se elimino state/auto_router.lock (pid 22328 muerto). Y el
+reescrito v2 de 
+eutral_bot.py (15-nov), que es el codigo que estaba
+CORRIENDO, no estaba en git: se sube con sus arreglos.
+
+**Auditoria del estado (16-nov 15:45 COT):** grid_state y el exchange
+coincidian 32/32 slots y ordenes, sin huerfanos en ninguna direccion. El
+inventario bruto es 13.454 USD sobre un tope total de 1.200 USD: con el
+arreglo el bot solo puede REDUCIR hasta bajar del tope. Subir ese tope es
+una decision de riesgo, no un bug: no se ha tocado ningun limite.
+
+Nota: el unRealizedProfit que lee el stop-loss viene de
+/fapi/v2/positionRisk (clave unRealizedProfit) y se verifica bien: el
+stop de HYPE esta en −34,40 sobre un umbral de −141,26, o sea que todavia
+no dispara.
+
+---
 ## 2026-11-12 — Altas de par en el scanner: 1000PEPE/USD y ARB/USD
 
 El registro canonico (scanner-engine/pairs.py) grew a 12 pares. Los dos

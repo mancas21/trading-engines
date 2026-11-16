@@ -85,6 +85,27 @@ def _tps(algo: list[dict]) -> list[dict]:
             if str(a.get("orderType") or a.get("type") or "").upper() == "TAKE_PROFIT_MARKET"]
 
 
+GRID_STATE = HERE / "state" / "grid_state.json"
+
+
+def grid_manages(symbol: str) -> bool:
+    """True si el neutral_bot (grid) gestiona este simbolo.
+
+    El grid tiene su propio estado (state/grid_state.json) y su propio riesgo
+    (stop por notional en el bot). Para el reconciliador del auto_router
+    esas posiciones son HUERFANAS por definicion: no estan en positions.json.
+    Sin este guardia, `reconcile.py --execute --close-orphans` las cerraba a
+    mercado. MEDIDO el 16-nov: 8 de las 9 posiciones de la cuenta las lleva
+    el grid y ninguna esta en positions.json.
+    """
+    try:
+        d = json.loads(GRID_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    syms = (d.get("symbols") or {})
+    return symbol.upper() in syms
+
+
 def classify_exit(px: float, stop: float | None, tp: float | None,
                   long_: bool) -> str:
     """Por donde salio, comparando el precio con los niveles guardados.
@@ -207,6 +228,22 @@ def process(c: TestnetClient, sym: str, rec: dict, execute: bool) -> int:
     amt = _amt(c, sym)
     algo = c.open_algo_orders(sym)
     stops, tps = _stops(algo), _tps(algo)
+
+    # 2026-11-16 — el reconciliador es del auto_router (retirado el 12-nov) y
+    # el unico bot vivo desde entonces es el NEUTRAL, que gestiona las mismas
+    # cuentas con otro modelo de estado (state/grid_state.json). Una posicion
+    # del grid no esta en positions.json: sin este guardia el reconciliador la
+    # marca HUERFANA y con --close-orphans --execute la CIERRA A MERCADO. Con
+    # 8 posiciones vivas del grid en la cuenta, un solo comando cerraba el
+    # libro entero. El grid gestiona el riesgo con su propio stop (STOP_LOSS_PCT
+    # del neutral_bot) y con su log; el reconciliador no tiene que re-crear
+    # stops de un grid que no usa stops.
+    if grid_manages(sym):
+        print(f"\n{sym}: lo gestiona el neutral_bot (grid). No lo toco: "
+              f"este reconciliador es del auto_router retirado.")
+        log({"symbol": sym, "event": "grid_managed", "amt": amt})
+        return 0
+
     pos_txt = f"{amt:g}" if amt else "plana"
     print(f"\n{sym}  estado={rec.get('status')} {rec.get('side')} qty={rec.get('qty')} "
           f"stop={rec.get('stop')}  |  cuenta={pos_txt} stops={len(stops)} tps={len(tps)}")
@@ -297,7 +334,8 @@ def run_cycle(execute: bool, close_orphans: bool, only: str | None) -> int:
     if not only:
         pos = [p for p in c.positions()
                if float(p.get("positionAmt", 0) or 0) != 0
-               and p["symbol"] in c.allow_symbols and p["symbol"] not in state]
+               and p["symbol"] in c.allow_symbols and p["symbol"] not in state
+               and not grid_manages(p["symbol"])]
         for p in pos:
             print(f"\nHUERFANA: {p['symbol']} {p['positionAmt']} @ {p['entryPrice']} "
                   f"upnl {float(p.get('unRealizedProfit', 0)):+.2f} sin estado.")
