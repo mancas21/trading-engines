@@ -15,6 +15,10 @@ import backtest_link as BTL
 def _artifact(run_id: str, symbol: str, tf: str, rows: list, *,
               fee: float = 5.0, slip: float = 0.5, rt: float = 11.0) -> dict:
     return {
+        # El puente exige esquema conocido y run_id ligado al nombre del
+        # fichero (fail-closed de identidad, 2026-11-17): el fixture tiene que
+        # parecerse al artefacto real o probaria un contrato que no existe.
+        "schema": "bt-artifact/1",
         "run_id": run_id,
         "strategy": "cbpack",
         "symbol": symbol,
@@ -36,8 +40,9 @@ def _row(id_: str, pf: float, net: float, trades: float) -> dict:
 def _write_root(tmp: str, artifacts: list) -> None:
     d = pathlib.Path(tmp) / "results" / "runs"
     d.mkdir(parents=True)
-    for i, a in enumerate(artifacts):
-        (d / f"{i:016x}.json").write_text(json.dumps(a), encoding="utf-8")
+    for a in artifacts:
+        # el nombre del fichero ES el run_id en results/runs/
+        (d / f"{a['run_id']}.json").write_text(json.dumps(a), encoding="utf-8")
 
 
 def test_missing_root_declares_absence_instead_of_raising():
@@ -224,5 +229,62 @@ def test_missing_concentration_fields_are_none_not_invented():
             c = BTL.scan()["candidates"]["SOLUSDT@1h"][0]
             assert c["conc_passes"] is None
             assert c["conc_top5_share_pct"] is None
+        finally:
+            BTL.BACKTEST_ROOT = old
+
+
+# ── identidad del artefacto (fail-closed, 2026-11-17) ──────────────────────
+def test_artifact_whose_run_id_does_not_match_its_file_is_rejected():
+    """Un artefacto tiene que venir de SU run: results/runs/<run_id>.json.
+    Si el run_id no casa con el fichero no se sabe de que run viene el
+    numero, asi que no se admite (y se cuenta, para que no parezca que
+    'nadie pasa el gate')."""
+    with tempfile.TemporaryDirectory() as tmp:
+        a = _artifact("deadbeefdeadbeef", "XRPUSDT", "1h", [_row("S10", 1.9, 40.0, 120)])
+        d = pathlib.Path(tmp) / "results" / "runs"
+        d.mkdir(parents=True)
+        (d / "0000000000000000.json").write_text(json.dumps(a), encoding="utf-8")
+        old = BTL.BACKTEST_ROOT
+        try:
+            BTL.BACKTEST_ROOT = pathlib.Path(tmp)
+            data = BTL.scan()
+            assert data["candidates"] == {}
+            assert data["unbound_artifacts"] == 1
+        finally:
+            BTL.BACKTEST_ROOT = old
+
+
+def test_artifact_with_unknown_schema_is_not_admitted():
+    """Si el backtest-system cambia de esquema, el puente no adivina campos:
+    cuenta el artefacto como desconocido y no admite nada. Fail-closed, y
+    distinguible de 'ningun candidato pasa el gate'."""
+    with tempfile.TemporaryDirectory() as tmp:
+        a = _artifact("c" * 16, "SOLUSDT", "1h", [_row("S10", 1.9, 40.0, 120)])
+        a["schema"] = "bt-artifact/2-futuro"
+        _write_root(tmp, [a])
+        old = BTL.BACKTEST_ROOT
+        try:
+            BTL.BACKTEST_ROOT = pathlib.Path(tmp)
+            data = BTL.scan()
+            assert data["candidates"] == {}
+            assert data["unknown_schema"] == 1
+        finally:
+            BTL.BACKTEST_ROOT = old
+
+
+def test_candidate_evidence_is_never_verified_by_default():
+    """`verify` NUNCA es 'OK' porque si: sin veredicto del backtest-system es
+    'not_checked'. Un numero sin verificar no es un resultado verificado."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _write_root(tmp, [_artifact("e" * 16, "XRPUSDT", "1h",
+                                     [_row("S10", 1.8, 40.0, 120)])])
+        old = BTL.BACKTEST_ROOT
+        try:
+            BTL.BACKTEST_ROOT = pathlib.Path(tmp)
+            ev = BTL.scan()["candidates"]["XRPUSDT@1h"][0]["evidence"]
+            assert ev["verify"] in ("not_checked", "MISSING")
+            assert ev["verify"] != "OK"
+            assert ev["run_id_matches_file"] is True
+            assert len(ev["artifact_sha256"]) == 64
         finally:
             BTL.BACKTEST_ROOT = old

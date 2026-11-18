@@ -46,9 +46,11 @@ Solo LECTURA. Nunca se escribe en el backtest-system: `code/`, `data/`,
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 BACKTEST_ROOT = Path(os.environ.get(
@@ -67,6 +69,12 @@ REPO_COST_RT_BPS = 11.0
 
 PF_MIN = 1.2
 TRADES_MIN = 30
+
+# Esquema que este puente sabe leer. Si el backtest-system lo sube, el puente
+# NO adivina campos: cuenta el artefacto como desconocido y no admite nada de
+# el. Fail-closed: un cambio de esquema no puede colarse en silencio como
+# "no hay candidatos", que es indistinguible de "nadie pasa el gate".
+KNOWN_SCHEMA = "bt-artifact/1"
 
 # pares del engine -> simbolos del backtest-system (los perps de Binance
 # tienen el mismo ticker en los dos repos, pero el engine los llama X/USDT)
@@ -152,6 +160,61 @@ def _passes(row: dict) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _verify_status(run_id: str) -> str:
+    """Veredicto del backtest-system para este run_id, o 'not_checked'.
+
+    Lee el ledger de `backtest_verify.py`; NO lanza procesos aqui (este
+    modulo se llama en cada /health). Un veredicto ausente es 'not_checked',
+    nunca 'OK'.
+    """
+    try:
+        import backtest_verify  # noqa: PLC0415 — import tardio
+        return backtest_verify.cached_status(run_id)
+    except Exception:  # noqa: BLE001 — sin ledger se declara no comprobado
+        return "not_checked"
+
+
+def _evidence(path: Path, j: dict) -> dict:
+    """Lo que se puede demostrar del artefacto, sin interpretarlo.
+
+    No dice "esto es cierto": dice quien lo firmo, sobre que datos y desde
+    cuando. `verify` es el veredicto del backtest-system (vrun.py verify):
+    'OK' / 'REFUSED' / 'STALE' / 'not_checked' / 'ERROR' / 'MISSING'.
+    """
+    inputs = j.get("inputs") or []
+    cut = None
+    for i in inputs:
+        if isinstance(i, dict) and i.get("end"):
+            cut = max(cut or "", str(i["end"]))
+    created = j.get("created_utc")
+    age_days = None
+    try:
+        dt = datetime.fromisoformat(str(created))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        age_days = round((time.time() - dt.timestamp()) / 86400.0, 1)
+    except (TypeError, ValueError):
+        pass
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        digest = None
+    prov = j.get("provenance") or {}
+    core = j.get("core") or {}
+    return {
+        "schema": j.get("schema"),
+        "run_id": j.get("run_id"),
+        "run_id_matches_file": str(j.get("run_id") or "") == path.stem,
+        "artifact": path.name,
+        "artifact_sha256": digest,
+        "engine_sha256": prov.get("engine_sha256") or core.get("engine_sha256"),
+        "data_cut": cut,
+        "created_utc": created,
+        "age_days": age_days,
+        "verify": _verify_status(str(j.get("run_id") or "")),
+    }
+
+
 def scan() -> dict:
     """Lee los artefactos y devuelve candidatos admitidos + conteos.
 
@@ -169,6 +232,8 @@ def scan() -> dict:
         "scored": {},              # symbol -> {rows_scored, rows_passed}
         "other_cost_artifacts": 0,
         "slice_artifacts": 0,      # diagnostic slices (slice_from/slice_to): never candidates
+        "unknown_schema": 0,       # esquema que este puente no sabe leer
+        "unbound_artifacts": 0,    # run_id ausente o que no casa con el fichero
         "unreadable": 0,
         "latest_artifact_utc": None,
         "scanned_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -187,6 +252,16 @@ def scan() -> dict:
             latest = max(latest, p.stat().st_mtime)
         except OSError:
             pass
+        # Fail-closed de IDENTIDAD. Un artefacto tiene que declarar su
+        # esquema y su run_id, y ese run_id tiene que ser el del fichero
+        # (`results/runs/<run_id>.json`). Sin eso no se puede decir de que
+        # run viene el numero: no se admite, se cuenta.
+        if str(j.get("schema") or "") != KNOWN_SCHEMA:
+            out["unknown_schema"] += 1
+            continue
+        if not j.get("run_id") or str(j.get("run_id")) != p.stem:
+            out["unbound_artifacts"] += 1
+            continue
         m = j.get("metrics") or {}
         sym = j.get("symbol")
         tf = j.get("timeframe")
@@ -247,6 +322,10 @@ def scan() -> dict:
                 # backtest-system; aqui solo se copia la expectancia por trade.
                 "exp_R": row.get("exp_R"),
             }
+            # Procedencia verificable: de donde sale el numero y si el
+            # backtest-system lo reproduce. Se adjunta al candidato para que
+            # quien lo consuma no tenga que creerse nada de memoria.
+            cand["evidence"] = _evidence(p, j)
             # DEDUPE: la misma estrategia puede tener varios artefactos
             # (el backtest-system se ha re-ejecutado con datos frescos). Se
             # queda el MAS RECIENTE y se descartan los anteriores: si no, el
@@ -290,6 +369,38 @@ def for_pair(pair: str) -> dict:
         "artifacts_scanned": data.get("artifacts"),
         "root_exists": data.get("root_exists"),
     }
+
+
+def strictly_admitted(run_verify: bool = False) -> dict:
+    """Candidatos cuyo artefacto el backtest-system REPRODUCE (verify == OK).
+
+    `for_pair()` responde "pasa los gates numericos". Esto responde la
+    pregunta distinta y mas dura: "el artefacto que sostiene ese numero sigue
+    siendo valido". Son dos condiciones y ninguna implica a la otra.
+
+    `run_verify=True` ejecuta `vrun.py verify` para los que no tengan
+    veredicto (4-5 s por artefacto: para un job, no para /health).
+    """
+    data = cached_scan()
+    out: dict = {}
+    for key, lst in data.get("candidates", {}).items():
+        for c in lst:
+            ev = dict(c.get("evidence") or {})
+            st = str(ev.get("verify") or "not_checked")
+            if run_verify and st in ("not_checked", "ERROR"):
+                rid = ev.get("run_id")
+                try:
+                    import backtest_verify  # noqa: PLC0415
+                    st = backtest_verify.verify(str(rid))["status"]
+                except Exception:  # noqa: BLE001
+                    st = "ERROR"
+            if st != "OK":
+                continue
+            c = dict(c)
+            ev["verify"] = st
+            c["evidence"] = ev
+            out.setdefault(key, []).append(c)
+    return out
 
 
 # ── cache ──────────────────────────────────────────────────────────────────
@@ -343,8 +454,10 @@ def _main() -> int:
     data = scan()
     print(f"root: {data['root']} (existe={data['root_exists']})")
     print(f"artefactos: {data['artifacts']} | con costes del repo: "
-          f"{data['artifacts'] - data['other_cost_artifacts'] - data['unreadable']}"
-          f" | otros costes: {data['other_cost_artifacts']}")
+          f"{data['artifacts'] - data['other_cost_artifacts'] - data['unreadable'] - data.get('unknown_schema', 0) - data.get('unbound_artifacts', 0)}"
+          f" | otros costes: {data['other_cost_artifacts']}"
+          f" | esquema desconocido: {data.get('unknown_schema', 0)}"
+          f" | run_id no ligado: {data.get('unbound_artifacts', 0)}")
     print(f"ultimo artefacto: {data['latest_artifact_utc']}")
     print()
     if not data["scored"]:
@@ -359,9 +472,12 @@ def _main() -> int:
             continue
         print(f"{key}: {len(lst)} admitido(s) de {sc['rows_scored']} filas")
         for c in lst:
+            ev = c.get("evidence") or {}
             print(f"   {c['id']} {c['name']} | PF {c['pf']:.2f} | net {c['net_pct']:+.2f}% "
                   f"| excess {c['excess_pct']:+.2f}% | n {c['trades']:.0f} | "
                   f"DD {c['maxdd_pct']:.1f}% | run_id {c['run_id']}")
+            print(f"        verify={ev.get('verify')} | corte={ev.get('data_cut')} "
+                  f"| edad={ev.get('age_days')}d | sha={str(ev.get('artifact_sha256'))[:12]}")
     return 0
 
 
