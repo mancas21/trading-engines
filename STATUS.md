@@ -64,10 +64,12 @@ versiona el trabajo que estaba sin commitear de la sesion paralela
 Cinco commits, empujados, arbol limpio.
 
 **Estado vivo tras el reinicio (19:29 COT).** Bot pid 13372, politica nueva
-(60/nivel, 240/720). `--check` → `OK`; bruto 719,55 / neto +360,58 USD,
-verificable=True. El libro esta practicamente en el tope: solo se permite el
-lado que cubre. Primer ciclo procesado sin duplicar (fill ARB BUY3 @ 0,132).
-stderr a `execution/logs/neutral_bot.err.log` (antes moria sin rastro).
+(60/nivel, 240/720). `--check` → `OK`; bruto 719,55 / neto +360,58 USD a las
+19:30 COT (el bruto deriva con el mark y ya toco 720,24: el tope se aplica a
+colocacion nueva, no fuerza cierre), verificable=True. El libro esta en el
+tope: solo se permite el lado que cubre. Primer ciclo procesado sin duplicar
+(fill ARB BUY3 @ 0,132). stderr a `execution/logs/neutral_bot.err.log` (antes
+moria sin rastro).
 
 **Hallazgo operativo:** la tarea programada `Execution Watchdog` esta
 **Deshabilitada**. Por eso el bot estuvo ~79 min caido sin relanzarse y hubo
