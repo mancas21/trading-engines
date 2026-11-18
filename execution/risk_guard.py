@@ -11,14 +11,20 @@ agregada ni pare la cuenta. Este modulo es ese "ultimo paso antes de la orden":
   * PERDIDA DIARIA: guarda el equity al empezar el dia UTC; si el equity cae
     mas de DAILY_LOSS_PCT, dispara el kill switch y bloquea nuevas entradas.
   * EXPOSICION: tope de nocional bruto (suma |amt|*mark) y neto (|suma firmada|)
-    en la cuenta. Pasarse bloquea solo las entradas nuevas.
+    en la cuenta. Pasarse bloquea solo las entradas nuevas. Un mark ilegible
+    deja la exposicion como DESCONOCIDA (fail-closed), nunca como cero.
 
-Todo se puede afinar por entorno: QAE_DAILY_LOSS_PCT, QAE_MAX_GROSS_USD,
-QAE_MAX_NET_USD.
+`exposure_snapshot()` es la UNICA fuente de verdad de exposicion del repo: la
+usan el auto_router, el bot neutral y cualquier panel. Los topes de inventario
+del grid viven aqui y el bot los importa; no hay un segundo juego de numeros.
+
+Todo se puede afinar por entorno: QAE_DAILY_LOSS_PCT, QAE_MAX_INV_SYMBOL,
+QAE_MAX_INV_TOTAL, QAE_MAX_GROSS_USD, QAE_MAX_NET_USD.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -28,8 +34,28 @@ STATE = HERE / "state"
 KILL_FILE = STATE / "KILL_SWITCH"
 DAILY_FILE = STATE / "daily_guard.json"
 
+# ---------------------------------------------------------------------------
+# POLITICA DE RIESGO — UN SOLO SITIO
+# ---------------------------------------------------------------------------
+# 2026-11-17 — habia DOS cerebros de riesgo con numeros distintos: este modulo
+# decia 600 bruto / 400 neto (heredado del auto_router, retirado el 12-nov) y
+# neutral_bot.py llevaba sus propios 400/1.200 inline. Cualquier consumidor que
+# preguntara aqui -un panel, un control plane, el propio bot- recibia una
+# respuesta que no describia la cuenta. Ahora la politica vive aqui y el bot
+# IMPORTA estas constantes: no hay un segundo numero que pueda derivar.
+#
+# El envelope lo fijo el bot el 17-nov midiendo el peor caso: 9 pares x 4
+# niveles x 60 USDT = 720 de inventario bruto (15% de la equity de 4.700), y un
+# stop-out completo de los 9 a la vez ~29 USDT (0,6%), dentro de la guardia
+# diaria del 2%. Ver neutral_bot.py para el razonamiento completo.
+MAX_INVENTORY_USD_PER_SYMBOL = float(
+    os.environ.get("QAE_MAX_INV_SYMBOL", "240"))
+MAX_INVENTORY_USD_TOTAL = float(os.environ.get("QAE_MAX_INV_TOTAL", "720"))
+
 DAILY_LOSS_PCT = float(os.environ.get("QAE_DAILY_LOSS_PCT", "2.0"))
-MAX_GROSS_USD = float(os.environ.get("QAE_MAX_GROSS_USD", "600"))
+# El bruto de la cuenta ES el inventario total: un solo numero, no dos.
+MAX_GROSS_USD = float(os.environ.get("QAE_MAX_GROSS_USD",
+                                     MAX_INVENTORY_USD_TOTAL))
 MAX_NET_USD = float(os.environ.get("QAE_MAX_NET_USD", "400"))
 
 
@@ -112,28 +138,107 @@ def daily_check(equity: float) -> dict:
 
 
 # ───────────────────────────────────────────────────────────── exposicion ──
-def exposure_check(client) -> dict:
-    """Nocional bruto y neto de las posiciones vivas, contra los topes.
+def _finite(x) -> float | None:
+    """float finito o None. `None` NUNCA se convierte en 0."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
 
-    `client` necesita .positions() -> [{"symbol","positionAmt",...}] y
-    .mark_price(sym). Devuelve {"gross": f, "net": f, "ok": bool, "why": str}.
+
+def _positive(x) -> float | None:
+    v = _finite(x)
+    return v if (v is not None and v > 0) else None
+
+
+def exposure_snapshot(client) -> dict:
+    """LA fuente unica de exposicion de la cuenta. Fail-closed por diseno.
+
+    Devuelve:
+        {gross, net, positions, unpriced, verifiable, ok, why, caps}
+
+    Regla que este modulo aprendio a golpes (audit P0): si el mark de una
+    posicion no se puede leer, la exposicion es DESCONOCIDA, no cero. El
+    codigo viejo hacia `except: mark = 0.0`, el bruto se encogia y
+    `gross <= MAX_GROSS_USD` daba True: autorizaba riesgo nuevo justo cuando
+    no sabia cuanto riesgo habia. Aqui un precio ilegible deja
+    `verifiable=False` y `ok=False`.
+
+    Puede lanzar si `client.positions()` falla: el llamador debe tratar la
+    excepcion como "exposicion desconocida" (fail-closed), no como "plana".
     """
-    gross = 0.0
-    net = 0.0
-    for p in client.positions():
-        amt = float(p.get("positionAmt", 0))
+    out: dict = {
+        "gross": 0.0, "net": 0.0,
+        "positions": {}, "unpriced": [],
+        "verifiable": True, "ok": True, "why": "",
+        "caps": {"per_symbol": MAX_INVENTORY_USD_PER_SYMBOL,
+                 "total": MAX_INVENTORY_USD_TOTAL,
+                 "gross": MAX_GROSS_USD, "net": MAX_NET_USD},
+    }
+    raw = client.positions()
+    if not isinstance(raw, list):
+        out.update(verifiable=False, ok=False,
+                   why=f"positions() devolvio {type(raw).__name__}, no una lista")
+        return out
+
+    for p in raw:
+        if not isinstance(p, dict):
+            continue
+        sym = p.get("symbol")
+        amt = _finite(p.get("positionAmt"))
+        if not sym or amt is None:
+            out["unpriced"].append(str(sym) if sym else "(sin symbol)")
+            continue
         if amt == 0:
             continue
-        sym = p["symbol"]
-        try:
-            mark = client.mark_price(sym)
-        except Exception:  # noqa: BLE001 — sin mark no puedo valorar: cuento amt signado a precio 0
-            mark = 0.0
+        mark = _positive(p.get("markPrice"))
+        if mark is None:
+            # positionRisk trae markPrice; si falta se pregunta una vez.
+            try:
+                mark = _positive(client.mark_price(sym))
+            except Exception:  # noqa: BLE001 — red/HTTP: exposicion desconocida
+                mark = None
+        if mark is None:
+            out["unpriced"].append(sym)
+            continue
         notional = abs(amt) * mark
-        gross += notional
-        net += amt * mark
-    ok = gross <= MAX_GROSS_USD and abs(net) <= MAX_NET_USD
-    why = "" if ok else (
-        f"exposicion gross {gross:.0f} USD (tope {MAX_GROSS_USD:.0f}) / "
-        f"net {net:.0f} USD (tope {MAX_NET_USD:.0f})")
-    return {"gross": gross, "net": net, "ok": ok, "why": why}
+        out["positions"][sym] = {
+            "amt": amt, "mark": mark, "notional": notional,
+            "upnl": _finite(p.get("unRealizedProfit")) or 0.0,
+        }
+        out["gross"] += notional
+        out["net"] += amt * mark
+
+    if out["unpriced"]:
+        out["verifiable"] = False
+    gross_ok = out["gross"] <= MAX_GROSS_USD
+    net_ok = abs(out["net"]) <= MAX_NET_USD
+    out["ok"] = bool(out["verifiable"] and gross_ok and net_ok)
+
+    reasons = []
+    if not out["verifiable"]:
+        reasons.append("precio ilegible en " + ", ".join(out["unpriced"])
+                       + " -> exposicion DESCONOCIDA")
+    if not gross_ok:
+        reasons.append(f"gross {out['gross']:.0f} USD > tope {MAX_GROSS_USD:.0f}")
+    if not net_ok:
+        reasons.append(f"net {out['net']:.0f} USD > tope {MAX_NET_USD:.0f}")
+    out["why"] = "; ".join(reasons)
+    return out
+
+
+def exposure_check(client) -> dict:
+    """Compatibilidad con el auto_router: dict {gross, net, ok, why}."""
+    s = exposure_snapshot(client)
+    return {"gross": s["gross"], "net": s["net"], "ok": s["ok"],
+            "why": s["why"], "verifiable": s["verifiable"],
+            "positions": s["positions"], "unpriced": s["unpriced"]}
+
+
+def require_exposure_ok(client) -> dict:
+    """Fail-closed de verdad: lanza RiskBlocked si no se puede verificar."""
+    s = exposure_snapshot(client)
+    if not s["ok"]:
+        raise RiskBlocked(s["why"] or "exposicion fuera de tope o no verificable")
+    return s
