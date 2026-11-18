@@ -79,6 +79,10 @@ scanner-engine/data/
 scanner-engine/*.db
 scanner-engine/scanner.db
 scanner-engine/tests/_ssl_*.py
+# 2026-11-17 — ledger de verificacion de artefactos (backtest_verify.py).
+# Machine-local y regenerable con `python scanner-engine/backtest_verify.py
+# --candidates`; la autoridad es vrun.py, no este cache.
+scanner-engine/state/
 
 # 2026-10-13 — estado de RUNTIME del reader. Estos tres los escribe el proceso
 # en cada ciclo y son machine-local: lock de instancia, fingerprint de la
@@ -118,3 +122,11 @@ quant-alert-engine/card_live/raw/
 .hermes/
 .zcode/
 .git_sync_watchdog_pause
+
+# 2026-11-17 — eqs.npy: 55 MB de curvas de equity INTERMEDIAS que genera
+# backtest_prompts100/run_all.py:187 y consumen make_report/make_charts/
+# make_top10. Es un producto regenerable, no una fuente: versionarlo metia un
+# blob de 55 MB en cada clon y en cada historia. Se queda en disco; el
+# pipeline lo reescribe. (El fichero ya estaba en el indice: salio con
+# `git rm --cached`, sin borrarlo.)
+backtest_prompts100/eqs.npy
