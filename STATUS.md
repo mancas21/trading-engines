@@ -5,6 +5,77 @@ SQLite corpus (`quant-alert-engine/data/alerts.db`) unless stated otherwise.
 
 ---
 
+## 2026-11-17 19:30 COT — Cinco arreglos de saneamiento: el bot deja de fallar abierto
+
+Auditoria de los caminos donde una guardia se desactivaba **en silencio**. El
+criterio aplicado en los cinco: si el bot no puede verificar algo, no actua;
+no se imputa un cero ni se supone "plano".
+
+**1. Exposicion fail-closed y una sola politica (`execution/risk_guard.py`).**
+El audit P0: `except: mark = 0.0` encogia el bruto y `gross <= tope` autorizaba
+riesgo nuevo justo cuando la exposicion era desconocida. Ahora
+`exposure_snapshot()` devuelve `verifiable=False` y `ok=False` si un mark es
+ilegible; `require_exposure_ok()` lanza `RiskBlocked`. Los topes 240/simbolo y
+720 total se declaran **solo** aqui; `neutral_bot.py` los importa (antes: bot
+400/1.200 vs guard 600/400 = dos cerebros). `MAX_GROSS_USD` es alias del total.
+8 tests nuevos (`execution/tests/test_risk_guard.py`), 47 passed en execution.
+
+**2. Estado y cuenta fail-closed (`execution/neutral_bot.py`).**
+`load_state()` devolvia estado fresco ante JSON corrupto: arrancaba creyendo
+que no tenia nada puesto y colocaba un grid completo encima del vivo. Ahora
+`StateCorrupt` y no arranca (rc=6). `save_state()` devuelve bool (antes se
+tragaba `OSError` y las ordenes quedaban sin registrar). `account()` y
+`positions()` con excepcion ya no hacen `pass`: bloquean colocacion
+(`account_unavailable` / `positions_unavailable`). `check_stop()` con mark
+ilegible deja `stop_unverifiable` (antes notional=0 lo creia plano).
+
+**3. Desync como precondicion, no como sorpresa.**
+`sync_slots()` devuelve `{fills, orphans, known}`: una orden viva que el estado
+no conoce (huerfana) bloquea el simbolo (`state_desync`). Nuevo
+`neutral_bot.py --check` (rc=1 si descuadra). Medido: **64 ordenes vivas vs 28
+slots**. `audit_sync.py --repair` infiere el ancla que explica el 100% del
+libro y **adopta el exchange como verdad** (no cancela ni re-coloca); una orden
+que la reticula no explica rechaza el simbolo. `--repair --apply` adopto 64/64
+en 9/9 simbolos, 0 rechazados; `--check` → OK.
+
+**4. Evidencia verificable de los artefactos (`scanner-engine/`).**
+`backtest_verify.py` no reimplementa la verificacion: invoca
+`python code/vrun.py verify <run_id>` (0 OK / 2 REFUSED / 3 STALE) y guarda el
+veredicto con TTL. Sin veredicto = `not_checked`; nunca OK por defecto.
+`backtest_link.py` exige esquema `bt-artifact/1` y `run_id == nombre del
+fichero`, y adjunta `evidence` (sha256, engine_sha256, data_cut, edad, verify).
+`strictly_admitted()` = gate numerico **y** verify OK.
+
+Resultado medido: 22 run_ids unicos → **17 OK / 5 STALE**.
+STALE: `0ed422b997a5ce61` (SOL), `13e802f38dca237a` (XRP),
+`f74c954793301a86` (ETH) — funding extendido dentro del corte;
+`f7b8e2aad81d1013` (SUI) — CSV 1h de 17.520 a 17.803 barras; y
+`f4dd916c2faa5e36` (PEPE) — edicion dentro del corte o input añadido/eliminado.
+El gate numerico admite 35 candidatos; con evidencia verificada, **28**. ARB
+`b819239a1ff78eda` OK. **PEPE queda 0/2 verificado y esta en `ALLOW_SYMBOLS`:
+no es operable con evidencia** (ademas de ARB, registrado pero no operable por
+concentracion).
+
+**5. Limpieza del repo.** `backtest_prompts100/eqs.npy` (55,4 MB, curvas
+intermedias regenerables por `run_all.py:187`) sale del indice con
+`git rm --cached`; el fichero sigue en disco y el pipeline lo reescribe. Se
+versiona el trabajo que estaba sin commitear de la sesion paralela
+(`automation/`, backtests HMA, `_estado_corte.py`, `market_narrative.md`).
+Cinco commits, empujados, arbol limpio.
+
+**Estado vivo tras el reinicio (19:29 COT).** Bot pid 13372, politica nueva
+(60/nivel, 240/720). `--check` → `OK`; bruto 719,55 / neto +360,58 USD,
+verificable=True. El libro esta practicamente en el tope: solo se permite el
+lado que cubre. Primer ciclo procesado sin duplicar (fill ARB BUY3 @ 0,132).
+stderr a `execution/logs/neutral_bot.err.log` (antes moria sin rastro).
+
+**Hallazgo operativo:** la tarea programada `Execution Watchdog` esta
+**Deshabilitada**. Por eso el bot estuvo ~79 min caido sin relanzarse y hubo
+que arrancarlo a mano. Reactivarla es una decision del operador (puede haberse
+deshabilitado a proposito para control manual).
+
+---
+
 ## 2026-11-16 — Auditoria del bot neutral (grid): 3 bugs reales y 1 pie de bomba
 
 El bot neutral (grid delta-neutral sobre Binance USDT-M testnet) estaba vivo
