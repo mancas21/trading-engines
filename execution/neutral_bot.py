@@ -27,8 +27,9 @@ Por que NO se coloca un TP a fill+0.5% (modelo v1, retirado):
 
 SEGURIDAD
 =========
-  * Tope de inventario por simbolo (400 USD) y total (1.200 USD): al llegar,
-    se dejan de reponer compras (las ventas siempre se permiten).
+  * Tope de inventario por simbolo (240 USD) y total (720 USD): al llegar,
+    se bloquea el lado que AUMENTA la exposicion y se cancelan sus slots.
+    La cobertura del lado contrario siempre se permite.
   * Stop por simbolo: si el uPnL de la posicion cae -4% de su nocional, se
     cancelan sus niveles, se cierra a mercado y el simbolo entra en cuarentena
     60 min.
@@ -55,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -81,12 +83,22 @@ SYMBOLS = [
 
 GRID_LEVELS = 4                 # niveles por lado
 GRID_SPACING_PCT = 0.005        # 0.5% entre niveles
-NOTIONAL_PER_SIDE_USDT = 100    # USDT por nivel
+NOTIONAL_PER_SIDE_USDT = 60     # USDT por nivel (era 100)
 MAX_ORDER_NOTIONAL_USD = 650
 POLL_SECONDS = 20
 
-MAX_INVENTORY_USD_PER_SYMBOL = 400   # 4 niveles llenos
-MAX_INVENTORY_USD_TOTAL = 1200       # correlacion: ~3 simbolos llenos
+# 2026-11-17 — el 17-nov una subida de 0,5-2% en los 9 pares a la vez lleno
+# 12 niveles en 13 minutos y dejo el libro en 1.212 USDT (tope 1.200). El
+# tope funciono, pero el libro era demasiado grande para un movimiento
+# correlacionado. Con 60/nivel el peor caso es 720 USDT (15% de la equity) y
+# un stop-out completo ~29 USDT (0,6%), dentro de la guardia diaria del 2%.
+#
+# LA POLITICA VIVE EN risk_guard (un solo sitio desde 2026-11-17): aqui solo
+# se importa. Antes este fichero llevaba sus propios 400/1.200 mientras
+# risk_guard decia 600/400 — dos cerebros, dos numeros, y ningun consumidor
+# podia saber cual describia la cuenta.
+MAX_INVENTORY_USD_PER_SYMBOL = risk_guard.MAX_INVENTORY_USD_PER_SYMBOL
+MAX_INVENTORY_USD_TOTAL = risk_guard.MAX_INVENTORY_USD_TOTAL
 STOP_LOSS_PCT = 0.04                 # -4% del nocional de la posicion
 COOLDOWN_MIN = 60                    # cuarentena tras stop
 FLAT_USD = 5.0                       # menos de esto se considera plano
@@ -110,25 +122,49 @@ def _fresh_state() -> dict:
     return {"version": 2, "symbols": {}, "cooldown": {}}
 
 
+class StateCorrupt(RuntimeError):
+    """El estado existe pero no se puede leer. NO se arranca con estado vacio.
+
+    2026-11-17 — `load_state()` devolvia un estado FRESCO ante cualquier
+    OSError o JSONDecodeError. Con grid_state.json corrupto (o bloqueado por
+    otro proceso) el bot arrancaba creyendo que no tenia NINGUNA orden puesta
+    y colocaba un grid completo encima del que ya estaba vivo en el exchange:
+    duplicaba cada nivel. El estado de posiciones de `state_store.py` ya habia
+    aprendido esta leccion (StateCorrupt); este fichero no. La ausencia del
+    fichero si es "sin estado" (primer arranque); un fichero ilegible no.
+    """
+
+
 def load_state() -> dict:
+    if not STATE.exists():
+        return _fresh_state()          # primer arranque: no hay estado, correcto
     try:
         d = json.loads(STATE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return _fresh_state()
+    except (OSError, json.JSONDecodeError) as e:
+        raise StateCorrupt(f"{STATE}: {e}") from e
     if not isinstance(d, dict) or "symbols" not in d:
-        return _fresh_state()   # estado v1 (slots que cambiaban de lado): se tira
+        # estado v1 (slots que cambiaban de lado): se tira a proposito, esta
+        # documentado en el historial. No es corrupcion.
+        return _fresh_state()
     d.setdefault("cooldown", {})
     return d
 
 
-def save_state(d: dict) -> None:
+def save_state(d: dict) -> bool:
+    """Escribe el estado de forma atomica. True si quedo en disco.
+
+    Si devuelve False, el llamador NO puede seguir colocando: las ordenes ya
+    enviadas no estarian registradas y el siguiente ciclo las duplicaria.
+    """
     try:
         STATE.parent.mkdir(parents=True, exist_ok=True)
         tmp = STATE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, STATE)
-    except OSError:
-        pass
+        return True
+    except OSError as e:
+        log({"symbol": "-", "action": "state_save_failed", "error": str(e)[:200]})
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +190,7 @@ class NeutralGridBot:
         self.state = load_state()
         self._rules: dict[str, dict] = {}
         self._halted = False     # kill switch / perdida diaria
+        self._log_seen: dict[str, float] = {}
 
     # ---- helpers ----------------------------------------------------------
     def sym_state(self, symbol: str) -> dict:
@@ -163,6 +200,14 @@ class NeutralGridBot:
         if symbol not in self._rules:
             self._rules[symbol] = self.client.rules(symbol)
         return self._rules[symbol]
+
+    def _log_throttled(self, key: str, rec: dict, every: float = 600.0) -> None:
+        """Evita escribir el mismo aviso cada 20 s (3,7 MB de log en 2 dias)."""
+        now = time.time()
+        if now - self._log_seen.get(key, 0.0) < every:
+            return
+        self._log_seen[key] = now
+        log(rec)
 
     # ---- exchange ---------------------------------------------------------
     def place_limit(self, symbol: str, side: str, price: float, qty: float) -> dict | None:
@@ -203,19 +248,36 @@ class NeutralGridBot:
         for key in list(st.get("slots", {})):
             self.cancel_slot(symbol, st, key)
 
-    def sync_slots(self, symbol: str, st: dict) -> int:
-        """Detecta fills y ordenes muertas. Devuelve el numero de fills."""
-        if self.dry_run or not st.get("slots"):
-            return 0
+    def sync_slots(self, symbol: str, st: dict) -> dict:
+        """Detecta fills, ordenes muertas y ordenes que el estado NO conoce.
+
+        Devuelve {"fills": n, "orphans": [ids], "known": bool}.
+
+        `known=False`: no se pudo leer el libro de ordenes. El llamador no
+        puede colocar nada en ese simbolo: no sabria si duplica.
+
+        `orphans`: ordenes vivas en el exchange que no estan registradas en
+        state/grid_state.json. Antes se leian solo las ordenes muertas; una
+        orden viva SIN registro pasaba desapercibida y el ciclo siguiente
+        colocaba otra vez el mismo nivel: dos ordenes al mismo precio, es
+        decir el doble de exposicion en ese nivel. MEDIDO el 17-nov: la
+        cuenta tenia 63 ordenes abiertas y el estado 28 slots. El estado ya
+        no es la unica entrada: si el libro tiene algo que el estado no
+        conoce, el bot no coloca y avisa.
+        """
+        out = {"fills": 0, "orphans": [], "known": True}
+        if self.dry_run:
+            return out
         try:
             live = {int(o["orderId"]) for o in self.client.open_orders(symbol)}
         except (BinanceError, SafetyError) as e:
             log({"symbol": symbol, "action": "error", "error": f"open_orders: {e}"[:200]})
-            return 0
+            out["known"] = False
+            return out
 
-        fills = 0
-        for key in list(st["slots"]):
-            rec = st["slots"][key]
+        slots = st.get("slots") or {}
+        for key in list(slots):
+            rec = slots[key]
             oid = int(rec.get("order_id") or 0)
             if not oid or oid in live:
                 continue
@@ -230,13 +292,17 @@ class NeutralGridBot:
                 log({"symbol": symbol, "action": "fill", "level": rec.get("level"),
                      "side": key[:3], "price": px, "qty": executed or rec.get("qty"),
                      "order_id": oid})
-                fills += 1
-                st["slots"].pop(key, None)
+                out["fills"] += 1
+                slots.pop(key, None)
             elif status in ("CANCELED", "EXPIRED", "REJECTED"):
                 log({"symbol": symbol, "action": "lost_slot", "level": key,
                      "status": status, "executed_qty": executed})
-                st["slots"].pop(key, None)
-        return fills
+                slots.pop(key, None)
+
+        registered = {int(r.get("order_id") or 0)
+                      for r in (st.get("slots") or {}).values()}
+        out["orphans"] = sorted(i for i in live if i not in registered)
+        return out
 
     # ---- grid -------------------------------------------------------------
     @staticmethod
@@ -276,7 +342,7 @@ class NeutralGridBot:
 
     def ensure_grid(self, symbol: str, st: dict, mark: float,
                     blocked: bool, amt: float = 0.0,
-                    halted: bool = False) -> None:
+                    total_inv: float = 0.0, halted: bool = False) -> None:
         """Rellena los 8 niveles que falten. No persigue el precio: si un nivel
         cae del lado equivocado del mark, se omite hasta que el precio vuelva.
 
@@ -293,7 +359,11 @@ class NeutralGridBot:
         lo = mark * float(band.get("down") or 1.0)
         hi = mark * float(band.get("up") or 1.0)
 
-        qty = self.client.round_qty(symbol, self.notional_per_side / mark)
+        # Un step puede valer mas que el nocional objetivo (BTC: 0.001 paso
+        # x 64.800 = 64,8 USDT). Sin este minimo el redondeo da 0 y el
+        # simbolo se queda sin grid para siempre.
+        qty = self.client.round_qty(
+            symbol, max(self.notional_per_side / mark, float(r.get("step") or 0)))
         if qty <= 0 or qty * mark < r.get("min_notional", 0):
             log({"symbol": symbol, "action": "skip",
                  "why": f"qty {qty} no cumple min_notional {r.get('min_notional')}"})
@@ -302,12 +372,14 @@ class NeutralGridBot:
         # Tope de inventario: se retiran los slots vivos del lado que aumenta
         # la exposicion. Sin esto el tope solo impedia colocar, no absorber:
         # el bot seguia agrandando la posicion con las ordenes que ya estaban
-        # puestas en el libro.
-        if blocked and not halted:
+        # puestas en el libro. Cancelar reduce riesgo: se hace tambien con el
+        # kill switch activo (lo que no se hace es COLOCAR nada nuevo).
+        if blocked:
             for key in list(st.get("slots", {})):
                 if self.increases_exposure(key[:3], amt):
                     self.cancel_slot(symbol, st, key)
 
+        inv_sym = abs(amt) * mark
         placed = 0
         for i in range(1, self.grid_levels + 1):
             for side, sign in (("BUY", -1), ("SELL", +1)):
@@ -316,7 +388,12 @@ class NeutralGridBot:
                     continue
                 if halted:
                     continue
-                if blocked and self.increases_exposure(side, amt):
+                inc = self.increases_exposure(side, amt)
+                if blocked and inc:
+                    continue
+                # tope prospectivo: no colocar la orden que romperia el tope
+                if inc and (inv_sym + self.notional_per_side > MAX_INVENTORY_USD_PER_SYMBOL
+                            or total_inv + self.notional_per_side > MAX_INVENTORY_USD_TOTAL):
                     continue
                 px = self.client.round_price(
                     symbol, anchor * (1 + sign * self.grid_spacing * i))
@@ -345,7 +422,19 @@ class NeutralGridBot:
         if not pos:
             return False
         amt = float(pos.get("positionAmt", 0))
-        mark = float(pos.get("markPrice", 0) or 0)
+        try:
+            mark = float(pos.get("markPrice"))
+        except (TypeError, ValueError):
+            mark = 0.0
+        if not (math.isfinite(mark) and mark > 0):
+            # 2026-11-17 — antes `or 0` dejaba notional=0 < FLAT_USD y el stop
+            # se creia "plano": el unico freno por perdida quedaba desactivado
+            # en silencio. Sin precio no se mide el dano; el ciclo ya bloquea
+            # colocaciones por exposicion no verificable.
+            self._log_throttled(f"{symbol}:stopnoprice", {
+                "symbol": symbol, "action": "stop_unverifiable",
+                "note": "mark ilegible: el stop NO se evalua"})
+            return False
         notional = abs(amt) * mark
         if notional < FLAT_USD:
             return False
@@ -376,11 +465,19 @@ class NeutralGridBot:
     def run_cycle(self) -> None:
         # 1) equity + guardia diaria
         equity = 0.0
+        account_ok = True
         try:
             equity = float(self.client.account().get("totalMarginBalance", 0) or 0)
-        except (BinanceError, SafetyError):
-            pass
-        if equity > 0 and not self.dry_run:
+        except (BinanceError, SafetyError) as e:
+            # 2026-11-17 — antes `pass`: equity quedaba en 0, `if equity > 0`
+            # se saltaba la guardia diaria EN SILENCIO y el bot seguia
+            # operando sin saber si el dia ya estaba roto.
+            account_ok = False
+            self._log_throttled("account:fail", {
+                "symbol": "-", "action": "account_unavailable",
+                "error": str(e)[:200],
+                "note": "guardia diaria NO evaluada; no se coloca riesgo nuevo"})
+        if account_ok and equity > 0 and not self.dry_run:
             daily = risk_guard.daily_check(equity)
             if daily.get("tripped") and not self._halted:
                 log({"symbol": "-", "action": "daily_guard",
@@ -390,18 +487,38 @@ class NeutralGridBot:
         if risk_guard.kill_active():
             self._halted = True
 
-        # 2) posiciones y marks
-        positions: dict[str, dict] = {}
+        # 2) exposicion: UNA fuente (risk_guard.exposure_snapshot), fail-closed
+        snap = None
         try:
-            positions = {p["symbol"]: p for p in self.client.positions()
-                         if float(p.get("positionAmt", 0) or 0) != 0}
-        except (BinanceError, SafetyError):
-            pass
-        total_inv = sum(abs(float(p["positionAmt"])) * float(p.get("markPrice", 0) or 0)
-                        for p in positions.values())
+            snap = risk_guard.exposure_snapshot(self.client)
+        except (BinanceError, SafetyError) as e:
+            # 2026-11-17 — antes `except: pass` dejaba positions={} y
+            # total_inv=0: los topes de inventario DESAPARECIAN justo cuando
+            # no se podia leer la cuenta, y el bot colocaba sin limite.
+            self._log_throttled("positions:fail", {
+                "symbol": "-", "action": "positions_unavailable",
+                "error": str(e)[:200],
+                "note": "exposicion desconocida: NO se coloca riesgo nuevo"})
+        positions: dict[str, dict] = {}
+        total_inv = 0.0
+        exposure_ok = snap is not None and bool(snap.get("verifiable"))
+        if snap is not None:
+            total_inv = float(snap["gross"])
+            for sym, v in snap["positions"].items():
+                positions[sym] = {"symbol": sym, "positionAmt": v["amt"],
+                                  "markPrice": v["mark"],
+                                  "unRealizedProfit": v["upnl"]}
+            unpriced = list(snap.get("unpriced") or [])
+            if unpriced:
+                self._log_throttled("exposure:unpriced", {
+                    "symbol": "-", "action": "exposure_unverifiable",
+                    "unpriced": unpriced,
+                    "note": "precio ilegible: la exposicion es DESCONOCIDA, "
+                            "no cero; no se coloca riesgo nuevo"})
 
         now = time.time()
         cooldown = self.state["cooldown"]
+        halt_cycle = bool(self._halted or not exposure_ok or not account_ok)
 
         for symbol in self.symbols:
             if symbol not in self.allow_symbols:
@@ -409,8 +526,25 @@ class NeutralGridBot:
                 continue
             st = self.sym_state(symbol)
 
-            # fills / ordenes muertas
-            self.sync_slots(symbol, st)
+            # fills / ordenes muertas / ordenes que el estado no conoce
+            sync = self.sync_slots(symbol, st)
+            desync = bool(sync["orphans"]) or not sync["known"]
+            if sync["orphans"]:
+                self._log_throttled(f"{symbol}:desync", {
+                    "symbol": symbol, "action": "state_desync",
+                    "orphans": len(sync["orphans"]),
+                    "order_ids": sync["orphans"][:10],
+                    "slots": len(st.get("slots") or {}),
+                    "note": "ordenes vivas que el estado NO conoce: no se coloca "
+                            "en este simbolo hasta reconciliar "
+                            "(python execution/audit_sync.py --repair)"})
+            elif not sync["known"]:
+                self._log_throttled(f"{symbol}:nobook", {
+                    "symbol": symbol, "action": "orderbook_unavailable",
+                    "note": "no se pudo leer el libro: no se coloca en este simbolo"})
+
+            if snap is not None and symbol in (snap.get("unpriced") or []):
+                continue          # sin precio no hay stop, ni tope, ni grid
 
             pos = positions.get(symbol)
             amt = float(pos["positionAmt"]) if pos else 0.0
@@ -436,7 +570,8 @@ class NeutralGridBot:
                 continue
             if until:
                 cooldown.pop(symbol, None)
-                save_state(self.state)
+                if not save_state(self.state):
+                    halt_cycle = True
 
             # ancla y re-anclaje (solo plano)
             flat = abs(amt) * mark < FLAT_USD
@@ -453,32 +588,45 @@ class NeutralGridBot:
             inv_sym = abs(amt) * mark
             capped = (inv_sym >= MAX_INVENTORY_USD_PER_SYMBOL
                       or total_inv >= MAX_INVENTORY_USD_TOTAL)
-            blocked = (self._halted or capped)
             if capped and not self._halted:
-                log({"symbol": symbol, "action": "inventory_cap",
-                     "inventory_sym_usd": round(inv_sym, 2),
-                     "inventory_total_usd": round(total_inv, 2),
-                     "side_blocked": ("SELL" if amt < 0 else "BUY") if amt else "ambos",
-                     "note": "se bloquea el lado que AUMENTA la exposicion; "
-                             "la cobertura sigue permitida"})
+                self._log_throttled(f"{symbol}:cap", {
+                    "symbol": symbol, "action": "inventory_cap",
+                    "inventory_sym_usd": round(inv_sym, 2),
+                    "inventory_total_usd": round(total_inv, 2),
+                    "side_blocked": ("SELL" if amt < 0 else "BUY") if amt else "ambos",
+                    "note": "se bloquea el lado que AUMENTA la exposicion; "
+                            "la cobertura sigue permitida"})
 
-            self.ensure_grid(symbol, st, mark, blocked, amt=amt,
-                             halted=self._halted)
+            # 2026-11-17: `desync` NO cancela (un libro que no se pudo leer no
+            # autoriza acciones) pero SI impide colocar. `halted` = no colocar;
+            # `blocked` = retirar el lado que aumenta.
+            self.ensure_grid(symbol, st, mark,
+                             blocked=bool(capped or self._halted),
+                             amt=amt, total_inv=total_inv,
+                             halted=bool(halt_cycle or desync))
 
             # posicion viva que el grid no puede gestionar: los 8 niveles
             # estan al lado equivocado del mark (el precio se fue del ancla)
             # y no hay ninguno colocado. Sin este aviso el bot la lleva
             # colgada sin que nadie lo note.
             if amt and not st.get("slots"):
-                log({"symbol": symbol, "action": "unmanaged_position",
-                     "amt": amt, "notional": round(inv_sym, 2),
-                     "anchor": st.get("anchor"), "mark": mark,
-                     "drift_pct": round((mark / float(st["anchor"]) - 1) * 100, 2)
-                     if st.get("anchor") else None})
+                self._log_throttled(f"{symbol}:unmanaged", {
+                    "symbol": symbol, "action": "unmanaged_position",
+                    "amt": amt, "notional": round(inv_sym, 2),
+                    "anchor": st.get("anchor"), "mark": mark,
+                    "drift_pct": round((mark / float(st["anchor"]) - 1) * 100, 2)
+                    if st.get("anchor") else None})
 
-        save_state(self.state)
+        if not save_state(self.state):
+            # las ordenes de este ciclo no quedaron registradas: el proximo
+            # sync las vera como huerfanas y el gate de desync parara el
+            # simbolo. Se avisa ahora para que no sorprenda.
+            log({"symbol": "-", "action": "state_save_failed_cycle",
+                 "note": "estado no persistido: el proximo ciclo parara los "
+                         "simbolos con ordenes no registradas"})
 
-    def net_exposure(self) -> dict:
+    def net_exposure(self) -> dict | None:
+        """Posiciones netas. None = no se pudo leer (NUNCA {} = 'plano')."""
         out = {}
         try:
             for p in self.client.positions():
@@ -486,7 +634,46 @@ class NeutralGridBot:
                 if a != 0:
                     out[p["symbol"]] = a
         except (BinanceError, SafetyError):
-            pass
+            return None
+        return out
+
+    def consistency(self) -> dict:
+        """Estado vs exchange, SOLO LECTURA (no poda slots ni escribe nada).
+
+        Es la precondicion de arranque: si `ok` es False el bot no coloca en
+        los simbolos afectados hasta reconciliar. `unregistered_state` son
+        slots del estado que ya no estan vivos en el libro (fills sin procesar
+        o ordenes muertas); no invalidan por si solos, se informan.
+        """
+        snap = risk_guard.exposure_snapshot(self.client)
+        out = {"ok": True, "gross": snap["gross"], "net": snap["net"],
+               "verifiable": snap["verifiable"],
+               "unpriced": list(snap.get("unpriced") or []),
+               "caps": snap["caps"], "symbols": {}}
+        if not snap["verifiable"]:
+            out["ok"] = False
+        for symbol in self.symbols:
+            if symbol not in self.allow_symbols:
+                continue
+            st = (self.state.get("symbols") or {}).get(symbol) or {}
+            registered = {int(r.get("order_id") or 0)
+                          for r in (st.get("slots") or {}).values()}
+            try:
+                live = {int(o["orderId"]) for o in self.client.open_orders(symbol)}
+            except (BinanceError, SafetyError) as e:
+                out["symbols"][symbol] = {"error": str(e)[:120], "known": False}
+                out["ok"] = False
+                continue
+            orphans = sorted(live - registered)
+            if orphans:
+                out["ok"] = False
+            out["symbols"][symbol] = {
+                "known": True,
+                "slots": len(registered),
+                "live": len(live),
+                "orphans": orphans,
+                "unregistered_state": sorted(registered - live),
+            }
         return out
 
     def run(self, loop: bool = False, interval: int = POLL_SECONDS) -> None:
@@ -495,7 +682,16 @@ class NeutralGridBot:
             return
         try:
             while True:
-                self.run_cycle()
+                try:
+                    self.run_cycle()
+                except Exception as e:  # noqa: BLE001
+                    # 2026-11-17: un TimeoutError de SSL mataba el proceso (~1
+                    # muerte/dia). En loop se registra y se sigue; en one-shot
+                    # se relanza para que el fallo sea visible.
+                    log({"symbol": "-", "action": "cycle_error",
+                         "error": f"{type(e).__name__}: {e}"[:200]})
+                    if not loop:
+                        raise
                 if not loop:
                     break
                 time.sleep(max(10, interval))
@@ -520,21 +716,53 @@ def main() -> int:
                     help="espaciado en fraccion (0.005 = 0.5%%)")
     ap.add_argument("--notional", type=float, default=NOTIONAL_PER_SIDE_USDT)
     ap.add_argument("--status", action="store_true", help="solo muestra el estado y sale")
+    ap.add_argument("--check", action="store_true",
+                    help="precondicion: estado vs exchange, sin tocar nada (rc=1 si descuadra)")
     a = ap.parse_args()
 
     symbols = [s.strip().upper() for s in a.symbols.split(",") if s.strip()]
     client = TestnetClient(dry_run=not a.execute, max_notional_usd=MAX_ORDER_NOTIONAL_USD)
     client.sync_time()
 
-    bot = NeutralGridBot(
-        client=client, symbols=symbols, grid_levels=a.levels,
-        grid_spacing_pct=a.spacing, notional_per_side_usdt=a.notional,
-        dry_run=not a.execute,
-    )
+    try:
+        bot = NeutralGridBot(
+            client=client, symbols=symbols, grid_levels=a.levels,
+            grid_spacing_pct=a.spacing, notional_per_side_usdt=a.notional,
+            dry_run=not a.execute,
+        )
+    except StateCorrupt as e:
+        # 2026-11-17: arrancar con estado vacio significaba colocar un grid
+        # completo encima del que ya estaba vivo. Mejor no arrancar.
+        print(f"CRITICO: grid_state.json ilegible; NO se arranca con estado vacio.\n  {e}")
+        print("  Inspecciona execution/state/grid_state.json y reconcilia con")
+        print("  python execution/audit_sync.py --repair")
+        return 6
+
+    if a.check:
+        c = bot.consistency()
+        print(f"exposicion bruta={c['gross']:.2f} neta={c['net']:+.2f} "
+              f"verificable={c['verifiable']} topes={c['caps']['per_symbol']:.0f}/"
+              f"{c['caps']['total']:.0f}")
+        if c["unpriced"]:
+            print(f"  SIN PRECIO: {', '.join(c['unpriced'])}")
+        for sym, r in c["symbols"].items():
+            if not r.get("known"):
+                print(f"  {sym:14s} LIBRO ILEGIBLE: {r.get('error')}")
+            elif r["orphans"]:
+                print(f"  {sym:14s} DESINCRONIZADO slots={r['slots']} vivas={r['live']} "
+                      f"huerfanas={r['orphans']}")
+            elif r["unregistered_state"]:
+                print(f"  {sym:14s} ok (slots del estado ya no vivos: "
+                      f"{r['unregistered_state']})")
+        print("OK" if c["ok"] else "DESINCRONIZADO")
+        return 0 if c["ok"] else 1
 
     if a.status:
         exp = bot.net_exposure()
-        print(f"exposicion neta: {exp if exp else 'PLANO (todo en 0)'}")
+        if exp is None:
+            print("exposicion neta: DESCONOCIDA (no se pudo leer la cuenta)")
+        else:
+            print(f"exposicion neta: {exp if exp else 'PLANO (todo en 0)'}")
         pos = {p["symbol"]: p for p in client.positions()
                if float(p.get("positionAmt", 0)) != 0}
         for sym in symbols:
@@ -558,6 +786,9 @@ def main() -> int:
         f"{'EJECUTANDO EN TESTNET' if a.execute else 'DRY-RUN'}",
         flush=True,
     )
+    log({"symbol": "-", "action": "startup", "symbols": len(symbols),
+         "levels": a.levels, "notional": a.notional,
+         "execute": a.execute, "interval": a.interval})
     bot.run(loop=a.loop, interval=a.interval)
     return 0
 
