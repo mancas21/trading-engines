@@ -1,57 +1,42 @@
 # MARKET NARRATIVE — estado de la historia por par (compartido entre sesiones)
 
-**Actualizado:** 2026-11-17 19:40 COT · **Mantenido por:** sesiones de análisis en vivo
+**Actualizado:** 2026-11-23 20:34 COT (lectura del chart OpenMarket 7kOL6Nwh) · **Mantenido por:** sesiones de análisis en vivo
 (exec briefs) y el cron horario de briefs. REGLA: cada lectura/brief CONTINÚA
 esta historia (qué cambió desde la última entrada) y la actualiza al cerrar.
 Nunca reiniciar de cero.
 
 ---
 
-## RÉGIMEN DE MERCADO (2026-11-17 19:40 COT)
+## RÉGIMEN DE MERCADO (2026-11-20, live)
 
-Rotación, no risk-on amplio: BTC 64.8k en rango 63.3-65.4k (+0.5% 24h) y ETH
-1.820 (+0.4%, LH/LL) no lideran. La fuerza está en beta alta (JUP +8.2%, SOL
-+5.5% tras barrer 71.02 y romper 74.29) y en equity tokenizada (NVDA +3.9% con
-volumen 6h 2.5x el previo, SPCX +4.3%). Débiles: PEPE -2.3% (barrió 0.0036485
-sin cerrar bajo 0.00369) y XAU -0.8% pegado al mínimo 3.825. ATAS cerrado: sin
-footprint/DOM/tape/CVD; lectura de estructura y precio, no de flujo. Gate
-scanner: 12/12 neutral.
-
-## RÉGIMEN DE MERCADO (2026-11-15) — previo
-
-Purga acelerando: BTC 64.7k (75.8k→71.5k→68k→63.7k mínimo intradiario con rebote; funding AÚN positivo
-+0.007% = los largos NO capitulan — el capítulo final de la purga sigue
-pendiente), ETH rompió 2000 y 1800 (1.805), XRP rompió el dollar level (1.02), NVDA
-sangrando (211→160). Periferia con suelos: HYPE/SUI/JUP/XRP/SOL llevan días
-sin hacer nuevos mínimos mientras el núcleo gotea. Gate de señales RETIRADO
-(2026-11-13) — sin sesgo formal; toda lectura direccional es interpretativa.
+**CAPÍTULO FINAL EN CURSO — las dos condiciones del 15-nov se alinearon:**
+(1) los pisos estadísticos se están probando SIMULTÁNEAMENTE (PEPE +0.6%
+sobre el suyo, SUI +1.4%, XRP +1.8%, SOL +5.3%), y (2) **el funding de BTC y
+ETH giró NEGATIVO por primera vez en toda la purga** (BTC −0.004%, ETH
+−0.019%) — los largos capitularon y ahora SON LOS CORTOS los que pagan.
+BTC 59,020 (rompió 60k), ETH 1,619, NVDA −11.9% en un día (129, de 211),
+XAU −2.7% cayendo también. Todo lh=True, nada construye suelo AÚN.
 
 ## 1000PEPE (par objetivo del bridge)
 
-**Arco:** 12-nov 0.00439 → flush 0.00369 → firma de suelo completada (funding
-−0.05%) → absorción en POC (15-nov) → **INVALIDACIÓN EJECUTADA (15/16-nov):
-la absorción MURIÓ.** La confirmación exigida (CHOCH/BOS alcista 5m/15m sobre
-0.00401) nunca llegó: el precio tocó 0.00401-0.00402 dos veces y cerró debajo
-del POC 0.003968 → 15m CHOCH bajista @ 0.0039779 → tape 100% ventas.
+**Arco:** 0.00439 → flush 0.00369 → firma de suelo (funding −0.056%) →
+absorción INVALIDADA → segunda pierna 0.00394 rota → **20-nov: tocando su
+piso estadístico 0.00344 (a +0.6%)**. Funding −0.0024% (ya no extremo — los
+cortos cubrieron en la caída). El guion bajista se cumplió entero; ahora el
+mercado está EN el piso que episode-stats marcó. Primer test en vivo del
+piso bajo condiciones de capitulación — observación, no señal (el mecanismo
+funding→rebote murió en §5.7; este episodio es la prueba en vivo que faltaba).
 
-**Última lectura de flujo (16-nov, ATAS):** barra delta −28.8M, tape neto
-negativo con 0% prints compradores, DOM EMA −26.9% (sigue vendido), CVD −550M
-(otra ola de −94M tras el flush). Funding −0.047% (cortos aún apiñados).
-La estructura micro es BAJISTA: último evento del early-engine 1m CHOCH short.
-
-**Estado:** tesista bajista de continuación medida (deep-dd perde en sección
-cruzada — el veredicto §5.7 aplicado a esta situación). Pisos: 0.00394
-(micro), 0.00369 (pierna), 0.00344 (episode-stats). El guion alcista se
-REINICIA desde cero: exigiría un CHOCH/BOS alcista 15m NUEVO sostenido sobre
-0.00401-0.00412 con funding aún más profundo — la vieja absorción no cuenta.
-
-**Lectura 17-nov 19:40 COT (sin ATAS):** el nivel 0.00369 se BARRIÓ (mínimo
-24h 0.0036485) pero NO hubo cierre 1h por debajo (mínimo cierre 0.0037069,
-17-nov 16:00 UTC): la continuación bajista a 0.00344 no se ejecutó. Desde el
-barrido, mínimos crecientes 0.0036485 → 0.0036868 → 0.00370/0.00379; precio
-0.0038062 probando 0.003825 (pivote 1h) y 0.003878 (máximo 15m). Arriba:
-0.003978 (24h) y 0.00401-0.00402 (CHOCH viejo). Sin flujo no hay confirmación:
-spring en prueba, no suelo confirmado.
+**23-nov 20:30 COT — chart OpenMarket 7kOL6Nwh (PEPE-USDT-SWAP, OKEX, 5m):**
+impulso alcista intradía limpio: desde el mínimo 0.0034014 (18:55 COT) sube
+por HH/HL hasta 0.0035032 (20:10), cierra 0.003492 con volumen creciendo en
+el tramo final (214B/188B/198B vs 46-100B al inicio). Precio POR ENCIMA de la
+banda superior de VWAP (0.0034748) y del VWAP (0.0034501): sobre-extensión de
+banda en 5m. En 1h sigue LH/LL (0.0034487 Binance, -1,8% en 6h) — el impulso
+5m aun no repara la estructura mayor. Soporte 0.0034501 (VWAP) / 0.0034254
+(banda baja); invalidacion del impulso = cierre 5m bajo 0.0034748.
+Footprint/CVD del chart NO exponen valores por chart_read: no se imputa delta.
+Gate scanner PEPE 0 (neutral), artefactos STALE (0/2 verificado): sin plan.
 
 ## SOL / XRP / SUI / ARB / HYPE (débiles, pisos estadísticos)
 
@@ -66,6 +51,15 @@ en tablero rojo).
 0.7135-0.7441 (LH/HL, precio en el vértice); ARB 0.132 en medio del rango
 0.1279-0.1351; HYPE 69.65 recuperó 68.82, techo 70.71. Pisos episode-stats
 sin tocar: la periferia ya no construye suelo, empieza a resolverlo.
+
+**18-nov 14:54 COT:** SUI 0.7178 (−0.3% 24h, RS vs BTC −1.8%/ETH −2.0%)
+resolvió la compresión 0.7135-0.7441 POR ABAJO: barrido 0.7024 (nuevo mínimo
+bajo 0.7056) y reclamo hasta 0.7239; ahora de vuelta dentro del valor 3d
+(POC 0.7216, VAL 0.7149, VAH 0.7310) pero bajo el POC. Estructura 15m sigue
+LH 0.7340 → 0.7286 → 0.7239: spring en prueba, sin CHOCH. Funding −0.008%/8h,
+LS 2.18, OI 101M SUI; DOM Binance +20% (muro bid 0.7174/361k, ask 0.7202/374k);
+tape 10s comprador 6.4k vs 1.5k pero cierra con prints de venta. ATAS cerrado:
+sin footprint/CVD por barra, gate UNAVAILABLE → sin plan (Rule 10).
 
 ## GATE
 
