@@ -1,6 +1,6 @@
 # MARKET NARRATIVE — estado de la historia por par (compartido entre sesiones)
 
-**Actualizado:** 2026-11-23 20:34 COT (lectura del chart OpenMarket 7kOL6Nwh) · **Mantenido por:** sesiones de análisis en vivo
+**Actualizado:** 2026-11-26 09:20 COT (barrido live + OpenMarket metric_get, chart tab cerrado) · **Mantenido por:** sesiones de análisis en vivo
 (exec briefs) y el cron horario de briefs. REGLA: cada lectura/brief CONTINÚA
 esta historia (qué cambió desde la última entrada) y la actualiza al cerrar.
 Nunca reiniciar de cero.
@@ -37,6 +37,17 @@ banda en 5m. En 1h sigue LH/LL (0.0034487 Binance, -1,8% en 6h) — el impulso
 (banda baja); invalidacion del impulso = cierre 5m bajo 0.0034748.
 Footprint/CVD del chart NO exponen valores por chart_read: no se imputa delta.
 Gate scanner PEPE 0 (neutral), artefactos STALE (0/2 verificado): sin plan.
+
+**26-nov 09:20 COT — REBOTE GENERALIZADO, la periferia lidera.** Todas las
+pares verdes 24h (BTC +4,4% 60.833, ETH +4,2% 1.704, SOL +6,5% 71,4,
+SUI +7,5%, HYPE +8,1%, JUP +10,1%, XRP +5,9%, PEPE +5,6%). El movimiento
+es un short squeeze: funding PEPE +0,0033%/8h (los cortos pagan), OI 25,9M.
+PERO CVD 5m de PEPE en OKX = −927.875 en 50 barras con taker_buy 0,695:
+precio arriba, CVD abajo = distribución/absorbencia, no compra agresiva
+sostenida. RSI 5m 48,8 (neutral), precio 0,0000035232 en la parte media de
+BB (0,0000035108-0,0000035293), EMA20≈precio<EMA50. Chart tab de OpenMarket
+cerrado: leído via metric_get sin tab. Sin ATAS: sin footprint por barra.
+Gate: BTC/HYPE/XAU score 20, PEPE/ARB/ETH/SOL 10, todos neutral → sin plan.
 
 ## SOL / XRP / SUI / ARB / HYPE (débiles, pisos estadísticos)
 
