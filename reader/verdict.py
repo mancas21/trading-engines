@@ -253,8 +253,16 @@ _DOM_GATE_STATE = HERE / "dom_gate_state.json"
 
 
 def _symbol_to_scanner_pair(symbol: str) -> str | None:
-    """'XRPUSDT' -> 'XRP/USD', solo si el scanner tiene el par registrado."""
-    base = str(symbol or "").upper().replace("-", "")
+    """'XRPUSDT' -> 'XRP/USD', solo si el scanner tiene el par registrado.
+
+    Acepta también la forma de par que usa el propio informe ('JUP/USD',
+    'JUP/USDT', 'JUP/USD.P'). Sin esto, 'JUP/USD' producía 'JUP//USD' y el
+    scanner —que indexa por 'JUP/USD'— devolvía 'sin dato' con 4 venues vivas.
+    """
+    raw = str(symbol or "").upper().replace("-", "").strip()
+    if not raw:
+        return None
+    base = raw.split("/", 1)[0] if "/" in raw else raw
     changed = True
     while changed:
         changed = False
